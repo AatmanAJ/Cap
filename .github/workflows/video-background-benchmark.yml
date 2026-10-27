@@ -1,0 +1,123 @@
+name: Video Background Benchmark
+
+on:
+  push:
+    branches:
+      - ci/video-bg-benchmark
+  workflow_dispatch:
+
+jobs:
+  fixtures:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Generate clips
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+          mkdir fixtures && cd fixtures
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=10 -c:v libx264 -pix_fmt yuv420p -preset fast bg-1080p30-h264.mp4
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=3840x2160:rate=60:duration=6 -c:v libx265 -tag:v hvc1 -pix_fmt yuv420p -preset ultrafast bg-2160p60-hevc.mov
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=480x270:rate=15:duration=3 -vf "split[a][b];[a]palettegen[p];[b][p]paletteuse" bg-480p.gif
+          ffmpeg -v error -y -f lavfi -i testsrc2=size=1920x1080:rate=30:duration=1 -frames:v 1 bg-still.png
+          ls -la
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: fixtures
+
+  benchmark:
+    needs: fixtures
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        settings:
+          - runner: windows-2022
+            target: x86_64-pc-windows-msvc
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+    runs-on: ${{ matrix.settings.runner }}
+    env:
+      LD_LIBRARY_PATH: ${{ github.workspace }}/target/native-deps/lib
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux desktop dependencies
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/install-desktop-deps
+
+      # No GPU on hosted runners: lavapipe gives wgpu a software Vulkan device.
+      - name: Install software Vulkan
+        if: runner.os == 'Linux'
+        run: sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - uses: ./.github/actions/setup-rust-cache
+        with:
+          target: ${{ matrix.settings.target }}
+          prefix-key: v1-video-bg-benchmark
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Native dependencies
+        run: node scripts/setup.js
+        env:
+          RUST_TARGET_TRIPLE: ${{ matrix.settings.target }}
+
+      - name: Add FFmpeg DLLs to PATH
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Add-Content -Path $env:GITHUB_PATH -Value "${{ github.workspace }}\\target\\ffmpeg\\bin"
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: fixtures
+
+      - name: Build benchmark
+        run: cargo build --release -p cap-rendering --example background-benchmark
+
+      - name: Run benchmark
+        shell: bash
+        run: |
+          dir="$PWD/fixtures"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -m "$dir")"; fi
+          cat > cases.json <<EOF
+          [
+            {"name":"image-png","source":{"type":"image","path":"$dir/bg-still.png"}},
+            {"name":"gif-480p","source":{"type":"image","path":"$dir/bg-480p.gif"}},
+            {"name":"video-1080p30-h264","source":{"type":"image","path":"$dir/bg-1080p30-h264.mp4"}},
+            {"name":"video-2160p60-hevc","source":{"type":"image","path":"$dir/bg-2160p60-hevc.mov"}}
+          ]
+          EOF
+          lscpu 2>/dev/null | grep -E "Model name|^CPU\(s\)" || powershell -Command "Get-CimInstance Win32_Processor | Select-Object Name,NumberOfLogicalProcessors | Format-List"
+          target/release/examples/background-benchmark --backgrounds cases.json --frames 300 --repetitions 2 > results.jsonl
+
+      - name: Summarise
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json, collections
+          rows = collections.defaultdict(list)
+          for line in open("results.jsonl"):
+              m = json.loads(line)
+              rows[(m["background"], m["mode"])].append(m)
+          print("## ${{ matrix.settings.runner }}\n")
+          print("| Background | Mode | Mean ms | p95 ms |")
+          print("|---|---|---|---|")
+          for (bg, mode), ms in rows.items():
+              mean = sum(m["mean_ms"] for m in ms) / len(ms)
+              p95 = sum(m["p95_ms"] for m in ms) / len(ms)
+              print(f"| {bg} | {mode} | {mean:.2f} | {p95:.2f} |")
+          EOF
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: results-${{ matrix.settings.runner }}
+          path: results.jsonl
