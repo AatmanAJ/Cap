@@ -78,6 +78,15 @@ jobs:
           name: fixtures
           path: fixtures
 
+      - name: Decode-only benchmark
+        shell: bash
+        run: |
+          dir="$PWD/fixtures"
+          if [ "$RUNNER_OS" = Windows ]; then dir="$(cygpath -m "$dir")"; fi
+          export VBG_BENCH_PATHS="$dir/bg-480p.gif;$dir/bg-1080p30-h264.mp4;$dir/bg-2160p60-hevc.mov"
+          cargo test --release -p cap-rendering --lib decode_benchmark_modes -- --ignored --nocapture 2>&1 | tee decode.log
+          { echo '## Decode only (${{ matrix.settings.runner }})'; echo '```'; grep '^VBM' decode.log; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Build benchmark
         run: cargo build --release -p cap-rendering --example background-benchmark
 
@@ -120,4 +129,6 @@ jobs:
         if: always()
         with:
           name: results-${{ matrix.settings.runner }}
-          path: results.jsonl
+          path: |
+            results.jsonl
+            decode.log

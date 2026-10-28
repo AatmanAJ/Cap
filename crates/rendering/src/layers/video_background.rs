@@ -913,4 +913,63 @@ mod tests {
         ));
         assert!(result.is_err());
     }
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn decode_benchmark_modes() {
+        let paths = std::env::var("VBG_BENCH_PATHS").expect("VBG_BENCH_PATHS");
+        for path in paths.split(';').filter(|path| !path.is_empty()) {
+            let path = PathBuf::from(path);
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            for (mode, rate, paced) in [
+                ("export60", 60.0, false),
+                ("export30", 30.0, false),
+                ("play60", 60.0, true),
+            ] {
+                let source = VideoBackgroundSource::open(path.clone(), 1920)
+                    .await
+                    .unwrap();
+                let mut samples = Vec::new();
+                let wall = std::time::Instant::now();
+                for frame in 0..300u32 {
+                    let start = std::time::Instant::now();
+                    assert!(source.frame_at(frame as f64 / rate).await.is_some());
+                    samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                    if paced {
+                        tokio::time::sleep(Duration::from_secs_f64(1.0 / rate)).await;
+                    }
+                }
+                let wall = wall.elapsed().as_secs_f64();
+                samples.sort_by(f64::total_cmp);
+                println!(
+                    "VBM {name} {mode} mean={:.2}ms p95={:.2}ms max={:.2}ms wall={:.2}s",
+                    samples.iter().sum::<f64>() / samples.len() as f64,
+                    samples[samples.len() * 95 / 100],
+                    samples.last().unwrap(),
+                    wall
+                );
+            }
+            let source = VideoBackgroundSource::open(path.clone(), 1920)
+                .await
+                .unwrap();
+            let mut samples = Vec::new();
+            let mut seed = 12345u64;
+            for _ in 0..20 {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let seconds = (seed >> 33) as f64 / (1u64 << 31) as f64 * 5.5;
+                let start = std::time::Instant::now();
+                assert!(source.frame_at(seconds).await.is_some());
+                samples.push(start.elapsed().as_secs_f64() * 1000.0);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "VBM {name} scrub mean={:.2}ms p95={:.2}ms max={:.2}ms",
+                samples.iter().sum::<f64>() / samples.len() as f64,
+                samples[samples.len() * 95 / 100],
+                samples.last().unwrap()
+            );
+        }
+    }
 }
