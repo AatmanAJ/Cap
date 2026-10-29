@@ -282,7 +282,7 @@ impl KeyboardTrackSegment {
     }
 }
 
-fn load_project_keyboard_events(
+pub fn load_project_keyboard_events(
     meta: &crate::RecordingMeta,
 ) -> Result<Vec<(KeyboardEvents, f64)>, String> {
     let Some(crate::StudioRecordingMeta::MultipleSegments { inner }) = meta.studio_meta() else {
