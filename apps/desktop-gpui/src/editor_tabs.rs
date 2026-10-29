@@ -24,8 +24,8 @@ use cap_project::CaptionsData;
 use cap_project::{
     BackgroundBlurConfig, BackgroundBlurMode, CameraShape, CameraXPosition, CameraYPosition,
     CaptionSegment, CaptionSettings, CornerStyle, CursorAnimationStyle, CursorRippleConfig,
-    KeyboardData, KeyboardSettings, ProjectConfiguration, RecordingMeta, ShadowConfiguration,
-    StereoMode, transcription_ranges_cover, transcription_source_ranges,
+    KeyboardData, KeyboardSettings, KeyboardStyle, ProjectConfiguration, RecordingMeta,
+    ShadowConfiguration, StereoMode, transcription_ranges_cover, transcription_source_ranges,
 };
 use gpui::{
     AnyElement, Bounds, Context, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -145,6 +145,14 @@ pub const KEYBOARD_POSITIONS: [(&str, Label); 6] = [
     ("bottom-left", tr::editor::tabs::position::bottom_left),
     ("bottom-center", tr::editor::tabs::position::bottom_center),
     ("bottom-right", tr::editor::tabs::position::bottom_right),
+];
+
+pub const KEYBOARD_STYLES: [(KeyboardStyle, Label); 2] = [
+    (KeyboardStyle::Text, tr::editor::tabs::keyboard::style_text),
+    (
+        KeyboardStyle::Keycaps,
+        tr::editor::tabs::keyboard::style_keycaps,
+    ),
 ];
 
 /// `CAPTION_POSITION_OPTIONS` (`text-style.tsx:18-26`) -- the keyboard's six
@@ -699,12 +707,15 @@ pub fn keyboard_settings(project: &ProjectConfiguration) -> KeyboardSettings {
         .unwrap_or_default()
 }
 
-fn keyboard_generation_settings_fingerprint(settings: &KeyboardSettings) -> (u64, u32, bool, bool) {
+fn keyboard_generation_settings_fingerprint(
+    settings: &KeyboardSettings,
+) -> (u64, u32, bool, bool, bool) {
     (
         settings.grouping_threshold_ms.to_bits(),
         settings.linger_duration.to_bits(),
         settings.show_modifiers,
         settings.show_special_keys,
+        settings.shortcuts_only,
     )
 }
 
@@ -2400,6 +2411,37 @@ impl EditorWindow {
             .gap(px(16.))
             .when(!enabled, |this| this.opacity(0.5))
             .child(
+                ui::Field::section(&theme, tr::editor::tabs::keyboard::style()).child(
+                    ui::SegmentedControl::editor(
+                        &theme,
+                        "keyboard-style",
+                        KEYBOARD_STYLES
+                            .iter()
+                            .map(|(style, label)| {
+                                ui::SegmentOption::new(label(), settings.style == *style)
+                            })
+                            .collect(),
+                    )
+                    .stretch()
+                    .on_select(cx.listener(
+                        |this, index: &usize, window, cx| {
+                            let Some(&(style, _)) = KEYBOARD_STYLES.get(*index) else {
+                                return;
+                            };
+                            if keyboard_settings(&this.project).style == style {
+                                return;
+                            }
+                            this.set_keyboard_setting(
+                                "keyboard-style",
+                                window,
+                                cx,
+                                move |settings| settings.style = style,
+                            );
+                        },
+                    )),
+                ),
+            )
+            .child(
                 ui::Field::section(&theme, tr::editor::tabs::keyboard::font_settings()).child(
                     div()
                         .flex()
@@ -2514,6 +2556,36 @@ impl EditorWindow {
                         .child(
                             ui::Subfield::plain(
                                 &theme,
+                                tr::editor::tabs::keyboard::shortcuts_only(),
+                            )
+                            .child(
+                                ui::Toggle::plain(
+                                    &theme,
+                                    "keyboard-shortcuts-only",
+                                    settings.shortcuts_only,
+                                )
+                                .on_click(cx.listener(
+                                    |this, _, window, cx| {
+                                        let next = !keyboard_settings(&this.project).shortcuts_only;
+                                        this.set_keyboard_setting(
+                                            "keyboard-shortcuts-only",
+                                            window,
+                                            cx,
+                                            move |settings| settings.shortcuts_only = next,
+                                        );
+                                    },
+                                )),
+                            ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(Hsla::from(theme.gray_10))
+                                .child(tr::editor::tabs::keyboard::shortcuts_only_description()),
+                        )
+                        .children((!settings.shortcuts_only).then(|| {
+                            ui::Subfield::plain(
+                                &theme,
                                 tr::editor::tabs::keyboard::show_modifiers(),
                             )
                             .child(
@@ -2533,8 +2605,9 @@ impl EditorWindow {
                                         );
                                     },
                                 )),
-                            ),
-                        )
+                            )
+                            .into_any_element()
+                        }))
                         .child(
                             ui::Subfield::plain(
                                 &theme,

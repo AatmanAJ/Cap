@@ -691,6 +691,14 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
             "Regenerate Keyboard Segments",
         ),
         (
+            tr::editor::tabs::keyboard::shortcuts_only(),
+            "Shortcuts Only",
+        ),
+        (
+            tr::editor::tabs::keyboard::shortcuts_only_description(),
+            "Hides regular typing, so passwords and other text never appear. Regenerate segments to apply.",
+        ),
+        (
             tr::editor::tabs::keyboard::show_modifiers(),
             "Show Modifiers",
         ),
@@ -699,6 +707,9 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
             "Show Special Keys",
         ),
         (tr::editor::tabs::keyboard::size_label(), "Size"),
+        (tr::editor::tabs::keyboard::style(), "Style"),
+        (tr::editor::tabs::keyboard::style_keycaps(), "Keycaps"),
+        (tr::editor::tabs::keyboard::style_text(), "Text"),
         (tr::editor::tabs::keyboard::text_color(), "Text Color"),
         (
             tr::editor::tabs::keyboard::timeline_unavailable(),
