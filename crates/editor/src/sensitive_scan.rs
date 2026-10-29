@@ -51,7 +51,6 @@ pub struct SensitiveScanResult {
     pub elapsed: Duration,
 }
 
-/// Whether this build can scan recordings for sensitive information.
 pub fn sensitive_scan_available() -> bool {
     cap_redaction::ocr_available()
 }
@@ -132,8 +131,8 @@ pub async fn scan_for_sensitive_info(
         let Some(luma) = frames.screen_frame.as_ref().and_then(luma_from_frame) else {
             continue;
         };
-        source_size = (luma.width, luma.height);
-        let luma = if luma.width > MAX_OCR_WIDTH {
+        source_size = (luma.width(), luma.height());
+        let luma = if luma.width() > MAX_OCR_WIDTH {
             luma.half()
         } else {
             luma
@@ -279,8 +278,9 @@ impl<'a> Placements<'a> {
             )
         });
         zoom.ensure_precomputed_until((frame_number as f32 + 1.0) / PLACEMENT_FPS as f32);
+        let (screen_width, screen_height) = media.decoders.screen_video_dimensions();
         let frames = DecodedSegmentFrames {
-            screen_size,
+            screen_size: XY::new(screen_width, screen_height),
             screen_frame: None,
             camera_frame: None,
             segment_time: source_time as f32,
@@ -304,13 +304,10 @@ impl<'a> Placements<'a> {
     }
 
     fn map(&mut self, time: f64, rect: Rect) -> Option<Rect> {
-        let placement = self.placement(time)?;
-        if !placement.visible {
-            return None;
-        }
-        let (x0, y0) = placement.source_to_output(rect.x, rect.y);
-        let (x1, y1) = placement.source_to_output(rect.right(), rect.bottom());
-        Some(Rect::new(x0, y0, x1 - x0, y1 - y0))
+        let [left, top, right, bottom] =
+            self.placement(time)?
+                .cover_source_rect(rect.x, rect.y, rect.right(), rect.bottom())?;
+        Some(Rect::new(left, top, right - left, bottom - top))
     }
 }
 

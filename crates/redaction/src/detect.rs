@@ -47,13 +47,55 @@ pub fn find_sensitive_text(line: &str, options: &DetectorOptions) -> Vec<TextMat
         find_prefixed_keys(&chars, &mut found);
         find_jwts(&chars, &mut found);
         find_bearer_tokens(&chars, &mut found);
+        find_telegram_tokens(&chars, &mut found);
         find_labeled_secrets(&chars, &mut found);
         find_high_entropy(&chars, &mut found);
+        find_pem_body(&chars, &mut found);
     }
     if options.phones {
         find_phones(&chars, &mut found);
     }
     merge_overlaps(line, found)
+}
+
+/// [`find_sensitive_text`] for the lines of one frame, top to bottom, plus
+/// what only shows across lines: every line inside a `-----BEGIN ... PRIVATE
+/// KEY-----` block is key material.
+pub fn find_sensitive_lines(lines: &[&str], options: &DetectorOptions) -> Vec<Vec<TextMatch>> {
+    let mut in_private_key = false;
+    lines
+        .iter()
+        .map(|line| {
+            let mut found = find_sensitive_text(line, options);
+            let upper = line.to_ascii_uppercase();
+            let armour = upper.trim_start().starts_with(['-', '—', '–']);
+            let begins = armour && upper.contains("BEGIN") && upper.contains("PRIVATE KEY");
+            let ends = armour && upper.contains("END");
+            if options.secrets && in_private_key && !ends && !begins {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let start = line.len() - line.trim_start().len();
+                    found = merge_overlaps(
+                        line,
+                        found
+                            .into_iter()
+                            .chain([TextMatch {
+                                kind: SensitiveKind::Secret,
+                                range: start..start + trimmed.len(),
+                                key: trimmed.to_string(),
+                            }])
+                            .collect(),
+                    );
+                }
+            }
+            if begins {
+                in_private_key = true;
+            } else if ends {
+                in_private_key = false;
+            }
+            found
+        })
+        .collect()
 }
 
 struct Chars<'a> {
@@ -177,13 +219,13 @@ fn normalize_key(kind: SensitiveKind, text: &str) -> String {
     }
 }
 
-// -- Email ------------------------------------------------------------------
-
+/// File extensions that are not also top-level domains (`.rs`, `.py`,
+/// `.md`, `.zip` and `.mov` are real ones, so `milan@firma.rs` stays an
+/// address).
 const FILE_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "svg", "webp", "avif", "heic", "ico", "bmp", "tiff", "js", "mjs",
-    "cjs", "ts", "tsx", "jsx", "css", "scss", "html", "json", "md", "txt", "rs", "py", "go", "rb",
-    "java", "kt", "swift", "mp4", "mov", "webm", "mp3", "wav", "pdf", "zip", "lock", "toml",
-    "yaml", "yml", "xml", "wasm", "map", "gz",
+    "cjs", "ts", "tsx", "jsx", "css", "scss", "html", "json", "txt", "rb", "java", "kt", "swift",
+    "mp4", "webm", "mp3", "wav", "pdf", "lock", "toml", "yaml", "yml", "xml", "wasm", "map", "gz",
 ];
 
 fn is_email_local(c: char) -> bool {
@@ -212,7 +254,12 @@ fn find_emails(chars: &Chars, found: &mut Vec<TextMatch>) {
         }
         let local = chars.text(start..at);
         let domain = chars.text(at + 1..end);
-        if valid_email(local, domain) {
+        let mut word_start = at;
+        while word_start > 0 && !chars.get(word_start - 1).is_some_and(char::is_whitespace) {
+            word_start -= 1;
+        }
+        let in_url = chars.text(word_start..at).contains("://");
+        if !in_url && valid_email(local, domain) {
             let text = chars.text(start..end);
             chars.push(
                 found,
@@ -241,14 +288,21 @@ fn valid_email(local: &str, domain: &str) -> bool {
         return false;
     }
     let tld = labels[labels.len() - 1];
+    let density_asset = labels.len() == 2 && is_density_suffix(labels[0]);
     (2..=24).contains(&tld.len())
         && tld.chars().all(|c| c.is_ascii_alphabetic())
+        && !density_asset
         && !FILE_EXTENSIONS
             .iter()
             .any(|extension| tld.eq_ignore_ascii_case(extension))
 }
 
-// -- Payment cards ----------------------------------------------------------
+/// `2x`, `3x`: the pixel-density suffix of `icon@2x.<ext>` asset names.
+fn is_density_suffix(label: &str) -> bool {
+    label.len() >= 2
+        && label.ends_with(['x', 'X'])
+        && label[..label.len() - 1].chars().all(|c| c.is_ascii_digit())
+}
 
 fn find_cards(chars: &Chars, found: &mut Vec<TextMatch>) {
     let mut index = 0;
@@ -380,8 +434,6 @@ fn is_card_number(digits: &str) -> bool {
         _ => false,
     }
 }
-
-// -- API keys and tokens ----------------------------------------------------
 
 struct KeyPattern {
     prefix: &'static str,
@@ -525,6 +577,36 @@ fn find_jwts(chars: &Chars, found: &mut Vec<TextMatch>) {
     }
 }
 
+/// Telegram bot tokens, `<bot id>:<35 characters>`, also inside
+/// `api.telegram.org/bot<token>/...` URLs.
+fn find_telegram_tokens(chars: &Chars, found: &mut Vec<TextMatch>) {
+    let mut start = 0;
+    while start < chars.len() {
+        let starts_digits = chars.get(start).is_some_and(|c| c.is_ascii_digit())
+            && !chars.before(start).is_some_and(|c| c.is_ascii_digit())
+            && (!chars
+                .before(start)
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+                || start >= 3 && chars.text(start - 3..start).eq_ignore_ascii_case("bot"));
+        if !starts_digits {
+            start += 1;
+            continue;
+        }
+        let digits_end = chars.scan_while(start, |c| c.is_ascii_digit());
+        let id_len = digits_end - start;
+        if (6..=12).contains(&id_len) && chars.get(digits_end) == Some(':') {
+            let end = chars.scan_while(digits_end + 1, key_body);
+            if end - (digits_end + 1) >= 30 {
+                let text = chars.text(start..end);
+                chars.push(found, SensitiveKind::ApiKey, start..end, text.to_string());
+                start = end;
+                continue;
+            }
+        }
+        start = digits_end.max(start + 1);
+    }
+}
+
 fn token_body(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_' | '~' | '+' | '/' | '=')
 }
@@ -578,9 +660,18 @@ const SECRET_LABELS: &[&str] = &[
     "credential",
 ];
 
+/// Labels whose value is secret whatever it looks like: a password of plain
+/// words is still a password.
+const ANY_VALUE_LABELS: &[&str] = &[
+    "password",
+    "passwd",
+    "passphrase",
+    "secret",
+    "token",
+    "client_secret",
+];
+
 const PLACEHOLDERS: &[&str] = &[
-    "string",
-    "number",
     "null",
     "none",
     "nil",
@@ -594,6 +685,37 @@ const PLACEHOLDERS: &[&str] = &[
     "secret",
     "password",
     "changeme",
+];
+
+/// What follows `password:` in code when it is a type, not a value.
+const TYPE_NAMES: &[&str] = &[
+    "string",
+    "str",
+    "&str",
+    "&'static",
+    "number",
+    "bool",
+    "boolean",
+    "int",
+    "integer",
+    "i32",
+    "i64",
+    "u8",
+    "u32",
+    "u64",
+    "usize",
+    "char",
+    "byte",
+    "bytes",
+    "any",
+    "unknown",
+    "object",
+    "securestring",
+    "secret",
+    "option",
+    "vec",
+    "text",
+    "varchar",
 ];
 
 fn is_value_char(c: char) -> bool {
@@ -633,29 +755,39 @@ fn find_labeled_secrets(chars: &Chars, found: &mut Vec<TextMatch>) {
             cursor = chars.scan_while(cursor + 1, |c| matches!(c, ' ' | '"' | '\'' | '`'));
             let end = chars.scan_while(cursor, is_value_char);
             let value = chars.text(cursor..end);
-            if looks_like_secret_value(value, label.starts_with("pass")) {
+            let any_value = ANY_VALUE_LABELS.contains(label);
+            if looks_like_secret_value(value, chars.get(end), any_value) {
                 chars.push(found, SensitiveKind::Secret, cursor..end, value.to_string());
             }
         }
     }
 }
 
-fn looks_like_secret_value(value: &str, password: bool) -> bool {
-    let min_len = if password { 6 } else { 8 };
-    if value.chars().count() < min_len || value.len() > 512 {
-        return false;
-    }
-    if value.starts_with(['$', '{', '<', '(', '[', '%', '@'])
-        || value.contains("process.env")
-        || value.contains("environ")
-        || value.contains("://")
-        || value.contains(['(', '<'])
-        || value.contains("::")
-    {
+fn is_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    chars
+        .next()
+        .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn is_pascal_case(text: &str) -> bool {
+    text.starts_with(|c: char| c.is_ascii_uppercase())
+        && text.chars().all(|c| c.is_ascii_alphabetic())
+        && text.chars().any(|c| c.is_ascii_lowercase())
+}
+
+/// Whether the text after a credential label is a value rather than code:
+/// a type (`password: SecureString,`, `Option<String>`), a call
+/// (`getPassword()`), an environment reference (`${TOKEN}`, `$API_KEY`,
+/// `process.env.X`) or a placeholder.
+fn looks_like_secret_value(value: &str, next: Option<char>, any_value: bool) -> bool {
+    if value.is_empty() || value.len() > 512 {
         return false;
     }
     let lower = value.to_ascii_lowercase();
     if PLACEHOLDERS.contains(&lower.as_str())
+        || TYPE_NAMES.contains(&lower.as_str())
         || lower.starts_with("your")
         || lower
             .chars()
@@ -663,19 +795,53 @@ fn looks_like_secret_value(value: &str, password: bool) -> bool {
     {
         return false;
     }
-    if value
-        .chars()
-        .all(|c| c.is_ascii_uppercase() || c == '_' || c.is_ascii_digit())
-        && value.contains('_')
+    if value.starts_with(['{', '[', '<'])
+        || value.starts_with("${")
+        || value.starts_with("$(")
+        || value.contains("process.env")
+        || value.contains("environ")
+        || value.contains("://")
+        || value.contains("::")
     {
         return false;
     }
-    let looks_like_path = value.split('.').count() > 1
+    let env_name = |name: &str| {
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+    };
+    if value.strip_prefix('$').is_some_and(env_name)
+        || value.len() > 2
+            && value.starts_with('%')
+            && value.ends_with('%')
+            && env_name(&value[1..value.len() - 1])
+    {
+        return false;
+    }
+    if env_name(value) && value.contains('_') {
+        return false;
+    }
+    if let Some(open) = value.find(['(', '<']) {
+        let head = &value[..open];
+        let call = value.ends_with('(') && head.split('.').all(is_identifier);
+        let generic = value[open..].starts_with('<') && is_pascal_case(head);
+        if call || generic {
+            return false;
+        }
+    }
+    if is_pascal_case(value) && matches!(next, Some(',' | ';' | ')' | '>')) {
+        return false;
+    }
+    let dotted_path = value.split('.').count() > 1
         && value.split('.').all(|part| {
             !part.is_empty() && part.chars().all(|c| c.is_ascii_alphabetic() || c == '_')
         });
-    if looks_like_path {
+    if dotted_path {
         return false;
+    }
+    if any_value {
+        return !(value.chars().all(|c| c.is_ascii_digit()) && value.len() < 6);
     }
     let classes = [
         value.chars().any(|c| c.is_ascii_lowercase()),
@@ -686,7 +852,7 @@ fn looks_like_secret_value(value: &str, password: bool) -> bool {
     .into_iter()
     .filter(|present| *present)
     .count();
-    classes >= 2 && (password || has_letter_and_digit(value))
+    value.chars().count() >= 8 && classes >= 2 && has_letter_and_digit(value)
 }
 
 fn has_letter_and_digit(value: &str) -> bool {
@@ -695,15 +861,24 @@ fn has_letter_and_digit(value: &str) -> bool {
 
 const CONTEXT_WORDS: &[&str] = &[
     "secret",
+    "secrets",
     "token",
+    "tokens",
     "key",
+    "keys",
+    "apikey",
+    "accesskey",
+    "privatekey",
+    "secretkey",
     "password",
     "passwd",
     "auth",
+    "authorization",
     "bearer",
     "credential",
+    "credentials",
     "signature",
-    "sig=",
+    "sig",
 ];
 
 const URL_SECRET_PARAMS: &[&str] = &[
@@ -721,22 +896,49 @@ const URL_SECRET_PARAMS: &[&str] = &[
     "x-amz-signature",
     "x-amz-credential",
     "x-amz-security-token",
+    "x-goog-signature",
+    "x-goog-credential",
+    "googleaccessid",
     "password",
     "auth",
     "code",
 ];
 
+/// SRI hashes (`integrity: sha512-...`) are long base64 but not secret.
+const DIGEST_PREFIXES: &[&str] = &["sha1-", "sha256-", "sha384-", "sha512-"];
+
 fn is_b64(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '_' | '-')
+}
+
+/// Whether `text` names a credential as a whole word (`api_key`, `apiKey`,
+/// `token:`), never inside another word (`monkey`, `keyboard`).
+fn has_context_word(text: &str) -> bool {
+    let mut words = Vec::new();
+    for part in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        let mut start = 0;
+        let bytes = part.as_bytes();
+        for index in 1..bytes.len() {
+            if bytes[index - 1].is_ascii_lowercase() && bytes[index].is_ascii_uppercase() {
+                words.push(&part[start..index]);
+                start = index;
+            }
+        }
+        words.push(&part[start..]);
+    }
+    words.iter().any(|word| {
+        CONTEXT_WORDS
+            .iter()
+            .any(|context| word.eq_ignore_ascii_case(context))
+    })
 }
 
 /// Long random-looking strings: base64 blobs and, only when the line says
 /// it is a credential, hex. Plain hashes (commit SHAs, digests, asset
 /// fingerprints) are everywhere on a developer's screen and are not secret,
-/// so a bare hex run never counts and a URL only counts through a
-/// credential-named query parameter.
+/// so a bare hex run never counts and a URL only counts through credentials
+/// it carries.
 fn find_high_entropy(chars: &Chars, found: &mut Vec<TextMatch>) {
-    let lower = chars.line.to_ascii_lowercase();
     let mut index = 0;
     while index < chars.len() {
         if chars.get(index).is_some_and(char::is_whitespace) {
@@ -746,13 +948,14 @@ fn find_high_entropy(chars: &Chars, found: &mut Vec<TextMatch>) {
         let word_end = chars.scan_while(index, |c| !c.is_whitespace());
         let word = index..word_end;
         let text = chars.text(word.clone());
+        let lower = text.to_ascii_lowercase();
+        if lower.contains("data:") && lower.contains(";base64,") {
+            index = word_end;
+            continue;
+        }
         if text.contains("://") || text.starts_with("www.") {
             find_url_secrets(chars, word.clone(), found);
         } else {
-            let context_before = |at: usize| {
-                let before = &lower[..chars.byte(at)];
-                CONTEXT_WORDS.iter().any(|word| before.contains(word))
-            };
             let mut cursor = word.start;
             while cursor < word.end {
                 if !chars.get(cursor).is_some_and(is_b64) {
@@ -771,7 +974,8 @@ fn find_high_entropy(chars: &Chars, found: &mut Vec<TextMatch>) {
                     start += 1;
                 }
                 let candidate = chars.text(start..end);
-                if random_looking(candidate, context_before(start)) {
+                let in_context = has_context_word(&chars.line[..chars.byte(start)]);
+                if random_looking(candidate, in_context) {
                     chars.push(
                         found,
                         SensitiveKind::Secret,
@@ -786,7 +990,74 @@ fn find_high_entropy(chars: &Chars, found: &mut Vec<TextMatch>) {
     }
 }
 
+/// A whole line of base64 the width PEM and similar armoured key formats
+/// wrap at: the body of a private key, even when its header is off screen.
+fn find_pem_body(chars: &Chars, found: &mut Vec<TextMatch>) {
+    let trimmed = chars.line.trim();
+    let body = trimmed.trim_end_matches('=');
+    let armoured = (60..=80).contains(&trimmed.len())
+        && trimmed.len() - body.len() <= 2
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '+' || c == '/')
+        && body.chars().any(|c| c.is_ascii_digit())
+        && body.chars().any(|c| c.is_ascii_uppercase())
+        && body.chars().any(|c| c.is_ascii_lowercase())
+        && shannon_entropy(body) >= 4.0;
+    if armoured {
+        let start = chars.line.len() - chars.line.trim_start().len();
+        found.push(TextMatch {
+            kind: SensitiveKind::Secret,
+            range: start..start + trimmed.len(),
+            key: trimmed.to_string(),
+        });
+    }
+}
+
 fn find_url_secrets(chars: &Chars, word: Range<usize>, found: &mut Vec<TextMatch>) {
+    let text = chars.text(word.clone());
+    let char_at = |byte: usize| word.start + text[..byte].chars().count();
+    let mut push = |start: usize, end: usize| {
+        if end > start {
+            let range = char_at(start)..char_at(end);
+            let value = chars.text(range.clone());
+            chars.push(found, SensitiveKind::Secret, range, value.to_string());
+        }
+    };
+
+    if let Some(scheme_end) = text.find("://") {
+        let authority_start = scheme_end + 3;
+        let authority_end = text[authority_start..]
+            .find(['/', '?', '#'])
+            .map_or(text.len(), |offset| authority_start + offset);
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@')
+            && let Some(colon) = authority[..at].find(':')
+        {
+            push(authority_start + colon + 1, authority_start + at);
+        }
+        let path_end = text[authority_end..]
+            .find(['?', '#'])
+            .map_or(text.len(), |offset| authority_end + offset);
+        let path = &text[authority_end..path_end];
+        let host = authority
+            .rsplit('@')
+            .next()
+            .unwrap_or(authority)
+            .to_ascii_lowercase();
+        for (host_part, marker) in [
+            ("hooks.slack.com", "/services/"),
+            ("discord.com", "/api/webhooks/"),
+            ("discordapp.com", "/api/webhooks/"),
+        ] {
+            if host.contains(host_part)
+                && let Some(offset) = path.find(marker)
+            {
+                push(authority_end + offset + marker.len(), path_end);
+            }
+        }
+    }
+
     let mut cursor = word.start;
     while cursor < word.end {
         if !matches!(chars.get(cursor), Some('?' | '&' | '#' | ';')) {
@@ -856,8 +1127,29 @@ fn longest_run(text: &str, class: impl Fn(char) -> bool) -> usize {
     longest
 }
 
+/// A path is made of words: each segment reads as lowercase, Capitalized or
+/// UPPERCASE. Random base64 with slashes mixes case inside its segments.
+fn path_like(candidate: &str) -> bool {
+    candidate.matches('/').count() >= 2
+        && candidate
+            .split('/')
+            .filter(|part| !part.is_empty())
+            .all(|part| {
+                let rest = part.get(1..).unwrap_or("");
+                !rest.chars().any(|c| c.is_ascii_uppercase())
+                    || !part.chars().any(|c| c.is_ascii_lowercase())
+            })
+}
+
 fn random_looking(candidate: &str, in_context: bool) -> bool {
     let len = candidate.len();
+    let lower = candidate.to_ascii_lowercase();
+    if DIGEST_PREFIXES
+        .iter()
+        .any(|prefix| lower.starts_with(prefix))
+    {
+        return false;
+    }
     let is_hex = candidate.chars().all(|c| c.is_ascii_hexdigit() || c == '-');
     if is_hex {
         let digits = candidate.chars().filter(char::is_ascii_hexdigit).count();
@@ -866,26 +1158,52 @@ fn random_looking(candidate: &str, in_context: bool) -> bool {
             && candidate.chars().any(|c| c.is_ascii_digit())
             && candidate.chars().any(|c| c.is_ascii_alphabetic());
     }
-    if candidate.chars().all(|c| c.is_ascii_digit()) {
-        return false;
-    }
-    if candidate.matches('/').count() >= 2 && !candidate.contains(['+', '=']) {
+    if candidate.chars().all(|c| c.is_ascii_digit()) || path_like(candidate) {
         return false;
     }
     let has_lower = candidate.chars().any(|c| c.is_ascii_lowercase());
     let has_upper = candidate.chars().any(|c| c.is_ascii_uppercase());
     let digits = candidate.chars().filter(char::is_ascii_digit).count();
-    let jagged = longest_run(candidate, |c| c.is_ascii_lowercase()) <= 6
-        && longest_run(candidate, |c| c.is_ascii_uppercase()) <= 6;
     let entropy = shannon_entropy(candidate);
     if in_context {
-        len >= 20 && has_letter_and_digit(candidate) && entropy >= 3.5 && jagged
-    } else {
-        len >= 32 && has_lower && has_upper && digits >= 2 && entropy >= 4.2 && jagged
+        return len >= 20 && has_letter_and_digit(candidate) && entropy >= 3.5;
     }
+    let long = len >= 40;
+    // Long camelCase identifiers are the false positive to beat: their
+    // lowercase runs are whole words, while in random base64 they average
+    // under two letters and almost never reach ten.
+    let jagged = longest_run(candidate, |c| c.is_ascii_lowercase()) <= 9
+        && longest_run(candidate, |c| c.is_ascii_uppercase()) <= 9;
+    let wordy = mean_run(candidate, |c| c.is_ascii_lowercase()) >= 3.0;
+    len >= 32
+        && has_lower
+        && has_upper
+        && digits >= if long { 1 } else { 2 }
+        && entropy >= 4.0
+        && (long || jagged)
+        && !wordy
 }
 
-// -- Phone numbers ----------------------------------------------------------
+fn mean_run(text: &str, class: impl Fn(char) -> bool) -> f64 {
+    let mut runs = 0usize;
+    let mut members = 0usize;
+    let mut previous = false;
+    for c in text.chars() {
+        let member = class(c);
+        if member {
+            members += 1;
+            if !previous {
+                runs += 1;
+            }
+        }
+        previous = member;
+    }
+    if runs == 0 {
+        0.0
+    } else {
+        members as f64 / runs as f64
+    }
+}
 
 fn find_phones(chars: &Chars, found: &mut Vec<TextMatch>) {
     let mut index = 0;
@@ -1348,6 +1666,321 @@ mod tests {
                 (SensitiveKind::Email, "jane.doe@example.com"),
                 (SensitiveKind::CardNumber, "4242 4242 4242 4242")
             ]
+        );
+    }
+
+    type MakeSecret = Box<dyn FnMut(&mut Rng) -> String>;
+
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+
+        fn string(&mut self, alphabet: &[u8], len: usize) -> String {
+            (0..len)
+                .map(|_| alphabet[self.below(alphabet.len())] as char)
+                .collect()
+        }
+    }
+
+    const BASE64: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const BASE64URL: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+
+    fn covered(line: &str, secret: &str) -> bool {
+        let start = line.find(secret).unwrap();
+        let end = start + secret.len();
+        find_sensitive_text(line, &DetectorOptions::default())
+            .iter()
+            .any(|item| item.range.start <= start + 1 && item.range.end + 1 >= end)
+    }
+
+    fn coverage(samples: usize, mut make: impl FnMut(&mut Rng) -> String) -> f64 {
+        let mut rng = Rng(7);
+        let hits = (0..samples)
+            .filter(|_| {
+                let secret = make(&mut rng);
+                covered(&secret, &secret)
+            })
+            .count();
+        hits as f64 / samples as f64
+    }
+
+    #[test]
+    fn random_secrets_are_found_without_any_label() {
+        let cases: [(&str, MakeSecret, f64); 5] = [
+            (
+                "base64, 32-64 chars",
+                Box::new(|rng: &mut Rng| {
+                    let len = 32 + rng.below(33);
+                    rng.string(BASE64, len)
+                }),
+                0.97,
+            ),
+            (
+                "base64url, 32-64 chars",
+                Box::new(|rng: &mut Rng| {
+                    let len = 32 + rng.below(33);
+                    rng.string(BASE64URL, len)
+                }),
+                0.97,
+            ),
+            (
+                "base64, 40-64 chars",
+                Box::new(|rng: &mut Rng| {
+                    let len = 40 + rng.below(25);
+                    rng.string(BASE64, len)
+                }),
+                0.995,
+            ),
+            (
+                "PEM body line",
+                Box::new(|rng: &mut Rng| rng.string(BASE64, 64)),
+                0.999,
+            ),
+            (
+                "PKCS#8 first line",
+                Box::new(|rng: &mut Rng| {
+                    format!(
+                        "{}{}",
+                        concat!("MIIEvQIBADANBgkqhkiG9w0B", "AQEFAASCBKcwggSjAgEAAoIBAQ"),
+                        rng.string(BASE64, 14)
+                    )
+                }),
+                1.0,
+            ),
+        ];
+        for (name, make, floor) in cases {
+            let rate = coverage(2000, make);
+            eprintln!("{name}: {:.2}% found", rate * 100.0);
+            assert!(rate >= floor, "{name}: {rate}");
+        }
+    }
+
+    #[test]
+    fn generated_identifiers_are_not_secrets() {
+        const WORDS: &[&str] = &[
+            "use",
+            "sensitive",
+            "information",
+            "detection",
+            "blur",
+            "component",
+            "provider",
+            "context",
+            "render",
+            "editor",
+            "timeline",
+            "segment",
+            "recording",
+            "export",
+            "upload",
+            "settings",
+            "handler",
+            "factory",
+            "manager",
+            "service",
+            "default",
+        ];
+        let mut rng = Rng(11);
+        for _ in 0..2000 {
+            let mut identifier = String::new();
+            while identifier.len() < 40 {
+                let word = WORDS[rng.below(WORDS.len())];
+                identifier.push_str(&word[..1].to_ascii_uppercase());
+                identifier.push_str(&word[1..]);
+                if rng.below(4) == 0 {
+                    identifier.push_str(&rng.below(100).to_string());
+                }
+            }
+            assert!(found(&identifier).is_empty(), "{identifier}");
+        }
+    }
+
+    #[test]
+    fn private_key_blocks_are_blurred_line_by_line() {
+        let lines = [
+            concat!("-----BEGIN ", "PRIVATE KEY-----"),
+            concat!("MIIEvQIBADANBgkqhkiG9w0B", "AQEFAASCBKcwggSjAgEAAoIBAQC7"),
+            "abc/def+ghi",
+            "Zm9v==",
+            concat!("-----END ", "PRIVATE KEY-----"),
+            "after the block",
+        ];
+        let found = find_sensitive_lines(&lines, &DetectorOptions::default());
+        assert!(found[0].is_empty());
+        let ocr_dashes = [
+            concat!("—---BEGIN ", "PRIVATE KEY—---"),
+            "Zm9v==",
+            "-—--END",
+        ];
+        let read = find_sensitive_lines(&ocr_dashes, &DetectorOptions::default());
+        assert_eq!(read[1].len(), 1);
+        assert!(read[2].is_empty());
+        for (line, items) in lines.iter().zip(&found).skip(1).take(3) {
+            assert_eq!(items.len(), 1, "{line}");
+            assert_eq!(items[0].range, 0..line.len());
+        }
+        assert!(found[4].is_empty() && found[5].is_empty());
+    }
+
+    #[test]
+    fn finds_credentials_inside_urls() {
+        for (line, secret) in [
+            (
+                "postgres://admin:s3cretPW99@localhost:5432/app",
+                "s3cretPW99",
+            ),
+            ("redis://:Zx9pQ2rT7vL4@127.0.0.1:6379", "Zx9pQ2rT7vL4"),
+            (
+                "mongodb+srv://app:hunter2hunter2@cluster0.example.net/db",
+                "hunter2hunter2",
+            ),
+            ("mysql://root:rootpass@db:3306/shop", "rootpass"),
+            ("amqp://guest:guestpass@rabbit:5672/", "guestpass"),
+            (
+                concat!(
+                    "https://hooks.slack.com/services/",
+                    "T0001/B0002/XXXXabcdYYYYefgh1234"
+                ),
+                "T0001/B0002/XXXXabcdYYYYefgh1234",
+            ),
+            (
+                concat!(
+                    "https://discord.com/api/webhooks/",
+                    "123456789012345678/abcDEF_ghiJKL-mnoPQR"
+                ),
+                "123456789012345678/abcDEF_ghiJKL-mnoPQR",
+            ),
+            (
+                "https://storage.googleapis.com/b/o?X-Goog-Signature=4f3e2d1c0b9a8f7e6d5c&x=1",
+                "4f3e2d1c0b9a8f7e6d5c",
+            ),
+            (
+                "https://s3.amazonaws.com/b/k?X-Amz-Signature=9a8b7c6d5e4f3a2b1c0d",
+                "9a8b7c6d5e4f3a2b1c0d",
+            ),
+        ] {
+            let items = found(line);
+            assert!(
+                items.iter().any(|(_, text)| *text == secret),
+                "{line:?}: {items:?}"
+            );
+        }
+        let bot = concat!("12345678", "9:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw1");
+        assert_eq!(
+            found(&format!("https://api.telegram.org/bot{bot}/getMe")),
+            [(SensitiveKind::ApiKey, bot)]
+        );
+        assert_eq!(
+            found(&format!("TELEGRAM={bot}")),
+            [(SensitiveKind::ApiKey, bot)]
+        );
+    }
+
+    #[test]
+    fn urls_without_credentials_stay_clear() {
+        for line in [
+            "postgres://localhost:5432/app",
+            "https://user@example.com/path",
+            "https://hooks.slack.com/",
+            "https://discord.com/channels/123/456",
+            "at 10:30:45 the job ran",
+            "https://example.com/?q=search&page=2",
+        ] {
+            assert!(found(line).is_empty(), "{line:?}: {:?}", found(line));
+        }
+    }
+
+    #[test]
+    fn labeled_passwords_need_no_particular_shape() {
+        for (line, value) in [
+            ("password: correcthorsebattery", "correcthorsebattery"),
+            ("PASSWORD=letmeinplease", "letmeinplease"),
+            ("password: $ecret!Pass", "$ecret!Pass"),
+            ("password: @dm1n", "@dm1n"),
+            ("password: %Pa55%word", "%Pa55%word"),
+            ("password: hunter(2)", "hunter(2"),
+            ("password: p<ss", "p<ss"),
+            ("token = 7f3k", "7f3k"),
+            ("secret: Summer2024", "Summer2024"),
+        ] {
+            let items = found(line);
+            assert!(
+                items.iter().any(|(_, text)| *text == value),
+                "{line:?}: {items:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn labeled_types_and_code_are_not_passwords() {
+        for line in [
+            "password: SecureString,",
+            "password: PasswordHash,",
+            "password: string",
+            "password: str",
+            "fn login(password: &str)",
+            "password: Option<String>,",
+            "password: Vec<u8>",
+            "let password = getPassword();",
+            "token = os.getenv(\"TOKEN\")",
+            "password: $DB_PASSWORD",
+            "password: %DB_PASSWORD%",
+            "secret: ${{ secrets.DEPLOY_KEY }}",
+            "max_token: 4096",
+        ] {
+            assert!(found(line).is_empty(), "{line:?}: {:?}", found(line));
+        }
+    }
+
+    #[test]
+    fn real_country_domains_are_addresses() {
+        for address in [
+            "milan@firma.rs",
+            "juan@empresa.com.py",
+            "ion@site.md",
+            "a@shop.zip",
+        ] {
+            assert_eq!(found(address), [(SensitiveKind::Email, address)]);
+        }
+        for line in ["icon@2x.png", "logo@3X.svg", "hero@2x.rs"] {
+            assert!(found(line).is_empty(), "{line:?}: {:?}", found(line));
+        }
+    }
+
+    #[test]
+    fn digests_data_uris_and_words_containing_key_are_clear() {
+        let sri = concat!(
+            "integrity: sha512-",
+            "Zm9vYmFyQmF6UXV4MTIzNDU2Nzg5MGFiY2RlZkdISUpLTE1OT1BRUlNUVVZXWFla",
+            "YWJjZGVmZ2hpams0NTY3ODk="
+        );
+        let data_uri = concat!(
+            "src=\"data:image/png;base64,",
+            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==\""
+        );
+        for line in [
+            sri,
+            data_uri,
+            "monkey 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+            "keyboard 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+        ] {
+            assert!(found(line).is_empty(), "{line:?}: {:?}", found(line));
+        }
+        let hex = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
+        assert_eq!(
+            found(&format!("apiKey {hex}")),
+            [(SensitiveKind::Secret, hex)]
         );
     }
 }

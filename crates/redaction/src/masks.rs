@@ -5,7 +5,7 @@ use crate::{Rect, SensitiveKind, track::Track};
 /// The shortest mask the editor's mask track lets a user make.
 pub const MIN_MASK_DURATION: f64 = 1.0;
 /// Extra time on both ends, so a blur never trails the text by a frame.
-const TIME_PADDING: f64 = 0.05;
+const TIME_PADDING: f64 = 0.1;
 /// Positions that a straight line between their neighbours reproduces this
 /// closely (a share of the output frame) are dropped from the keyframes.
 const KEYFRAME_TOLERANCE: f64 = 0.0015;
@@ -77,7 +77,7 @@ pub fn track_to_masks(
     let samples = times
         .into_iter()
         .map(|time| {
-            let source = padded_bounds(track.kind, track.bounds_at(time), plan.source_size);
+            let source = padded_bounds(track.kind, track.cover_at(time), plan.source_size);
             let placed = map(time, source).filter(|rect| rect.intersect(Rect::UNIT).is_some());
             (time, placed)
         })
@@ -270,28 +270,126 @@ fn overlaps(a: &MaskSegment, b: &MaskSegment) -> bool {
     a.start < b.end && b.start < a.end
 }
 
+/// How many mask lanes a scan may add. Every lane is a row on the timeline
+/// and a blur pass per frame, so past this, items that share the screen
+/// share a mask.
+pub const MAX_GENERATED_LANES: u32 = 8;
+
 /// Gives each new mask the lowest mask lane it fits on without overlapping
-/// another mask there, and drops masks an earlier scan already made.
+/// another mask there, and drops masks an earlier scan already made. When
+/// more items are on screen at once than [`MAX_GENERATED_LANES`] allows,
+/// the extra ones join the placed mask that grows least by covering them.
 pub fn place_masks(existing: &[MaskSegment], new: Vec<MaskSegment>) -> Vec<MaskSegment> {
     let mut new = new;
     new.sort_by(|a, b| a.start.total_cmp(&b.start));
+    let lane_limit = existing
+        .iter()
+        .map(|mask| mask.track + 1)
+        .max()
+        .unwrap_or(0)
+        + MAX_GENERATED_LANES;
     let mut placed: Vec<MaskSegment> = Vec::with_capacity(new.len());
     for mut mask in new {
         if existing.iter().any(|existing| duplicates(existing, &mask)) {
             continue;
         }
-        let mut lane = 0;
-        while existing
-            .iter()
-            .chain(&placed)
-            .any(|other| other.track == lane && overlaps(other, &mask))
+        let lane = free_lane(existing, &placed, &mask, None);
+        if lane >= lane_limit
+            && let Some((index, merged)) = best_merge(existing, &placed, &mask)
         {
-            lane += 1;
+            placed[index] = merged;
+            continue;
         }
         mask.track = lane;
         placed.push(mask);
     }
     placed
+}
+
+fn free_lane(
+    existing: &[MaskSegment],
+    placed: &[MaskSegment],
+    mask: &MaskSegment,
+    skip: Option<usize>,
+) -> u32 {
+    let mut lane = 0;
+    while existing
+        .iter()
+        .chain(
+            placed
+                .iter()
+                .enumerate()
+                .filter_map(|(index, other)| (Some(index) != skip).then_some(other)),
+        )
+        .any(|other| other.track == lane && overlaps(other, mask))
+    {
+        lane += 1;
+    }
+    lane
+}
+
+fn best_merge(
+    existing: &[MaskSegment],
+    placed: &[MaskSegment],
+    mask: &MaskSegment,
+) -> Option<(usize, MaskSegment)> {
+    placed
+        .iter()
+        .enumerate()
+        .filter(|(_, other)| overlaps(other, mask))
+        .filter_map(|(index, other)| {
+            let mut merged = merge_masks(other, mask);
+            merged.track = other.track;
+            let lane_clear = existing
+                .iter()
+                .chain(
+                    placed
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(other_index, other)| (other_index != index).then_some(other)),
+                )
+                .all(|other| other.track != merged.track || !overlaps(other, &merged));
+            lane_clear.then(|| {
+                let probe = (mask.start.max(other.start) + mask.end.min(other.end)) / 2.0;
+                let growth =
+                    mask_rect_at(&merged, probe).area() - mask_rect_at(other, probe).area();
+                (growth, index, merged)
+            })
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, index, merged)| (index, merged))
+}
+
+/// One mask covering both masks for as long as either is shown.
+fn merge_masks(a: &MaskSegment, b: &MaskSegment) -> MaskSegment {
+    let start = a.start.min(b.start);
+    let end = a.end.max(b.end);
+    let mut times = vec![a.start, a.end, b.start, b.end];
+    for mask in [a, b] {
+        times.extend(
+            mask.keyframes
+                .position
+                .iter()
+                .chain(&mask.keyframes.size)
+                .map(|key| mask.start + key.time),
+        );
+    }
+    times.retain(|time| (start..=end).contains(time));
+    times.sort_by(f64::total_cmp);
+    times.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+    let samples = times
+        .into_iter()
+        .map(|time| {
+            let shown = [a, b]
+                .into_iter()
+                .filter(|mask| (mask.start - 1e-9..=mask.end + 1e-9).contains(&time))
+                .map(|mask| mask_rect_at(mask, time))
+                .reduce(|union, rect| union.union(rect))
+                .unwrap_or_else(|| mask_rect_at(a, time).union(mask_rect_at(b, time)));
+            (time, shown)
+        })
+        .collect::<Vec<_>>();
+    mask_from_samples(&samples, (start, end), a)
 }
 
 #[cfg(test)]
@@ -361,7 +459,7 @@ mod tests {
         ));
         assert!(matches!(mask.mask_type, MaskKind::Sensitive));
         assert_eq!(mask.pixelation, 42.0);
-        assert!((mask.start - 1.85).abs() < 1e-9 && (mask.end - 3.45).abs() < 1e-9);
+        assert!((mask.start - 1.8).abs() < 1e-9 && (mask.end - 3.5).abs() < 1e-9);
         assert!(mask.keyframes.position.is_empty() && mask.keyframes.size.is_empty());
         let rect = mask_rect_at(&mask, 2.5);
         let text = Rect::new(0.1, 0.5, 0.2, 0.02);
@@ -512,6 +610,64 @@ mod tests {
 
         let moved = place_masks(&all, vec![make(1.0, 4.0, 0.9)]);
         assert_eq!(moved.len(), 1);
+    }
+
+    #[test]
+    fn many_items_on_screen_at_once_share_a_bounded_number_of_lanes() {
+        let template = template();
+        let rows = (0..40)
+            .map(|row| {
+                let y = 0.02 + f64::from(row) * 0.024;
+                only(track_to_masks(
+                    &track(&[(1.0, y), (5.0, y)], 1.0, 5.0),
+                    &plan(&template),
+                    &mut identity,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let placed = place_masks(&[], rows.clone());
+        let lanes = placed.iter().map(|mask| mask.track).max().unwrap() + 1;
+        assert!(lanes <= MAX_GENERATED_LANES, "{lanes}");
+        assert!(placed.len() < rows.len());
+        for lane in 0..lanes {
+            let on_lane = placed
+                .iter()
+                .filter(|mask| mask.track == lane)
+                .collect::<Vec<_>>();
+            for (index, a) in on_lane.iter().enumerate() {
+                for b in &on_lane[index + 1..] {
+                    assert!(!overlaps(a, b));
+                }
+            }
+        }
+        for row in &rows {
+            let wanted = mask_rect_at(row, 3.0);
+            assert!(
+                placed.iter().any(|mask| {
+                    mask.start <= row.start
+                        && mask.end >= row.end
+                        && mask_rect_at(mask, 3.0).overlap_of_smaller(wanted) > 0.999
+                }),
+                "{wanted:?}"
+            );
+        }
+
+        let sequential = (0..40)
+            .map(|step| {
+                let start = f64::from(step) * 2.0;
+                only(track_to_masks(
+                    &track(&[(start, 0.5)], start, start + 1.0),
+                    &MaskPlan {
+                        total_duration: 100.0,
+                        ..plan(&template)
+                    },
+                    &mut identity,
+                ))
+            })
+            .collect::<Vec<_>>();
+        let placed = place_masks(&[], sequential);
+        assert_eq!(placed.len(), 40);
+        assert!(placed.iter().all(|mask| mask.track == 0));
     }
 
     #[test]

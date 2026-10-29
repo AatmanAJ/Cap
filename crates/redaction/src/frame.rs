@@ -3,19 +3,52 @@ use std::sync::Arc;
 use crate::Rect;
 
 /// One 8-bit luma plane. Text recognition and change detection only need
-/// brightness, and every decoder hands out a Y plane for free.
+/// brightness, and every decoder hands out a Y plane for free. Always holds
+/// `stride * height` bytes with `stride >= width > 0`, which the readers
+/// rely on.
 #[derive(Clone, Debug)]
 pub struct LumaFrame {
-    pub data: Vec<u8>,
-    pub width: u32,
-    pub height: u32,
-    pub stride: usize,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+    stride: usize,
 }
 
 impl LumaFrame {
+    pub fn new(data: Vec<u8>, width: u32, height: u32, stride: usize) -> Option<Self> {
+        let valid = width > 0
+            && height > 0
+            && stride >= width as usize
+            && stride
+                .checked_mul(height as usize)
+                .is_some_and(|len| data.len() >= len);
+        valid.then_some(Self {
+            data,
+            width,
+            height,
+            stride,
+        })
+    }
+
+    pub fn data(&self) -> &[u8] {
+        &self.data
+    }
+
+    pub fn width(&self) -> u32 {
+        self.width
+    }
+
+    pub fn height(&self) -> u32 {
+        self.height
+    }
+
+    pub fn stride(&self) -> usize {
+        self.stride
+    }
+
     pub fn from_rgba(rgba: &[u8], width: u32, height: u32, stride: usize) -> Option<Self> {
         let row = width as usize * 4;
-        if stride < row || rgba.len() < stride * height as usize {
+        if width == 0 || height == 0 || stride < row || rgba.len() < stride * height as usize {
             return None;
         }
         let mut data = Vec::with_capacity(width as usize * height as usize);
@@ -28,24 +61,12 @@ impl LumaFrame {
                 data.push(luma as u8);
             }
         }
-        Some(Self {
-            data,
-            width,
-            height,
-            stride: width as usize,
-        })
+        Self::new(data, width, height, width as usize)
     }
 
     pub fn from_plane(plane: &[u8], width: u32, height: u32, stride: usize) -> Option<Self> {
-        if stride < width as usize || plane.len() < stride * height as usize {
-            return None;
-        }
-        Some(Self {
-            data: plane[..stride * height as usize].to_vec(),
-            width,
-            height,
-            stride,
-        })
+        let len = stride.checked_mul(height as usize)?;
+        Self::new(plane.get(..len)?.to_vec(), width, height, stride)
     }
 }
 
@@ -269,6 +290,18 @@ mod tests {
             (half.width, half.height, half.data.as_slice()),
             (1, 1, &[3u8][..])
         );
+    }
+
+    #[test]
+    fn frames_that_would_read_out_of_bounds_are_refused() {
+        assert!(LumaFrame::new(vec![0; 8], 4, 2, 4).is_some());
+        assert!(LumaFrame::new(vec![0; 8], 4, 2, 3).is_none());
+        assert!(LumaFrame::new(vec![0; 7], 4, 2, 4).is_none());
+        assert!(LumaFrame::new(vec![0; 8], 0, 2, 4).is_none());
+        assert!(LumaFrame::new(Vec::new(), 4, 0, 4).is_none());
+        assert!(LumaFrame::new(vec![0; 8], 4, 2, usize::MAX).is_none());
+        assert!(LumaFrame::from_plane(&[0; 7], 4, 2, 4).is_none());
+        assert!(LumaFrame::from_rgba(&[0; 16], 0, 1, 16).is_none());
     }
 
     #[test]

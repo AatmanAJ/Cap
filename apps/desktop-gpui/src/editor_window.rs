@@ -1332,7 +1332,20 @@ fn same_edit_apart_from_masks(
         }
         serde_json::to_value(project).ok()
     };
-    without_masks(scanned) == without_masks(current)
+    match (without_masks(scanned), without_masks(current)) {
+        (Some(scanned), Some(current)) => scanned == current,
+        _ => false,
+    }
+}
+
+/// Raises its flag when dropped, so the UI stops waiting on a scan even
+/// when the scan task panics instead of finishing.
+struct FinishOnDrop(Arc<AtomicBool>);
+
+impl Drop for FinishOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -5858,7 +5871,8 @@ impl EditorWindow {
             let scan_finished = finished.clone();
             let scan_cancel = cancel.clone();
             let scan = gpui_tokio::Tokio::spawn(cx, async move {
-                let result = cap_editor::scan_for_sensitive_info(
+                let _finished = FinishOnDrop(scan_finished);
+                cap_editor::scan_for_sensitive_info(
                     &recording_meta,
                     constants,
                     Arc::new(scanned),
@@ -5867,9 +5881,7 @@ impl EditorWindow {
                     move |value| scan_progress.store(value.to_bits(), Ordering::Relaxed),
                     scan_cancel,
                 )
-                .await;
-                scan_finished.store(true, Ordering::Release);
-                result
+                .await
             });
 
             while !finished.load(Ordering::Acquire) {
@@ -13427,6 +13439,19 @@ mod tests {
             "style_controls timeline_segments=2000 samples=31 repaints_per_sample=10 median_us={:.3}",
             samples[samples.len() / 2]
         );
+    }
+
+    #[test]
+    fn a_panicking_scan_still_releases_the_lane() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let outcome = std::thread::spawn(move || {
+            let _finished = FinishOnDrop(flag);
+            panic!("scan failed");
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert!(finished.load(Ordering::Acquire));
     }
 
     #[test]

@@ -34,6 +34,39 @@ impl Track {
         }
         self.points[self.points.len() - 1].bounds
     }
+
+    /// [`Self::bounds_at`], but before the first sighting and after the
+    /// last it also covers where the item was heading: something scrolling
+    /// in or out was already, or still, moving at its last known speed.
+    pub fn cover_at(&self, time: f64) -> Rect {
+        let bounds = self.bounds_at(time);
+        let [first, second, ..] = self.points[..] else {
+            return bounds;
+        };
+        let last = self.points[self.points.len() - 1];
+        let before_last = self.points[self.points.len() - 2];
+        let (anchor, from, to) = if time < first.time {
+            (first, first, second)
+        } else if time > last.time {
+            (last, before_last, last)
+        } else {
+            return bounds;
+        };
+        let span = to.time - from.time;
+        if span <= 1e-9 {
+            return bounds;
+        }
+        let elapsed = time - anchor.time;
+        let dx = (to.bounds.x - from.bounds.x) / span * elapsed;
+        let dy = (to.bounds.y - from.bounds.y) / span * elapsed;
+        let moved = Rect::new(
+            anchor.bounds.x + dx,
+            anchor.bounds.y + dy,
+            anchor.bounds.width,
+            anchor.bounds.height,
+        );
+        bounds.union(moved)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -374,6 +407,37 @@ mod tests {
         assert_eq!(track.end, 5.0);
         let middle = track.bounds_at(1.25);
         assert!((middle.y - (0.8 - 0.125)).abs() < 1e-9, "{middle:?}");
+    }
+
+    #[test]
+    fn coverage_extends_along_the_motion_at_both_ends() {
+        let track = Track {
+            kind: SensitiveKind::Email,
+            key: "a@b.co".into(),
+            points: vec![
+                TrackPoint {
+                    time: 1.0,
+                    bounds: Rect::new(0.1, 0.6, 0.2, 0.03),
+                },
+                TrackPoint {
+                    time: 1.5,
+                    bounds: Rect::new(0.1, 0.5, 0.2, 0.03),
+                },
+            ],
+            start: 0.6,
+            end: 1.9,
+        };
+        let before = track.cover_at(0.6);
+        assert!((before.y - 0.6).abs() < 1e-9 && (before.bottom() - 0.71).abs() < 1e-9);
+        let after = track.cover_at(1.9);
+        assert!((after.y - 0.42).abs() < 1e-9 && (after.bottom() - 0.53).abs() < 1e-9);
+        assert_eq!(track.cover_at(1.25), track.bounds_at(1.25));
+
+        let still = Track {
+            points: vec![track.points[0]],
+            ..track
+        };
+        assert_eq!(still.cover_at(0.5), still.points[0].bounds);
     }
 
     #[test]

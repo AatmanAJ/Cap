@@ -3673,7 +3673,7 @@ pub struct FrameLayout {
 /// Where the screen recording lands in the output frame on one frame: source
 /// pixels inside `crop_bounds` map linearly onto output pixels inside
 /// `target_bounds` (zoom, padding, crop, split and takeover morphs included;
-/// a 3D pose warps the card further and is not included).
+/// a 3D pose warps the card further, which `warped` reports).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DisplayPlacement {
     pub source_size: [f32; 2],
@@ -3681,6 +3681,7 @@ pub struct DisplayPlacement {
     pub target_bounds: [f32; 4],
     pub output_size: [u32; 2],
     pub visible: bool,
+    pub warped: bool,
 }
 
 impl DisplayPlacement {
@@ -3702,6 +3703,22 @@ impl DisplayPlacement {
             output_y / f64::from(self.output_size[1].max(1)),
         )
     }
+
+    /// Where a normalized source rectangle can appear in the output,
+    /// normalized: `None` while the screen is hidden, and the whole frame
+    /// while a 3D pose warps the screen, since the flat mapping no longer
+    /// says where the rectangle went and a mask must not miss it.
+    pub fn cover_source_rect(&self, x0: f64, y0: f64, x1: f64, y1: f64) -> Option<[f64; 4]> {
+        if !self.visible {
+            return None;
+        }
+        if self.warped {
+            return Some([0.0, 0.0, 1.0, 1.0]);
+        }
+        let (left, top) = self.source_to_output(x0, y0);
+        let (right, bottom) = self.source_to_output(x1, y1);
+        Some([left, top, right, bottom])
+    }
 }
 
 #[cfg(test)]
@@ -3716,6 +3733,7 @@ mod display_placement_tests {
             target_bounds: [192.0, 108.0, 1728.0, 972.0],
             output_size: [1920, 1080],
             visible: true,
+            warped: false,
         };
         assert_eq!(padded.source_to_output(0.0, 0.0), (0.1, 0.1));
         assert_eq!(padded.source_to_output(1.0, 1.0), (0.9, 0.9));
@@ -3727,9 +3745,39 @@ mod display_placement_tests {
             target_bounds: [-1920.0, 0.0, 1920.0, 2160.0],
             output_size: [1920, 1080],
             visible: true,
+            warped: false,
         };
         let (x, y) = cropped_and_zoomed.source_to_output(0.875, 0.25);
         assert!((x - 0.5).abs() < 1e-9 && (y - 1.0).abs() < 1e-9, "{x} {y}");
+    }
+
+    #[test]
+    fn hidden_screens_get_no_mask_and_3d_poses_get_the_whole_frame() {
+        let flat = DisplayPlacement {
+            source_size: [1920.0, 1080.0],
+            crop_bounds: [0.0, 0.0, 1920.0, 1080.0],
+            target_bounds: [0.0, 0.0, 1920.0, 1080.0],
+            output_size: [1920, 1080],
+            visible: true,
+            warped: false,
+        };
+        assert_eq!(
+            flat.cover_source_rect(0.1, 0.2, 0.3, 0.4),
+            Some([0.1, 0.2, 0.3, 0.4])
+        );
+        let warped = DisplayPlacement {
+            warped: true,
+            ..flat
+        };
+        assert_eq!(
+            warped.cover_source_rect(0.1, 0.2, 0.3, 0.4),
+            Some([0.0, 0.0, 1.0, 1.0])
+        );
+        let hidden = DisplayPlacement {
+            visible: false,
+            ..warped
+        };
+        assert_eq!(hidden.cover_source_rect(0.1, 0.2, 0.3, 0.4), None);
     }
 }
 
@@ -3762,6 +3810,10 @@ impl ProjectUniforms {
             target_bounds: self.display.target_bounds,
             output_size: [self.output_size.0, self.output_size.1],
             visible: self.scene.should_render_screen() && self.display.opacity > 0.01,
+            warped: self
+                .camera3d
+                .as_ref()
+                .is_some_and(|camera3d| camera3d.pose.is_some()),
         }
     }
 

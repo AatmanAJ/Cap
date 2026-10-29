@@ -33,10 +33,7 @@ impl VisionAnalyzer {
     }
 
     fn analyze_inner(&mut self, frame: &LumaFrame) -> Result<Vec<Detection>, String> {
-        let (width, height) = (frame.width as usize, frame.height as usize);
-        if width == 0 || height == 0 || frame.data.len() < frame.stride * height {
-            return Err("invalid frame for text recognition".into());
-        }
+        let (width, height) = (frame.width() as usize, frame.height() as usize);
         let input = match &mut self.input {
             Some(input) if input.width() == width && input.height() == height => input,
             slot => slot.insert(create_input(width, height)?),
@@ -66,6 +63,7 @@ impl VisionAnalyzer {
             .map_err(|error| format!("Vision text recognition failed: {error:?}"))?;
 
         let mut detections = Vec::new();
+        let mut lines = Vec::new();
         if let Some(observations) = text_request.results() {
             for observation in observations.iter() {
                 let candidates = observation.top_candidates(1);
@@ -73,14 +71,25 @@ impl VisionAnalyzer {
                     continue;
                 };
                 let text = candidate.string().to_string();
-                let line_bounds = flip(observation.bounding_box());
-                for found in detect::find_sensitive_text(&text, &self.options) {
+                lines.push((flip(observation.bounding_box()), candidate.retained(), text));
+            }
+        }
+        lines.sort_by(|a, b| a.0.y.total_cmp(&b.0.y).then(a.0.x.total_cmp(&b.0.x)));
+        let texts = lines
+            .iter()
+            .map(|(_, _, text)| text.as_str())
+            .collect::<Vec<_>>();
+        let matches = detect::find_sensitive_lines(&texts, &self.options);
+        {
+            for ((line_bounds, candidate, text), found_in_line) in lines.iter().zip(matches) {
+                let (line_bounds, text) = (*line_bounds, text.as_str());
+                for found in found_in_line {
                     // Vision boxes whole words, so a key glued to its label
                     // (`API_KEY=sk-...`) gets the word's box: slice the
                     // match out of it by character position instead.
-                    let word = word_around(&text, found.range.clone());
+                    let word = word_around(text, found.range.clone());
                     let bounds = candidate
-                        .bounding_box_for_range(utf16_range(&text, word.clone()))
+                        .bounding_box_for_range(utf16_range(text, word.clone()))
                         .map(|rect| flip(rect.bounding_box()))
                         .ok()
                         .filter(|bounds| bounds.width > 0.0 && bounds.height > 0.0)
@@ -89,7 +98,7 @@ impl VisionAnalyzer {
                                 found.range.start - word.start..found.range.end - word.start
                             })
                         })
-                        .unwrap_or_else(|| slice_bounds(line_bounds, &text, found.range.clone()));
+                        .unwrap_or_else(|| slice_bounds(line_bounds, text, found.range.clone()));
                     detections.push(Detection {
                         kind: found.kind,
                         key: found.key,
@@ -187,7 +196,7 @@ fn create_input(width: usize, height: usize) -> Result<arc::R<cv::PixelBuf>, Str
 }
 
 fn write_luma(buffer: &mut cv::PixelBuf, frame: &LumaFrame) -> Result<(), String> {
-    let row = frame.width as usize;
+    let row = frame.width() as usize;
     unsafe {
         buffer
             .lock_base_addr(cv::pixel_buffer::LockFlags::DEFAULT)
@@ -200,9 +209,9 @@ fn write_luma(buffer: &mut cv::PixelBuf, frame: &LumaFrame) -> Result<(), String
         Err("text recognition input is not addressable".to_string())
     } else {
         for (y, source) in frame
-            .data
-            .chunks(frame.stride)
-            .take(frame.height as usize)
+            .data()
+            .chunks(frame.stride())
+            .take(frame.height() as usize)
             .enumerate()
         {
             unsafe { std::ptr::copy_nonoverlapping(source.as_ptr(), base.add(y * stride), row) };

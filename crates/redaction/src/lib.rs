@@ -143,7 +143,6 @@ pub struct Detection {
     pub bounds: Rect,
 }
 
-/// Whether this build can read text off the screen.
 pub fn ocr_available() -> bool {
     cfg!(target_os = "macos")
 }
