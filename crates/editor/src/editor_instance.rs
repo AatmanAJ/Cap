@@ -251,6 +251,14 @@ pub struct EditorInstance {
     pub preview_layers: std::sync::Mutex<Option<RendererLayers>>,
     runtime_handle: tokio::runtime::Handle,
     audio_output: Arc<crate::AudioOutput>,
+    camera_analysis: std::sync::Mutex<CameraAnalysisJob>,
+}
+
+#[derive(Default)]
+struct CameraAnalysisJob {
+    running: bool,
+    attempted: crate::CameraAnalysisRequest,
+    cancelled: Arc<AtomicBool>,
 }
 
 impl EditorInstance {
@@ -660,6 +668,7 @@ impl EditorInstance {
             playback_epoch: AtomicU64::new(0),
             runtime_handle: tokio::runtime::Handle::current(),
             audio_output,
+            camera_analysis: std::sync::Mutex::new(CameraAnalysisJob::default()),
         });
 
         this.state.lock().await.preview_task =
@@ -786,6 +795,7 @@ impl EditorInstance {
             preview_layers: std::sync::Mutex::new(None),
             runtime_handle: self.runtime_handle.clone(),
             audio_output: self.audio_output.clone(),
+            camera_analysis: std::sync::Mutex::new(CameraAnalysisJob::default()),
         });
         next.state.lock().await.preview_task =
             Some(next.clone().spawn_preview_renderer(preview_rx));
@@ -804,7 +814,74 @@ impl EditorInstance {
         self.dispose_inner(true).await
     }
 
+    /// Starts the speech/face analysis the camera settings need when the
+    /// render constants do not have it yet. Cheap when nothing is missing, so
+    /// it is called on every project change; the result is cached on disk
+    /// and the preview re-renders once it lands.
+    pub fn ensure_camera_analysis(self: &Arc<Self>, project: &ProjectConfiguration) {
+        let Some(meta) = self.meta.studio_meta() else {
+            return;
+        };
+        let sources = cap_rendering::segment_sources(&self.meta.project_path, meta);
+        let missing = self
+            .render_constants
+            .camera_analysis
+            .with_analysis(|analysis| {
+                crate::CameraAnalysisRequest::for_project(project).missing_from(analysis, &sources)
+            });
+        let cancelled = {
+            let mut job = self
+                .camera_analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let missing = crate::CameraAnalysisRequest {
+                speech: missing.speech && !job.attempted.speech,
+                faces: missing.faces && !job.attempted.faces,
+            };
+            if job.running || missing.is_empty() {
+                return;
+            }
+            job.running = true;
+            job.attempted.speech |= missing.speech;
+            job.attempted.faces |= missing.faces;
+            Arc::clone(&job.cancelled)
+        };
+        let this = Arc::clone(self);
+        let request = crate::CameraAnalysisRequest::for_project(project);
+        self.runtime_handle.spawn(async move {
+            let project_path = this.meta.project_path.clone();
+            let meta = this.meta.studio_meta().cloned();
+            let result = match meta {
+                Some(meta) => tokio::task::spawn_blocking(move || {
+                    crate::analyze_camera(&project_path, &meta, request, &cancelled)
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result),
+                None => Err("not a studio recording".into()),
+            };
+            match result {
+                Ok(analysis) => {
+                    this.render_constants.camera_analysis.set(analysis);
+                    this.preview_tx.send_modify(|_| {});
+                }
+                Err(error) => tracing::warn!(%error, "Camera analysis did not finish"),
+            }
+            this.camera_analysis
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .running = false;
+            let latest = this.project_config.1.borrow().clone();
+            this.ensure_camera_analysis(&latest);
+        });
+    }
+
     async fn dispose_inner(&self, refresh_thumbnail: bool) -> bool {
+        self.camera_analysis
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancelled
+            .store(true, Ordering::Relaxed);
         self.playback_epoch.fetch_add(1, Ordering::SeqCst);
         let mut state = self.state.lock().await;
 

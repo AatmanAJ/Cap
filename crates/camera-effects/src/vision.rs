@@ -384,7 +384,7 @@ impl Cleanup {
     }
 }
 
-fn create_input(width: usize, height: usize) -> Result<arc::R<cv::PixelBuf>, String> {
+pub(crate) fn create_input(width: usize, height: usize) -> Result<arc::R<cv::PixelBuf>, String> {
     let properties = cf::Dictionary::new();
     let attributes = cf::Dictionary::with_keys_values(
         &[cv::pixel_buffer::keys::io_surf_props().as_ref()],
@@ -395,7 +395,7 @@ fn create_input(width: usize, height: usize) -> Result<arc::R<cv::PixelBuf>, Str
         .map_err(|error| format!("segmentation input buffer: {error:?}"))
 }
 
-fn write_bgra(
+pub(crate) fn write_bgra(
     buffer: &mut cv::PixelBuf,
     bgra: &[u8],
     width: usize,

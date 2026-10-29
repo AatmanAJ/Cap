@@ -1,5 +1,6 @@
 mod audio;
 mod audio_output;
+mod camera_analysis;
 mod completed_audio;
 mod editor;
 mod editor_instance;
@@ -21,6 +22,7 @@ pub use audio_output::{
     AudioOutput, HEADLESS_BLOCK_FRAMES, HEADLESS_CHANNELS, HEADLESS_SAMPLE_RATE, HeadlessAudioTap,
     PlaySpec,
 };
+pub use camera_analysis::{CameraAnalysisRequest, analyze_camera};
 pub use cap_audio::{
     TranscriptionAudioSource, TranscriptionAudioTake, append_transcription_audio,
     assemble_transcription_audio, waveform_peaks,

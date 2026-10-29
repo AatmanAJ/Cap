@@ -190,6 +190,24 @@ impl ExporterBuilder {
             .map_err(Error::RendererSetup)?,
         );
 
+        let camera_request = cap_editor::CameraAnalysisRequest::for_project(&project_config);
+        if !camera_request.is_empty() {
+            let project_path = recording_meta.project_path.clone();
+            let meta = studio_meta.clone();
+            let cancelled = cancellation
+                .clone()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            match tokio::task::spawn_blocking(move || {
+                cap_editor::analyze_camera(&project_path, &meta, camera_request, &cancelled)
+            })
+            .await
+            {
+                Ok(Ok(analysis)) => render_constants.camera_analysis.set(analysis),
+                Ok(Err(error)) => tracing::warn!(%error, "Camera analysis did not finish"),
+                Err(error) => tracing::warn!(%error, "Camera analysis panicked"),
+            }
+        }
+
         let user_cancellation = cancellation.clone();
         let audio_cancellation = if stream_audio {
             cancellation.map(ExportAudioCancellation::new)

@@ -33,6 +33,7 @@ use std::{path::PathBuf, time::Instant};
 use tokio::sync::mpsc;
 
 pub mod camera3d;
+mod camera_automation;
 pub mod composite_frame;
 mod coord;
 pub mod cpu_yuv;
@@ -65,6 +66,7 @@ pub mod yuv_converter;
 mod zoom;
 mod zoom_spring;
 
+pub use camera_automation::*;
 pub use coord::*;
 pub use decoder::{DecodedFrame, DecoderStatus, DecoderType, PixelFormat};
 #[cfg(target_os = "macos")]
@@ -2578,6 +2580,7 @@ pub struct RenderVideoConstants {
     adapter_name: String,
     frozen_recorded_cursors: Option<FrozenRecordedCursorAssets>,
     project_styles: ProjectStyleCache,
+    pub camera_analysis: CameraAnalysisStore,
 }
 
 /// Instance, adapter and device the way every renderer creates them. A
@@ -2810,6 +2813,7 @@ impl RenderVideoConstants {
         if shared.is_software_adapter {
             frame_pipeline::note_software_adapter_in_use();
         }
+        let camera_analysis = CameraAnalysisStore::load(&recording_meta.project_path, &meta);
 
         Ok(Self {
             _instance: shared.instance,
@@ -2822,6 +2826,7 @@ impl RenderVideoConstants {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis,
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         })
@@ -2842,6 +2847,7 @@ impl RenderVideoConstants {
         if shared.is_software_adapter {
             frame_pipeline::note_software_adapter_in_use();
         }
+        let camera_analysis = CameraAnalysisStore::load(&recording_meta.project_path, &meta);
         Self {
             _instance: shared.instance,
             _adapter: shared.adapter,
@@ -2853,6 +2859,7 @@ impl RenderVideoConstants {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis,
             is_software_adapter: shared.is_software_adapter,
             adapter_name,
         }
@@ -2903,6 +2910,7 @@ impl RenderVideoConstants {
             frame_pipeline::note_software_adapter_in_use();
         }
 
+        let camera_analysis = CameraAnalysisStore::load(&recording_meta.project_path, &meta);
         constants_phase.finish("returned");
         Ok(Self {
             _instance: instance,
@@ -2915,6 +2923,7 @@ impl RenderVideoConstants {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis,
             is_software_adapter,
             adapter_name,
         })
@@ -4401,11 +4410,17 @@ impl ProjectUniforms {
                 0.0
             };
 
-        let scene_segments = project
-            .timeline
-            .as_ref()
-            .map(|t| t.scene_segments.as_slice())
-            .unwrap_or(&[]);
+        let silence_scene_segments = constants
+            .camera_analysis
+            .scene_segments(shared_project, total_duration);
+        let scene_segments = match &silence_scene_segments {
+            Some(segments) => segments.as_slice(),
+            None => project
+                .timeline
+                .as_ref()
+                .map(|t| t.scene_segments.as_slice())
+                .unwrap_or(&[]),
+        };
 
         // All zoom transforms come from the precomputed spring timeline
         // (TIMELINE-time domain). The old easing construction — and the
@@ -5006,6 +5021,15 @@ impl ProjectUniforms {
             display_outer_bounds
         };
 
+        let face_center = project
+            .camera
+            .tracks_face()
+            .then(|| {
+                constants
+                    .camera_analysis
+                    .face_center(project, &constants.meta, timeline_time)
+            })
+            .flatten();
         let camera = camera_size
             .filter(|_| !project.camera.hide && scene.should_render_camera())
             .map(|camera_size| {
@@ -5122,6 +5146,15 @@ impl ProjectUniforms {
                             [0.0, offset, frame_size[0], frame_size[1] - offset]
                         }
                     }
+                };
+                let crop_bounds = match face_center {
+                    Some(center) => face_crop(
+                        crop_bounds,
+                        frame_size,
+                        center,
+                        project.camera.face_zoom_clamped(),
+                    ),
+                    None => crop_bounds,
                 };
 
                 // Morph the camera from its PiP overlay toward its split-screen
@@ -6508,6 +6541,7 @@ mod style_image_tests {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis: CameraAnalysisStore::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: false,
         };
@@ -6764,6 +6798,7 @@ mod export_order_tests {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis: CameraAnalysisStore::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter: is_software_adapter || software_path,
         })
@@ -7101,6 +7136,7 @@ mod nv12_flush_tests {
             recording_meta,
             frozen_recorded_cursors: None,
             project_styles: ProjectStyleCache::default(),
+            camera_analysis: CameraAnalysisStore::default(),
             background_textures: Arc::new(BackgroundTextureCache::default()),
             is_software_adapter,
         })

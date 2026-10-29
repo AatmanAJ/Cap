@@ -565,6 +565,10 @@ pub struct Camera {
     pub scale_during_zoom: f32,
     #[serde(default)]
     pub background_blur: BackgroundBlurConfig,
+    pub hide_when_silent: bool,
+    pub hide_when_silent_delay: f32,
+    pub track_face: bool,
+    pub face_zoom: f32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
@@ -586,6 +590,39 @@ impl Camera {
 
     fn default_scale_during_zoom() -> f32 {
         0.7
+    }
+
+    pub const HIDE_WHEN_SILENT_DELAY_RANGE: (f32, f32) = (1.0, 10.0);
+    pub const FACE_ZOOM_RANGE: (f32, f32) = (1.0, 1.6);
+
+    fn default_hide_when_silent_delay() -> f32 {
+        2.0
+    }
+
+    fn default_face_zoom() -> f32 {
+        1.3
+    }
+
+    pub fn hide_when_silent_delay_clamped(&self) -> f32 {
+        let (min, max) = Self::HIDE_WHEN_SILENT_DELAY_RANGE;
+        if self.hide_when_silent_delay.is_finite() {
+            self.hide_when_silent_delay.clamp(min, max)
+        } else {
+            Self::default_hide_when_silent_delay()
+        }
+    }
+
+    pub fn face_zoom_clamped(&self) -> f32 {
+        let (min, max) = Self::FACE_ZOOM_RANGE;
+        if self.face_zoom.is_finite() {
+            self.face_zoom.clamp(min, max)
+        } else {
+            Self::default_face_zoom()
+        }
+    }
+
+    pub fn tracks_face(&self) -> bool {
+        cfg!(target_os = "macos") && self.track_face
     }
 }
 
@@ -609,6 +646,10 @@ impl Default for Camera {
             rounding_type: CornerStyle::default(),
             scale_during_zoom: Self::default_scale_during_zoom(),
             background_blur: BackgroundBlurConfig::default(),
+            hide_when_silent: false,
+            hide_when_silent_delay: Self::default_hide_when_silent_delay(),
+            track_face: false,
+            face_zoom: Self::default_face_zoom(),
         }
     }
 }
@@ -3014,6 +3055,26 @@ impl ProjectConfiguration {
             })
     }
 
+    fn camera_configs(&self) -> impl Iterator<Item = &Camera> {
+        std::iter::once(&self.camera).chain(
+            self.timeline
+                .iter()
+                .flat_map(|timeline| &timeline.style_segments)
+                .filter(|segment| segment.is_active_at(segment.start))
+                .filter_map(|segment| segment.overrides.camera.as_ref()),
+        )
+    }
+
+    pub fn wants_speech_analysis(&self) -> bool {
+        self.camera_configs()
+            .any(|camera| !camera.hide && camera.hide_when_silent)
+    }
+
+    pub fn wants_face_analysis(&self) -> bool {
+        self.camera_configs()
+            .any(|camera| !camera.hide && camera.tracks_face())
+    }
+
     fn default_screen_motion_blur() -> f32 {
         // With length-based blur semantics (amount scales the smear length,
         // output fully blurred) 1.0 gives the natural out-of-the-box look.
@@ -3416,6 +3477,55 @@ mod tests {
         );
         assert!(!style.is_active_at(0.0));
         assert!(!image.is_active_at(0.0));
+    }
+
+    #[test]
+    fn camera_automation_defaults_off_for_old_projects_and_round_trips() {
+        let config: ProjectConfiguration = serde_json::from_value(serde_json::json!({
+            "camera": { "hide": false, "size": 30.0 }
+        }))
+        .unwrap();
+        assert!(!config.camera.hide_when_silent);
+        assert!(!config.camera.track_face);
+        assert_eq!(config.camera.hide_when_silent_delay, 2.0);
+        assert_eq!(config.camera.face_zoom, 1.3);
+        assert!(!config.wants_speech_analysis());
+        assert!(!config.wants_face_analysis());
+
+        let mut config = config;
+        config.camera.hide_when_silent = true;
+        config.camera.hide_when_silent_delay = 3.5;
+        config.camera.track_face = true;
+        config.camera.face_zoom = 1.5;
+        let json = serde_json::to_value(&config).unwrap();
+        assert_eq!(json["camera"]["hideWhenSilent"], true);
+        assert_eq!(json["camera"]["trackFace"], true);
+        let reloaded: ProjectConfiguration = serde_json::from_value(json).unwrap();
+        assert!(reloaded.camera.hide_when_silent);
+        assert_eq!(reloaded.camera.hide_when_silent_delay, 3.5);
+        assert_eq!(reloaded.camera.face_zoom, 1.5);
+        assert!(reloaded.wants_speech_analysis());
+        assert_eq!(reloaded.wants_face_analysis(), cfg!(target_os = "macos"));
+
+        let mut hidden = reloaded;
+        hidden.camera.hide = true;
+        assert!(!hidden.wants_speech_analysis());
+        assert!(!hidden.wants_face_analysis());
+    }
+
+    #[test]
+    fn camera_automation_values_are_clamped_for_rendering() {
+        let mut camera = Camera {
+            hide_when_silent_delay: 0.1,
+            face_zoom: 9.0,
+            ..Default::default()
+        };
+        assert_eq!(camera.hide_when_silent_delay_clamped(), 1.0);
+        assert_eq!(camera.face_zoom_clamped(), 1.6);
+        camera.hide_when_silent_delay = f32::NAN;
+        camera.face_zoom = f32::INFINITY;
+        assert_eq!(camera.hide_when_silent_delay_clamped(), 2.0);
+        assert_eq!(camera.face_zoom_clamped(), 1.3);
     }
 
     #[test]

@@ -1,4 +1,6 @@
 mod blur_pipeline;
+#[cfg(target_os = "macos")]
+mod face;
 #[cfg(test)]
 mod gpu_tests;
 mod mask_refinement;
@@ -17,6 +19,9 @@ use mask_refinement::MaskRefiner;
 use mask_refinement::smooth_mask_value;
 use matte::{MattePipeline, MatteTextures};
 use segmentation::SegmentationModel;
+
+#[cfg(target_os = "macos")]
+pub use face::{DetectedFace, FaceDetector};
 
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub fn onnx_runtime_library_path() -> Option<std::path::PathBuf> {
