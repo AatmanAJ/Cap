@@ -32,6 +32,18 @@ struct Uniforms {
     color_adjust_b: vec4<f32>,
     // (grain amount, grain seed, grade-active flag, full-frame vignette flag).
     grain_params: vec4<f32>,
+    // Loupe lens (center u, center v, anchor u, anchor v) in card UV. The
+    // anchor is the content point shown at the lens center.
+    loupe_position: vec4<f32>,
+    // (half width px, half height px, corner radius px, magnification). A
+    // magnification below 1 disables the lens.
+    loupe_shape: vec4<f32>,
+    // Shutter-interval travel of the lens (center uv, anchor uv), already
+    // scaled by the screen motion blur amount.
+    loupe_motion: vec4<f32>,
+    // (display zoom amount, lens corner type, 0, 0). Above 1x the display
+    // upsamples with Catmull-Rom plus an adaptive sharpen.
+    sampling_params: vec4<f32>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: Uniforms;
@@ -61,6 +73,17 @@ fn vs_main(@builtin(vertex_index) vertex_index: u32) -> VertexOutput {
 // springs produce rays around 0.03-0.05 at the far corners; this only guards
 // synthetic or pathological amounts.
 const MAX_ZOOM_RAY_UV: f32 = 0.10;
+
+// Strongest CAS-style lobe weight, reached once a source texel covers
+// SHARPEN_FULL_UPSCALE output pixels. Kept mild: the result is also clamped to
+// the local min/max, so it can only restore contrast, never ring.
+const SHARPEN_MAX_LOBE: f32 = 0.2;
+const SHARPEN_FULL_UPSCALE: f32 = 2.5;
+
+const LOUPE_REFRACTION: f32 = 0.22;
+const LOUPE_CHROMA: f32 = 0.012;
+const LOUPE_SHADOW_OPACITY: f32 = 0.38;
+const LOUPE_BLUR_TAPS: i32 = 12;
 
 // Per-pixel random phase used to dither the fixed 13-tap zoom kernel
 // (deterministic in the fragment position, so renders stay reproducible).
@@ -328,13 +351,13 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     }
 
     let sample_target_uv = clamp(target_uv, vec2<f32>(0.0), vec2<f32>(1.0));
-    var base_color = sample_texture(sample_target_uv, crop_bounds_uv);
+    var base_color = sample_display(sample_target_uv, crop_bounds_uv);
     base_color.a = base_color.a * shape_coverage * uniforms.opacity;
 
     let zoom_amount = uniforms.motion_blur_params.z;
 
     if !blur_active {
-        return composite_source_over(apply_color_grade(base_color, target_uv, p), shadow_color);
+        return finish_card(base_color, target_uv, p, crop_bounds_uv, shadow_color);
     }
 
     // Length-based semantics: the user amount is baked into the LENGTH of
@@ -348,7 +371,7 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     if blur_mode < 1.5 {
         let velocity_uv = uniforms.motion_blur_vector;
         if length(velocity_uv) < 1e-5 {
-            return composite_source_over(apply_color_grade(base_color, target_uv, p), shadow_color);
+            return finish_card(base_color, target_uv, p, crop_bounds_uv, shadow_color);
         }
 
         // 21-tap box along [0, +v]: matches the reference directional filter
@@ -369,8 +392,11 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
         if out_alpha <= 0.0001 || alpha_sum <= 0.0001 {
             return shadow_color;
         }
-        return composite_source_over(
-            apply_color_grade(vec4(accum / alpha_sum, out_alpha), target_uv, p),
+        return finish_card(
+            vec4(accum / alpha_sum, out_alpha),
+            target_uv,
+            p,
+            crop_bounds_uv,
             shadow_color
         );
     }
@@ -379,7 +405,7 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     let dir = zoom_center - target_uv;
     let center_dist = length(dir);
     if center_dist < 1e-4 || zoom_amount < 1e-4 {
-        return composite_source_over(apply_color_grade(base_color, target_uv, p), shadow_color);
+        return finish_card(base_color, target_uv, p, crop_bounds_uv, shadow_color);
     }
 
     // Radial blur toward the scale origin: ray length grows with distance
@@ -413,10 +439,257 @@ fn fs_main(@builtin(position) frag_coord: vec4<f32>) -> @location(0) vec4<f32> {
     if out_alpha <= 0.0001 {
         return shadow_color;
     }
-    return composite_source_over(
-        apply_color_grade(vec4(accum / alpha_sum, out_alpha), target_uv, p),
+    return finish_card(
+        vec4(accum / alpha_sum, out_alpha),
+        target_uv,
+        p,
+        crop_bounds_uv,
         shadow_color
     );
+}
+
+fn finish_card(
+    color: vec4<f32>,
+    target_uv: vec2<f32>,
+    p: vec2<f32>,
+    crop_bounds_uv: vec4<f32>,
+    shadow_color: vec4<f32>
+) -> vec4<f32> {
+    let lensed = apply_loupe(color, p, crop_bounds_uv);
+    return composite_source_over(apply_color_grade(lensed, target_uv, p), shadow_color);
+}
+
+// Output pixels per source texel for the card as a whole.
+fn card_upscale_ratio(crop_bounds_uv: vec4<f32>) -> f32 {
+    let source_size = uniforms.frame_size * (crop_bounds_uv.zw - crop_bounds_uv.xy);
+    return max(
+        uniforms.target_size.x / max(source_size.x, 1.0),
+        uniforms.target_size.y / max(source_size.y, 1.0)
+    );
+}
+
+fn sample_display(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {
+    let display_zoom = uniforms.sampling_params.x;
+    if display_zoom > 1.0005 && uniforms.preserve_source_alpha < 0.5 {
+        let upscale = card_upscale_ratio(crop_bounds_uv);
+        if upscale > 1.0 {
+            return sample_sharp(uv, crop_bounds_uv, upscale, smoothstep(1.0, 1.15, display_zoom));
+        }
+    }
+    return sample_texture(uv, crop_bounds_uv);
+}
+
+struct CroppedSample {
+    uv: vec2<f32>,
+    safe_min: vec2<f32>,
+    safe_max: vec2<f32>,
+};
+
+fn crop_sample_uv(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> CroppedSample {
+    var sample_uv = uv;
+    if uniforms.mirror_x != 0.0 {
+        sample_uv.x = 1.0 - sample_uv.x;
+    }
+    let crop_size = crop_bounds_uv.zw - crop_bounds_uv.xy;
+    let texel_offset = 1.0 / uniforms.frame_size;
+    let safe_min = crop_bounds_uv.xy + texel_offset;
+    let safe_max = crop_bounds_uv.zw - texel_offset;
+    return CroppedSample(
+        clamp(sample_uv * crop_size + crop_bounds_uv.xy, safe_min, safe_max),
+        safe_min,
+        safe_max
+    );
+}
+
+fn sample_bilinear(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec3<f32> {
+    let cropped = crop_sample_uv(clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), crop_bounds_uv);
+    return textureSampleLevel(frame_texture, frame_sampler, cropped.uv, 0.0).rgb;
+}
+
+// 9-tap Catmull-Rom: the four inner bilinear taps fold the two centre texel
+// weights per axis into one fetch.
+fn sample_catmull_rom(uv: vec2<f32>, safe_min: vec2<f32>, safe_max: vec2<f32>) -> vec3<f32> {
+    let tex_size = uniforms.frame_size;
+    let sample_pos = uv * tex_size;
+    let tex_pos1 = floor(sample_pos - 0.5) + 0.5;
+    let f = sample_pos - tex_pos1;
+
+    let w0 = f * (-0.5 + f * (1.0 - 0.5 * f));
+    let w1 = 1.0 + f * f * (-2.5 + 1.5 * f);
+    let w2 = f * (0.5 + f * (2.0 - 1.5 * f));
+    let w3 = f * f * (-0.5 + 0.5 * f);
+    let w12 = w1 + w2;
+
+    let p0 = clamp((tex_pos1 - 1.0) / tex_size, safe_min, safe_max);
+    let p12 = clamp((tex_pos1 + w2 / w12) / tex_size, safe_min, safe_max);
+    let p3 = clamp((tex_pos1 + 2.0) / tex_size, safe_min, safe_max);
+
+    var color = vec3<f32>(0.0);
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p0.x, p0.y), 0.0).rgb * w0.x * w0.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p12.x, p0.y), 0.0).rgb * w12.x * w0.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p3.x, p0.y), 0.0).rgb * w3.x * w0.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p0.x, p12.y), 0.0).rgb * w0.x * w12.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p12.x, p12.y), 0.0).rgb * w12.x * w12.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p3.x, p12.y), 0.0).rgb * w3.x * w12.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p0.x, p3.y), 0.0).rgb * w0.x * w3.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p12.x, p3.y), 0.0).rgb * w12.x * w3.y;
+    color += textureSampleLevel(frame_texture, frame_sampler, vec2(p3.x, p3.y), 0.0).rgb * w3.x * w3.y;
+    return color;
+}
+
+// Catmull-Rom reconstruction followed by a contrast-adaptive sharpen (AMD
+// CAS's cross kernel) in source-texel space. The lobe weight grows with how
+// many output pixels one source texel covers and backs off where the local
+// neighbourhood is already near black or white, and the result is clamped to
+// the neighbourhood's range so edges get crisper without halos or ringing.
+fn sample_sharp(
+    uv: vec2<f32>,
+    crop_bounds_uv: vec4<f32>,
+    upscale: f32,
+    strength: f32
+) -> vec4<f32> {
+    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+        return vec4(0.0);
+    }
+    let cropped = crop_sample_uv(uv, crop_bounds_uv);
+    let texel = 1.0 / uniforms.frame_size;
+    let center = sample_catmull_rom(cropped.uv, cropped.safe_min, cropped.safe_max);
+
+    let north = textureSampleLevel(
+        frame_texture, frame_sampler,
+        clamp(cropped.uv - vec2(0.0, texel.y), cropped.safe_min, cropped.safe_max), 0.0
+    ).rgb;
+    let south = textureSampleLevel(
+        frame_texture, frame_sampler,
+        clamp(cropped.uv + vec2(0.0, texel.y), cropped.safe_min, cropped.safe_max), 0.0
+    ).rgb;
+    let west = textureSampleLevel(
+        frame_texture, frame_sampler,
+        clamp(cropped.uv - vec2(texel.x, 0.0), cropped.safe_min, cropped.safe_max), 0.0
+    ).rgb;
+    let east = textureSampleLevel(
+        frame_texture, frame_sampler,
+        clamp(cropped.uv + vec2(texel.x, 0.0), cropped.safe_min, cropped.safe_max), 0.0
+    ).rgb;
+
+    let bilinear = textureSampleLevel(frame_texture, frame_sampler, cropped.uv, 0.0).rgb;
+    let lo = min(bilinear, min(min(north, south), min(west, east)));
+    let hi = max(bilinear, max(max(north, south), max(west, east)));
+    let lobe_strength = SHARPEN_MAX_LOBE * strength *
+        smoothstep(1.0, SHARPEN_FULL_UPSCALE, upscale);
+    let amp = sqrt(clamp(min(lo, vec3(1.0) - hi) / max(hi, vec3(1e-4)), vec3(0.0), vec3(1.0)));
+    let lobe = -amp * lobe_strength;
+    let sharpened = (center + (north + south + west + east) * lobe) / (vec3(1.0) + 4.0 * lobe);
+    return vec4(clamp(sharpened, lo, hi), 1.0);
+}
+
+fn loupe_sdf(local: vec2<f32>, half_extent: vec2<f32>, corner: f32) -> f32 {
+    return sdf_rounded_rect(local, half_extent, corner, uniforms.sampling_params.y);
+}
+
+fn loupe_sample_uv(
+    p: vec2<f32>,
+    lens_center: vec2<f32>,
+    anchor: vec2<f32>,
+    bend: f32
+) -> vec2<f32> {
+    let magnification = uniforms.loupe_shape.w;
+    let sample_px = anchor + (p - lens_center) * bend / magnification;
+    return (sample_px - uniforms.target_bounds.xy) / uniforms.target_size;
+}
+
+// Glass magnifier drawn over the unzoomed card: a soft drop shadow, the
+// magnified content (bent and slightly split by colour toward the rim), an
+// inner thickness shade, a top sheen and a lit rim. Everything is in output
+// pixels so the lens looks the same at any resolution.
+fn apply_loupe(card: vec4<f32>, p: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {
+    let magnification = uniforms.loupe_shape.w;
+    if magnification < 1.0 {
+        return card;
+    }
+
+    let half_extent = uniforms.loupe_shape.xy;
+    let corner = uniforms.loupe_shape.z;
+    let radius = min(half_extent.x, half_extent.y);
+    let lens_center = uniforms.target_bounds.xy + uniforms.loupe_position.xy * uniforms.target_size;
+    let anchor = uniforms.target_bounds.xy + uniforms.loupe_position.zw * uniforms.target_size;
+    let local = p - lens_center;
+
+    let shadow_offset = vec2<f32>(0.0, radius * 0.07);
+    let shadow_blur = max(radius * 0.2, 2.0);
+    let reach = half_extent + vec2<f32>(shadow_blur + shadow_offset.y + 1.0);
+    if abs(local.x) > reach.x || abs(local.y) > reach.y {
+        return card;
+    }
+
+    let dist = loupe_sdf(local, half_extent, corner);
+    let shadow_dist = loupe_sdf(local - shadow_offset, half_extent, corner);
+    let shadow_alpha = LOUPE_SHADOW_OPACITY * card.a *
+        (1.0 - smoothstep(-shadow_blur * 0.4, shadow_blur, shadow_dist));
+    let shadowed = composite_source_over(vec4<f32>(0.0, 0.0, 0.0, shadow_alpha), card);
+
+    let coverage = clamp(0.5 - dist, 0.0, 1.0);
+    if coverage <= 0.0 {
+        return shadowed;
+    }
+
+    let depth = max(-dist, 0.0);
+    let rim_width = max(radius * 0.06, 1.5);
+    let interior = clamp(depth / (rim_width * 3.0), 0.0, 1.0);
+    let edge = 1.0 - interior;
+    let bend = 1.0 + LOUPE_REFRACTION * edge * edge;
+
+    let travel = uniforms.loupe_motion;
+    var rgb: vec3<f32>;
+    if dot(travel, travel) > 1e-10 {
+        let dither = interleaved_noise(p);
+        let center_travel = travel.xy * uniforms.target_size;
+        let anchor_travel = travel.zw * uniforms.target_size;
+        var accum = vec3<f32>(0.0);
+        for (var i = 0; i < LOUPE_BLUR_TAPS; i = i + 1) {
+            let k = (f32(i) + dither) / f32(LOUPE_BLUR_TAPS);
+            accum += sample_bilinear(
+                loupe_sample_uv(p, lens_center - center_travel * k, anchor - anchor_travel * k, bend),
+                crop_bounds_uv
+            );
+        }
+        rgb = accum / f32(LOUPE_BLUR_TAPS);
+    } else {
+        let upscale = card_upscale_ratio(crop_bounds_uv) * magnification;
+        let uv = clamp(
+            loupe_sample_uv(p, lens_center, anchor, bend),
+            vec2<f32>(0.0),
+            vec2<f32>(1.0)
+        );
+        rgb = sample_sharp(uv, crop_bounds_uv, upscale, 1.0).rgb;
+        if edge > 0.0 {
+            let split = LOUPE_CHROMA * edge * edge;
+            rgb.r = sample_bilinear(
+                loupe_sample_uv(p, lens_center, anchor, bend * (1.0 + split)),
+                crop_bounds_uv
+            ).r;
+            rgb.b = sample_bilinear(
+                loupe_sample_uv(p, lens_center, anchor, bend * (1.0 - split)),
+                crop_bounds_uv
+            ).b;
+        }
+    }
+
+    let normalized = local / max(half_extent, vec2<f32>(1.0));
+    let light_dir = normalize(vec2<f32>(-0.55, -0.83));
+    let facing = dot(normalize(local + vec2<f32>(1e-4, 0.0)), light_dir);
+
+    rgb = rgb * (1.0 - 0.14 * edge * edge);
+    let sheen = 0.06 * (1.0 - smoothstep(-0.95, 0.15, normalized.y)) * interior;
+    rgb = mix(rgb, vec3<f32>(1.0), sheen);
+
+    let ring = 1.0 - smoothstep(0.0, rim_width, depth);
+    rgb = mix(rgb, vec3<f32>(1.0), ring * (0.22 + 0.5 * max(facing, 0.0)));
+    rgb = mix(rgb, vec3<f32>(0.0), ring * 0.28 * max(-facing, 0.0));
+    let outline = 1.0 - smoothstep(0.0, 1.25, abs(dist + 0.6));
+    rgb = mix(rgb, vec3<f32>(0.0), outline * 0.35);
+
+    return composite_source_over(vec4<f32>(rgb, coverage * uniforms.opacity), shadowed);
 }
 
 fn sample_texture(uv: vec2<f32>, crop_bounds_uv: vec4<f32>) -> vec4<f32> {

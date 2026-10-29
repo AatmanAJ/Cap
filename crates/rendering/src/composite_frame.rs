@@ -101,6 +101,19 @@ pub struct CompositeVideoFrameUniforms {
     /// flag). The active flag gates the shader's whole color pass in one
     /// uniform branch, keeping ungraded layers bit-identical to before.
     pub grain_params: [f32; 4],
+    /// Loupe lens (center u, center v, anchor u, anchor v) in card UV; the
+    /// anchor is the content point shown at the lens center.
+    pub loupe_position: [f32; 4],
+    /// (half width px, half height px, corner radius px, magnification). A
+    /// magnification below 1 disables the lens.
+    pub loupe_shape: [f32; 4],
+    /// Lens travel across the shutter interval (center uv, anchor uv),
+    /// already scaled by the screen motion blur amount.
+    pub loupe_motion: [f32; 4],
+    /// (display zoom amount, lens corner type, 0, 0). Above 1x the display
+    /// upsamples with Catmull-Rom plus an adaptive sharpen; at 1x the shader
+    /// takes its original sampling path untouched.
+    pub sampling_params: [f32; 4],
 }
 
 impl Default for CompositeVideoFrameUniforms {
@@ -131,6 +144,10 @@ impl Default for CompositeVideoFrameUniforms {
             color_adjust_a: [0.0; 4],
             color_adjust_b: [0.0; 4],
             grain_params: [0.0; 4],
+            loupe_position: [0.0; 4],
+            loupe_shape: [0.0; 4],
+            loupe_motion: [0.0; 4],
+            sampling_params: [0.0; 4],
         }
     }
 }
@@ -237,6 +254,11 @@ impl CompositeVideoFrameUniforms {
 
                 self.target_bounds = [new_x0, new_y0, new_x0 + fitted_w, new_y0 + fitted_h];
                 self.target_size = [fitted_w, fitted_h];
+
+                let lens_scale = (fitted_w / target_w).min(fitted_h / target_h);
+                for value in &mut self.loupe_shape[..3] {
+                    *value *= lens_scale;
+                }
             }
         }
 

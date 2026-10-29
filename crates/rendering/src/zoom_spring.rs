@@ -26,13 +26,13 @@
 //! export matches playback by construction.
 
 use cap_project::{
-    Crop, CursorEvents, ProjectConfiguration, ScreenMovementSpring, TimelineConfiguration, XY,
-    ZoomMode, ZoomSegment,
+    Crop, CursorEvents, LoupeShape, ProjectConfiguration, ScreenMovementSpring,
+    TimelineConfiguration, XY, ZoomMode, ZoomSegment,
 };
 
 use crate::{
     spring_mass_damper::{SpringMassDamperSimulation, SpringMassDamperSimulationConfig},
-    zoom::{InterpolatedZoom, SegmentBounds},
+    zoom::{InterpolatedZoom, LoupeSample, SegmentBounds},
 };
 
 /// Fixed precompute step (125 Hz), matching the sampling density the old
@@ -49,6 +49,14 @@ const INSTANT_SNAP_WINDOW_SECS: f64 = 0.1;
 /// scale straight toward their focus. Any center jump while amount <= this
 /// bound moves the viewport by at most (bound - 1) of the card: sub-pixel.
 const CENTER_PREAIM_MAX_AMOUNT: f32 = 1.0005;
+
+/// The loupe counterpart of [`CENTER_PREAIM_MAX_AMOUNT`]: below this presence
+/// the lens is invisible, so its center, size and magnification jump straight
+/// to their targets and an incoming lens grows in place at its focus.
+const LOUPE_PREAIM_MAX_PRESENCE: f32 = 0.001;
+
+/// Presence below which [`ZoomTransformTimeline::sample_loupe`] reports no lens.
+const LOUPE_VISIBLE_MIN_PRESENCE: f32 = 1e-4;
 
 /// Greedy click-cluster bounding-box limits, as a fraction of the visible
 /// zoomed viewport (50% width x 70% height).
@@ -732,6 +740,130 @@ struct PrecomputeState {
     /// Last center target while a segment was active. Held during zoom-out so
     /// the outgoing framing stays anchored instead of re-aiming mid-flight.
     held_center_target: XY<f32>,
+    /// Only present when at least one segment uses the loupe style.
+    loupe: Option<LoupePrecomputeState>,
+}
+
+/// One precomputed loupe step, parallel to [`TimelineSample`].
+#[derive(Clone, Copy, Debug)]
+struct LoupeTimelineSample {
+    presence: f32,
+    magnification: f32,
+    center: XY<f32>,
+    size: f32,
+    follow_cursor: f32,
+    shape: LoupeShape,
+}
+
+struct LoupePrecomputeState {
+    /// x = presence (0/1 step), y = magnification.
+    presence_sim: SpringMassDamperSimulation,
+    /// Lens focus in cropped-content UV.
+    center_sim: SpringMassDamperSimulation,
+    /// x = lens size, y = cursor-follow weight.
+    shape_sim: SpringMassDamperSimulation,
+    /// Last active loupe's targets, held while the lens shrinks away.
+    held: LoupeTargets,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LoupeTargets {
+    magnification: f32,
+    center: XY<f32>,
+    size: f32,
+    follow_cursor: f32,
+    shape: LoupeShape,
+}
+
+impl Default for LoupeTargets {
+    fn default() -> Self {
+        Self {
+            magnification: 1.0,
+            center: XY::new(0.5, 0.5),
+            size: ZoomSegment::default_loupe_size() as f32,
+            follow_cursor: 0.0,
+            shape: LoupeShape::Circle,
+        }
+    }
+}
+
+impl LoupePrecomputeState {
+    fn new(config: SpringMassDamperSimulationConfig, initial: Option<LoupeTargets>) -> Self {
+        let held = initial.unwrap_or_default();
+        let presence = if initial.is_some() { 1.0 } else { 0.0 };
+        let sim_at = |position: XY<f32>| {
+            let mut sim = SpringMassDamperSimulation::new(config);
+            sim.set_position(position);
+            sim.set_velocity(XY::new(0.0, 0.0));
+            sim.set_target_position(position);
+            sim
+        };
+        Self {
+            presence_sim: sim_at(XY::new(presence, held.magnification)),
+            center_sim: sim_at(held.center),
+            shape_sim: sim_at(XY::new(held.size, held.follow_cursor)),
+            held,
+        }
+    }
+
+    fn step(&mut self, targets: Option<LoupeTargets>, snap: bool) -> LoupeTimelineSample {
+        if let Some(targets) = targets {
+            self.held = targets;
+        }
+        let held = self.held;
+        let presence_target = XY::new(
+            if targets.is_some() { 1.0 } else { 0.0 },
+            held.magnification,
+        );
+        let shape_target = XY::new(held.size, held.follow_cursor);
+        self.presence_sim.set_target_position(presence_target);
+        self.center_sim.set_target_position(held.center);
+        self.shape_sim.set_target_position(shape_target);
+
+        let park = |sim: &mut SpringMassDamperSimulation, position: XY<f32>| {
+            sim.set_position(position);
+            sim.set_velocity(XY::new(0.0, 0.0));
+        };
+        if snap {
+            park(&mut self.presence_sim, presence_target);
+            park(&mut self.center_sim, held.center);
+            park(&mut self.shape_sim, shape_target);
+        } else {
+            if self.presence_sim.position.x <= LOUPE_PREAIM_MAX_PRESENCE {
+                park(&mut self.center_sim, held.center);
+                park(&mut self.shape_sim, shape_target);
+                self.presence_sim.position.y = held.magnification;
+                self.presence_sim.velocity.y = 0.0;
+            }
+            self.presence_sim.run(STEP_MS as f32);
+            self.center_sim.run(STEP_MS as f32);
+            self.shape_sim.run(STEP_MS as f32);
+        }
+
+        if self.presence_sim.position.x < 0.0 {
+            self.presence_sim.position.x = 0.0;
+            self.presence_sim.velocity.x = 0.0;
+        }
+        if self.presence_sim.position.y < 1.0 {
+            self.presence_sim.position.y = 1.0;
+            self.presence_sim.velocity.y = 0.0;
+        }
+
+        LoupeTimelineSample {
+            presence: self.presence_sim.position.x,
+            magnification: self.presence_sim.position.y,
+            center: XY::new(
+                self.center_sim.position.x.clamp(0.0, 1.0),
+                self.center_sim.position.y.clamp(0.0, 1.0),
+            ),
+            size: self.shape_sim.position.x.clamp(
+                ZoomSegment::LOUPE_SIZE_MIN as f32,
+                ZoomSegment::LOUPE_SIZE_MAX as f32,
+            ),
+            follow_cursor: self.shape_sim.position.y.clamp(0.0, 1.0),
+            shape: held.shape,
+        }
+    }
 }
 
 struct StepTargets {
@@ -740,6 +872,7 @@ struct StepTargets {
     activity: f32,
     segment_active: bool,
     snap: bool,
+    loupe: Option<LoupeTargets>,
 }
 
 /// Segments with a NaN bound can never be active, so they are left out of the
@@ -800,6 +933,8 @@ impl ZoomSegmentIndex {
 /// [`Self::sample`] is used for the corresponding frame times.
 pub struct ZoomTransformTimeline {
     samples: Vec<TimelineSample>,
+    /// Parallel to `samples`; empty unless a segment uses the loupe style.
+    loupe_samples: Vec<LoupeTimelineSample>,
     state: Option<PrecomputeState>,
     zoom_segments: Vec<ZoomSegment>,
     segment_index: ZoomSegmentIndex,
@@ -921,6 +1056,7 @@ impl ZoomTransformTimeline {
         if zoom_segments.is_empty() {
             return Self {
                 samples: Vec::new(),
+                loupe_samples: Vec::new(),
                 state: None,
                 zoom_segments,
                 segment_index,
@@ -939,8 +1075,10 @@ impl ZoomTransformTimeline {
             friction: spring.damping,
         };
 
+        let has_loupe = zoom_segments.iter().any(ZoomSegment::is_loupe);
         let mut timeline = Self {
             samples: Vec::new(),
+            loupe_samples: Vec::new(),
             state: None,
             zoom_segments,
             segment_index,
@@ -974,10 +1112,23 @@ impl ZoomTransformTimeline {
             activity: initial.activity.clamp(0.0, 1.0),
             snapped: false,
         });
+        let loupe = has_loupe.then(|| {
+            let loupe = LoupePrecomputeState::new(spring_config, initial.loupe);
+            timeline.loupe_samples.push(LoupeTimelineSample {
+                presence: loupe.presence_sim.position.x,
+                magnification: loupe.held.magnification.max(1.0),
+                center: loupe.held.center,
+                size: loupe.held.size,
+                follow_cursor: loupe.held.follow_cursor,
+                shape: loupe.held.shape,
+            });
+            loupe
+        });
         timeline.state = Some(PrecomputeState {
             center_sim,
             aux_sim,
             held_center_target: initial.center,
+            loupe,
         });
         timeline
     }
@@ -1154,6 +1305,33 @@ impl ZoomTransformTimeline {
         }
     }
 
+    /// Samples the loupe lens at a TIMELINE timestamp, with the same lookup as
+    /// [`Self::sample`]. `None` when no loupe segment exists or the lens is
+    /// fully hidden.
+    pub fn sample_loupe(&self, timeline_secs: f32) -> Option<LoupeSample> {
+        let last = self.loupe_samples.len().checked_sub(1)?;
+        let pos = (f64::from(timeline_secs).max(0.0)) * 1000.0 / STEP_MS;
+        let idx = (pos as usize).min(last);
+        let next = (idx + 1).min(last);
+        let frac = (pos - idx as f64).clamp(0.0, 1.0) as f32;
+        let a = self.loupe_samples[idx];
+        let b = self.loupe_samples[next];
+        let lerp = |from: f32, to: f32| f64::from(from + (to - from) * frac);
+
+        let presence = lerp(a.presence, b.presence);
+        if presence < f64::from(LOUPE_VISIBLE_MIN_PRESENCE) {
+            return None;
+        }
+        Some(LoupeSample {
+            presence,
+            magnification: lerp(a.magnification, b.magnification).max(1.0),
+            center: XY::new(lerp(a.center.x, b.center.x), lerp(a.center.y, b.center.y)),
+            size: lerp(a.size, b.size),
+            follow_cursor: lerp(a.follow_cursor, b.follow_cursor),
+            shape: if frac < 0.5 { a.shape } else { b.shape },
+        })
+    }
+
     /// Whether any precomputed step in `[from_secs, to_secs]` was an instant
     /// snap (no spring). Motion-effect consumers can use this to suppress
     /// velocity-derived effects across intentional discontinuities.
@@ -1238,6 +1416,11 @@ impl ZoomTransformTimeline {
             snapped: targets.snap,
         });
 
+        if let Some(loupe) = state.loupe.as_mut() {
+            self.loupe_samples
+                .push(loupe.step(targets.loupe, targets.snap));
+        }
+
         if self.samples.len() >= self.total_samples {
             self.state = None;
         }
@@ -1246,55 +1429,80 @@ impl ZoomTransformTimeline {
     fn targets_at(&self, timeline_secs: f64, held_center: XY<f32>) -> StepTargets {
         let active = self.segment_index.active_at(timeline_secs);
         let snap = self.segment_index.snaps_at(timeline_secs);
+        let idle = StepTargets {
+            amount: 1.0,
+            // Hold the last active framing while zooming out so the
+            // outgoing shot stays anchored (irrelevant once amount = 1).
+            center: held_center,
+            activity: 0.0,
+            segment_active: false,
+            snap,
+            loupe: None,
+        };
 
-        match active {
-            Some(index) => {
-                let segment = &self.zoom_segments[index];
-                let amount = if segment.amount.is_finite() {
-                    segment.amount.max(1.0)
-                } else {
-                    1.0
-                };
-                let center = match segment.mode {
-                    ZoomMode::Manual { x, y } => {
-                        (f64::from(x).clamp(0.0, 1.0), f64::from(y).clamp(0.0, 1.0))
-                    }
-                    ZoomMode::Auto => {
-                        let recording_ms = map_timeline_to_recording_secs(
-                            time_map_at(&self.time_map, timeline_secs, self.time_map_ordered),
-                            timeline_secs,
-                            self.recording_clip,
-                            self.prefer_outgoing,
-                        ) * 1000.0;
-                        let focus = self.clusters[index]
-                            .as_ref()
-                            .and_then(|clusters| clusters.center_at(timeline_secs, recording_ms))
-                            .unwrap_or(FALLBACK_FOCUS);
-                        SegmentBounds::calculate_follow_center(
-                            (focus.0.clamp(0.0, 1.0), focus.1.clamp(0.0, 1.0)),
-                            segment.edge_snap_ratio,
-                        )
-                    }
-                };
+        let Some(index) = active else {
+            return idle;
+        };
+        let segment = &self.zoom_segments[index];
+        let amount = if segment.amount.is_finite() {
+            segment.amount.max(1.0)
+        } else {
+            1.0
+        };
 
-                StepTargets {
-                    amount: amount as f32,
+        if segment.is_loupe() {
+            let (center, follow_cursor) = match segment.mode {
+                ZoomMode::Manual { x, y } => (
+                    (f64::from(x).clamp(0.0, 1.0), f64::from(y).clamp(0.0, 1.0)),
+                    0.0,
+                ),
+                ZoomMode::Auto => (self.auto_focus_at(index, timeline_secs), 1.0),
+            };
+            return StepTargets {
+                loupe: Some(LoupeTargets {
+                    magnification: amount as f32,
                     center: XY::new(center.0 as f32, center.1 as f32),
-                    activity: 1.0,
-                    segment_active: true,
-                    snap,
-                }
-            }
-            None => StepTargets {
-                amount: 1.0,
-                // Hold the last active framing while zooming out so the
-                // outgoing shot stays anchored (irrelevant once amount = 1).
-                center: held_center,
-                activity: 0.0,
-                segment_active: false,
-                snap,
-            },
+                    size: segment.loupe_size() as f32,
+                    follow_cursor,
+                    shape: segment.loupe_shape,
+                }),
+                ..idle
+            };
         }
+
+        let center = match segment.mode {
+            ZoomMode::Manual { x, y } => {
+                (f64::from(x).clamp(0.0, 1.0), f64::from(y).clamp(0.0, 1.0))
+            }
+            ZoomMode::Auto => SegmentBounds::calculate_follow_center(
+                self.auto_focus_at(index, timeline_secs),
+                segment.edge_snap_ratio,
+            ),
+        };
+
+        StepTargets {
+            amount: amount as f32,
+            center: XY::new(center.0 as f32, center.1 as f32),
+            activity: 1.0,
+            segment_active: true,
+            snap,
+            loupe: None,
+        }
+    }
+
+    /// The click-cluster focus (cropped-content UV) an Auto segment aims at.
+    fn auto_focus_at(&self, index: usize, timeline_secs: f64) -> (f64, f64) {
+        let recording_ms = map_timeline_to_recording_secs(
+            time_map_at(&self.time_map, timeline_secs, self.time_map_ordered),
+            timeline_secs,
+            self.recording_clip,
+            self.prefer_outgoing,
+        ) * 1000.0;
+        let focus = self.clusters[index]
+            .as_ref()
+            .and_then(|clusters| clusters.center_at(timeline_secs, recording_ms))
+            .unwrap_or(FALLBACK_FOCUS);
+        (focus.0.clamp(0.0, 1.0), focus.1.clamp(0.0, 1.0))
     }
 }
 
@@ -1320,6 +1528,9 @@ mod tests {
             glide_speed: 0.5,
             instant_animation: false,
             edge_snap_ratio: 0.25,
+            style: cap_project::ZoomStyle::Frame,
+            loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+            loupe_shape: cap_project::LoupeShape::Circle,
         }
     }
 
@@ -3441,6 +3652,162 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    fn loupe_segment(start: f64, end: f64, amount: f64, mode: ZoomMode) -> ZoomSegment {
+        ZoomSegment {
+            mode,
+            style: cap_project::ZoomStyle::Loupe,
+            loupe_size: 0.3,
+            loupe_shape: LoupeShape::RoundedRect,
+            ..manual_segment(start, end, amount, 0.5, 0.5)
+        }
+    }
+
+    fn sample_times(duration: f64) -> impl Iterator<Item = f32> {
+        (0..(duration * 60.0) as usize).map(|frame| frame as f32 / 60.0)
+    }
+
+    #[test]
+    fn loupe_segments_never_zoom_the_frame() {
+        let segments = [loupe_segment(
+            1.0,
+            3.0,
+            2.5,
+            ZoomMode::Manual { x: 0.2, y: 0.7 },
+        )];
+        let mut timeline = timeline_for(&segments, &CursorEvents::default(), 6.0);
+        timeline.precompute();
+        for time in sample_times(6.0) {
+            let zoom = timeline.sample(time);
+            assert_eq!(zoom.bounds, SegmentBounds::default(), "t={time}");
+            assert_eq!(zoom.t, 0.0, "t={time}");
+        }
+    }
+
+    #[test]
+    fn loupe_grows_in_place_holds_and_shrinks_away() {
+        let segments = [loupe_segment(
+            1.0,
+            3.0,
+            2.5,
+            ZoomMode::Manual { x: 0.2, y: 0.7 },
+        )];
+        let mut timeline = timeline_for(&segments, &CursorEvents::default(), 8.0);
+        timeline.precompute();
+
+        assert!(timeline.sample_loupe(0.5).is_none());
+        let first = sample_times(8.0)
+            .find_map(|time| timeline.sample_loupe(time))
+            .expect("lens appears");
+        assert!(first.presence < 0.2, "{first:?}");
+        assert!((first.center.x - 0.2).abs() < 1e-6 && (first.center.y - 0.7).abs() < 1e-6);
+        assert!((first.size - 0.3).abs() < 1e-6);
+        assert_eq!(first.magnification, 2.5);
+        assert_eq!(first.shape, LoupeShape::RoundedRect);
+        assert_eq!(first.follow_cursor, 0.0);
+
+        let mut previous = 0.0;
+        for time in sample_times(8.0).filter(|time| (1.0..1.3).contains(time)) {
+            let presence = timeline.sample_loupe(time).map_or(0.0, |s| s.presence);
+            assert!(presence >= previous, "presence dips at {time}");
+            previous = presence;
+        }
+
+        let settled = timeline.sample_loupe(2.8).unwrap();
+        assert!((settled.presence - 1.0).abs() < 0.01, "{settled:?}");
+        assert!((settled.effective_magnification() - 2.5).abs() < 0.03);
+
+        let leaving = timeline.sample_loupe(3.1).unwrap();
+        assert!(leaving.presence < settled.presence);
+        assert!(
+            (leaving.center.x - 0.2).abs() < 1e-6,
+            "shrinks where it was"
+        );
+        assert!(timeline.sample_loupe(7.5).is_none());
+    }
+
+    #[test]
+    fn auto_loupe_follows_the_cursor_with_the_cluster_as_fallback() {
+        let cursor = CursorEvents {
+            moves: vec![move_event(0.0, 0.8, 0.3), move_event(2900.0, 0.8, 0.3)],
+            clicks: vec![click_event(1100.0)],
+        };
+        let segments = [loupe_segment(1.0, 3.0, 2.0, ZoomMode::Auto)];
+        let mut timeline = timeline_for(&segments, &cursor, 5.0);
+        timeline.precompute();
+        let sample = timeline.sample_loupe(2.5).unwrap();
+        assert_eq!(sample.follow_cursor, 1.0);
+        assert!((sample.center.x - 0.8).abs() < 0.01, "{sample:?}");
+        assert!((sample.center.y - 0.3).abs() < 0.01, "{sample:?}");
+    }
+
+    #[test]
+    fn loupe_between_frame_zooms_hands_over_smoothly() {
+        let segments = [
+            manual_segment(1.0, 2.0, 2.0, 0.3, 0.3),
+            loupe_segment(2.0, 3.0, 2.0, ZoomMode::Manual { x: 0.6, y: 0.6 }),
+        ];
+        let mut timeline = timeline_for(&segments, &CursorEvents::default(), 6.0);
+        timeline.precompute();
+        assert!(timeline.sample(1.9).display_amount() > 1.9);
+        assert!(timeline.sample(2.9).display_amount() < 1.05);
+        assert!(timeline.sample_loupe(2.9).unwrap().presence > 0.95);
+        let mut previous = timeline.sample(1.5).display_amount();
+        for time in sample_times(6.0).filter(|time| (2.0..3.0).contains(time)) {
+            let amount = timeline.sample(time).display_amount();
+            assert!(
+                (previous - amount).abs() < 0.1,
+                "frame zoom jumps at {time}"
+            );
+            previous = amount;
+        }
+    }
+
+    #[test]
+    fn instant_loupe_snaps_in_and_out() {
+        let segments = [ZoomSegment {
+            instant_animation: true,
+            ..loupe_segment(1.0, 3.0, 2.0, ZoomMode::Manual { x: 0.5, y: 0.5 })
+        }];
+        let mut timeline = timeline_for(&segments, &CursorEvents::default(), 5.0);
+        timeline.precompute();
+        assert_eq!(timeline.sample_loupe(1.05).unwrap().presence, 1.0);
+        assert!(timeline.sample_loupe(3.05).is_none());
+    }
+
+    #[test]
+    fn frame_only_timelines_keep_no_loupe_samples() {
+        let segments = [manual_segment(1.0, 3.0, 2.0, 0.5, 0.5)];
+        let mut timeline = timeline_for(&segments, &CursorEvents::default(), 5.0);
+        timeline.precompute();
+        assert!(timeline.loupe_samples.is_empty());
+        assert!(timeline.sample_loupe(2.0).is_none());
+    }
+
+    #[test]
+    fn incremental_loupe_samples_match_eager() {
+        let segments = [
+            loupe_segment(0.5, 2.0, 3.0, ZoomMode::Manual { x: 0.1, y: 0.9 }),
+            loupe_segment(2.5, 4.0, 1.5, ZoomMode::Auto),
+        ];
+        let cursor = CursorEvents {
+            moves: (0..100)
+                .map(|i| move_event(f64::from(i) * 50.0, f64::from(i % 10) / 10.0, 0.4))
+                .collect(),
+            clicks: vec![click_event(2600.0)],
+        };
+        let mut eager = timeline_for(&segments, &cursor, 5.0);
+        eager.precompute();
+        let mut incremental = timeline_for(&segments, &cursor, 5.0);
+        for time in sample_times(5.0) {
+            incremental.ensure_precomputed_until(time + 1.0 / 60.0);
+            assert_eq!(
+                eager.sample_loupe(time),
+                incremental.sample_loupe(time),
+                "t={time}"
+            );
         }
     }
 }

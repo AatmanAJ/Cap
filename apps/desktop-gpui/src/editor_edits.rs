@@ -1649,6 +1649,9 @@ pub fn insert_zoom_segment(
             glide_speed: 0.5,
             instant_animation: false,
             edge_snap_ratio: 0.25,
+            style: cap_project::ZoomStyle::Frame,
+            loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+            loupe_shape: cap_project::LoupeShape::Circle,
         },
     );
     index
@@ -2230,6 +2233,9 @@ pub fn generate_zoom_segments_from_clicks(
             glide_speed: 0.5,
             instant_animation: false,
             edge_snap_ratio: 0.25,
+            style: cap_project::ZoomStyle::Frame,
+            loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+            loupe_shape: cap_project::LoupeShape::Circle,
         })
         .collect()
 }
@@ -4895,6 +4901,9 @@ mod tests {
             glide_speed: 1.0,
             instant_animation: false,
             edge_snap_ratio: 0.0,
+            style: cap_project::ZoomStyle::Frame,
+            loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+            loupe_shape: cap_project::LoupeShape::Circle,
         }];
         timeline.camera3d_segments = serde_json::from_value(serde_json::json!([
             {

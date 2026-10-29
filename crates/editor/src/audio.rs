@@ -5301,6 +5301,9 @@ mod tests {
                     glide_speed: 1.0,
                     instant_animation: false,
                     edge_snap_ratio: 0.1,
+                    style: cap_project::ZoomStyle::Frame,
+                    loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+                    loupe_shape: cap_project::LoupeShape::Circle,
                 }]
             }),
             ("motion blur", |f| f.project.screen_motion_blur = 0.9),

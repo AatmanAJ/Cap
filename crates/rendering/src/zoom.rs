@@ -1,4 +1,4 @@
-use cap_project::XY;
+use cap_project::{LoupeShape, XY};
 
 /// Bounds of the (possibly zoomed) display rect, expressed as a scale of the
 /// unzoomed display: `(0,0)-(1,1)` means no zoom, while a zoomed-in view
@@ -116,6 +116,138 @@ impl Default for InterpolatedZoom {
     }
 }
 
+/// A sampled loupe lens. Produced by `ZoomTransformTimeline::sample_loupe`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoupeSample {
+    /// Spring-driven 0..1 appearance. It may overshoot 1 slightly as the lens
+    /// settles; it scales the lens size and its magnification together.
+    pub presence: f64,
+    /// Full magnification the lens settles at (the segment's zoom amount).
+    pub magnification: f64,
+    /// Fixed focus in cropped-content UV: the manual point, or the Auto
+    /// segment's click-cluster focus used when no cursor is available.
+    pub center: XY<f64>,
+    /// Lens radius as a fraction of the card's shorter side.
+    pub size: f64,
+    /// 0..1 weight of the live cursor over `center` (1 for Auto segments).
+    pub follow_cursor: f64,
+    pub shape: LoupeShape,
+}
+
+/// Rounded-rect lenses are wider than tall so a line of text fits; both axes
+/// derive from the same radius so the size slider scales them together.
+const LOUPE_RECT_HALF_EXTENT: (f64, f64) = (1.3, 0.8);
+const LOUPE_RECT_CORNER: f64 = 0.45;
+/// Gap kept between the lens rim and the card edge, in lens radii.
+const LOUPE_EDGE_MARGIN: f64 = 0.06;
+const LOUPE_MAX_GROW: f64 = 1.1;
+/// How far from the lens center the focus may be drawn, as a fraction of the
+/// lens half extents.
+const LOUPE_MAX_FOCUS_REACH: f64 = 0.9;
+
+impl LoupeSample {
+    pub fn effective_magnification(&self) -> f64 {
+        1.0 + (self.magnification.max(1.0) - 1.0) * self.presence.clamp(0.0, 1.0)
+    }
+
+    /// The content point the lens should magnify, in cropped-content UV.
+    /// `cursor` is the rendered cursor in the same space, when there is one.
+    pub fn focus(&self, cursor: Option<XY<f64>>) -> XY<f64> {
+        let follow = self.follow_cursor.clamp(0.0, 1.0);
+        match cursor.filter(|cursor| cursor.x.is_finite() && cursor.y.is_finite()) {
+            Some(cursor) if follow > 0.0 => self.center + (cursor - self.center) * follow,
+            _ => self.center,
+        }
+    }
+}
+
+/// A lens resolved against a concrete card size, in card-local pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LoupeGeometry {
+    /// Where the lens sits on the card.
+    pub center: XY<f64>,
+    /// The content point drawn at the lens center. Equal to the focus away
+    /// from the card edges; near an edge the lens stays on the card while
+    /// the anchor keeps the magnified region inside the content.
+    pub anchor: XY<f64>,
+    pub half_extent: XY<f64>,
+    pub corner_radius: f64,
+    pub magnification: f64,
+}
+
+impl LoupeGeometry {
+    /// `focus` is in card UV (0..1 across the card). Returns `None` when the
+    /// lens is too small to draw or the card is degenerate.
+    pub fn resolve(sample: &LoupeSample, focus: XY<f64>, card_size: XY<f64>) -> Option<Self> {
+        if !(card_size.x >= 1.0 && card_size.y >= 1.0) {
+            return None;
+        }
+        let focus = XY::new(clamp_unit(focus.x), clamp_unit(focus.y)) * card_size;
+        let grow = sample.presence.clamp(0.0, LOUPE_MAX_GROW);
+        let size = if sample.size.is_finite() {
+            sample.size.max(0.0)
+        } else {
+            0.0
+        };
+        let radius = size * card_size.x.min(card_size.y) * grow;
+        let (mut half_extent, mut corner_radius) = match sample.shape {
+            LoupeShape::Circle => (XY::new(radius, radius), radius),
+            LoupeShape::RoundedRect => (
+                XY::new(
+                    radius * LOUPE_RECT_HALF_EXTENT.0,
+                    radius * LOUPE_RECT_HALF_EXTENT.1,
+                ),
+                radius * LOUPE_RECT_HALF_EXTENT.1 * LOUPE_RECT_CORNER,
+            ),
+        };
+
+        let margin = radius * LOUPE_EDGE_MARGIN;
+        let fit = ((card_size.x * 0.5 - margin) / half_extent.x.max(f64::EPSILON))
+            .min((card_size.y * 0.5 - margin) / half_extent.y.max(f64::EPSILON));
+        if fit < 1.0 {
+            let fit = fit.max(0.0);
+            half_extent = half_extent * fit;
+            corner_radius *= fit;
+        }
+        if half_extent.x.min(half_extent.y) < 0.5 {
+            return None;
+        }
+
+        let magnification = sample.effective_magnification();
+        let clamp_axis = |value: f64, inset: f64, extent: f64| {
+            if extent - inset <= inset {
+                extent * 0.5
+            } else {
+                value.clamp(inset, extent - inset)
+            }
+        };
+        let center = XY::new(
+            clamp_axis(focus.x, half_extent.x + margin, card_size.x),
+            clamp_axis(focus.y, half_extent.y + margin, card_size.y),
+        );
+        let mut anchor = XY::new(
+            clamp_axis(focus.x, half_extent.x / magnification, card_size.x),
+            clamp_axis(focus.y, half_extent.y / magnification, card_size.y),
+        );
+        // In a card corner the per-axis clamp would push the focus out past
+        // the lens's curved rim. Keeping the focus visible wins there, at the
+        // cost of the lens corner reaching slightly past the content edge.
+        let shown = (focus - anchor) * magnification / half_extent;
+        let reach = shown.x.hypot(shown.y);
+        if reach > LOUPE_MAX_FOCUS_REACH {
+            anchor = focus - (focus - anchor) * (LOUPE_MAX_FOCUS_REACH / reach);
+        }
+
+        Some(Self {
+            center,
+            anchor,
+            half_extent,
+            corner_radius,
+            magnification,
+        })
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -215,5 +347,168 @@ mod test {
             bounds: SegmentBounds::from_amount_center(2.5, XY::new(0.4, 0.6)),
         };
         assert!((zoom.display_amount() - 2.5).abs() < 1e-9);
+    }
+
+    fn loupe(presence: f64, magnification: f64, size: f64, shape: LoupeShape) -> LoupeSample {
+        LoupeSample {
+            presence,
+            magnification,
+            center: XY::new(0.5, 0.5),
+            size,
+            follow_cursor: 0.0,
+            shape,
+        }
+    }
+
+    /// Where a card-local content point shows up through the lens (ignoring
+    /// the refracting rim), or `None` when it lands outside the lens.
+    fn magnified_position(geometry: &LoupeGeometry, content: XY<f64>) -> Option<XY<f64>> {
+        let shown = geometry.center + (content - geometry.anchor) * geometry.magnification;
+        let offset = shown - geometry.center;
+        let inside = (offset.x / geometry.half_extent.x).powi(2)
+            + (offset.y / geometry.half_extent.y).powi(2)
+            <= 1.0 + 1e-9;
+        inside.then_some(shown)
+    }
+
+    const CARD: XY<f64> = XY {
+        x: 1920.0,
+        y: 1080.0,
+    };
+
+    #[test]
+    fn loupe_magnification_and_size_grow_with_presence() {
+        let sample = loupe(0.0, 3.0, 0.2, LoupeShape::Circle);
+        assert_f64_near!(sample.effective_magnification(), 1.0, "hidden");
+        assert!(LoupeGeometry::resolve(&sample, XY::new(0.5, 0.5), CARD).is_none());
+
+        let half = LoupeGeometry::resolve(
+            &LoupeSample {
+                presence: 0.5,
+                ..sample
+            },
+            XY::new(0.5, 0.5),
+            CARD,
+        )
+        .unwrap();
+        assert_f64_near!(half.magnification, 2.0, "half-way magnification");
+        assert_f64_near!(half.half_extent.x, 0.2 * 1080.0 * 0.5, "half-way radius");
+
+        let full = LoupeGeometry::resolve(
+            &LoupeSample {
+                presence: 1.0,
+                ..sample
+            },
+            XY::new(0.5, 0.5),
+            CARD,
+        )
+        .unwrap();
+        assert_f64_near!(full.magnification, 3.0, "settled magnification");
+        assert_f64_near!(full.half_extent.x, 0.2 * 1080.0, "settled radius");
+        assert_f64_near!(full.corner_radius, full.half_extent.x, "circle corner");
+
+        let overshoot = LoupeSample {
+            presence: 1.04,
+            ..sample
+        };
+        assert_f64_near!(
+            overshoot.effective_magnification(),
+            3.0,
+            "overshoot magnification"
+        );
+        let settled_bounce = LoupeGeometry::resolve(&overshoot, XY::new(0.5, 0.5), CARD).unwrap();
+        assert!(settled_bounce.half_extent.x > full.half_extent.x);
+    }
+
+    #[test]
+    fn loupe_grows_from_its_focus() {
+        for presence in [0.02, 0.2, 0.6, 1.0] {
+            let geometry = LoupeGeometry::resolve(
+                &loupe(presence, 2.0, 0.22, LoupeShape::Circle),
+                XY::new(0.3, 0.6),
+                CARD,
+            )
+            .unwrap();
+            let focus = XY::new(0.3 * CARD.x, 0.6 * CARD.y);
+            assert_f64_near!(geometry.center.x, focus.x, "center.x");
+            assert_f64_near!(geometry.center.y, focus.y, "center.y");
+            assert_f64_near!(geometry.anchor.x, focus.x, "anchor.x");
+            assert_f64_near!(geometry.anchor.y, focus.y, "anchor.y");
+        }
+    }
+
+    #[test]
+    fn loupe_stays_on_the_card_and_keeps_its_focus_visible_at_edges() {
+        for shape in [LoupeShape::Circle, LoupeShape::RoundedRect] {
+            for focus in [
+                XY::new(0.0, 0.0),
+                XY::new(1.0, 0.0),
+                XY::new(0.02, 0.5),
+                XY::new(1.0, 1.0),
+                XY::new(0.5, 0.99),
+            ] {
+                let geometry =
+                    LoupeGeometry::resolve(&loupe(1.0, 2.5, 0.3, shape), focus, CARD).unwrap();
+                let h = geometry.half_extent;
+                assert!(geometry.center.x - h.x >= 0.0 && geometry.center.x + h.x <= CARD.x);
+                assert!(geometry.center.y - h.y >= 0.0 && geometry.center.y + h.y <= CARD.y);
+
+                let corner =
+                    (focus.x == 0.0 || focus.x == 1.0) && (focus.y == 0.0 || focus.y == 1.0);
+                if !corner {
+                    let reach = h / geometry.magnification;
+                    let slack = reach * (1.0 - LOUPE_MAX_FOCUS_REACH) + XY::new(1e-9, 1e-9);
+                    assert!(geometry.anchor.x - reach.x >= -slack.x);
+                    assert!(geometry.anchor.x + reach.x <= CARD.x + slack.x);
+                    assert!(geometry.anchor.y - reach.y >= -slack.y);
+                    assert!(geometry.anchor.y + reach.y <= CARD.y + slack.y);
+                }
+
+                let focus_px = focus * CARD;
+                assert!(
+                    magnified_position(&geometry, focus_px).is_some(),
+                    "{shape:?} focus {focus:?} must show inside the lens: {geometry:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loupe_shrinks_to_fit_a_small_card() {
+        let card = XY::new(300.0, 120.0);
+        let geometry = LoupeGeometry::resolve(
+            &loupe(1.0, 2.0, 0.45, LoupeShape::RoundedRect),
+            XY::new(0.5, 0.5),
+            card,
+        )
+        .unwrap();
+        assert!(geometry.half_extent.x > geometry.half_extent.y);
+        assert!(geometry.half_extent.y * 2.0 <= card.y);
+        assert!(geometry.half_extent.x * 2.0 <= card.x);
+        assert!(geometry.corner_radius < geometry.half_extent.y);
+
+        assert!(
+            LoupeGeometry::resolve(
+                &loupe(1.0, 2.0, 0.3, LoupeShape::Circle),
+                XY::new(0.5, 0.5),
+                XY::new(0.0, 0.0)
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn loupe_focus_blends_toward_the_cursor() {
+        let mut sample = loupe(1.0, 2.0, 0.2, LoupeShape::Circle);
+        sample.center = XY::new(0.2, 0.2);
+        assert_eq!(sample.focus(Some(XY::new(0.8, 0.6))), sample.center);
+        sample.follow_cursor = 1.0;
+        assert_eq!(sample.focus(Some(XY::new(0.8, 0.6))), XY::new(0.8, 0.6));
+        assert_eq!(sample.focus(None), sample.center);
+        assert_eq!(sample.focus(Some(XY::new(f64::NAN, 0.6))), sample.center);
+        sample.follow_cursor = 0.5;
+        let half = sample.focus(Some(XY::new(0.8, 0.6)));
+        assert_f64_near!(half.x, 0.5, "x");
+        assert_f64_near!(half.y, 0.4, "y");
     }
 }

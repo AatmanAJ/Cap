@@ -1045,9 +1045,19 @@ pub struct ZoomSegment {
     pub instant_animation: bool,
     #[serde(default = "ZoomSegment::default_edge_snap_ratio")]
     pub edge_snap_ratio: f64,
+    #[serde(default)]
+    pub style: ZoomStyle,
+    /// Lens radius as a fraction of the display card's shorter side.
+    #[serde(default = "ZoomSegment::default_loupe_size")]
+    pub loupe_size: f64,
+    #[serde(default)]
+    pub loupe_shape: LoupeShape,
 }
 
 impl ZoomSegment {
+    pub const LOUPE_SIZE_MIN: f64 = 0.1;
+    pub const LOUPE_SIZE_MAX: f64 = 0.45;
+
     fn default_glide_speed() -> f64 {
         0.5
     }
@@ -1055,6 +1065,39 @@ impl ZoomSegment {
     fn default_edge_snap_ratio() -> f64 {
         0.25
     }
+
+    pub fn default_loupe_size() -> f64 {
+        0.22
+    }
+
+    pub fn is_loupe(&self) -> bool {
+        self.style == ZoomStyle::Loupe
+    }
+
+    pub fn loupe_size(&self) -> f64 {
+        if self.loupe_size.is_finite() {
+            self.loupe_size
+                .clamp(Self::LOUPE_SIZE_MIN, Self::LOUPE_SIZE_MAX)
+        } else {
+            Self::default_loupe_size()
+        }
+    }
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum ZoomStyle {
+    #[default]
+    Frame,
+    Loupe,
+}
+
+#[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LoupeShape {
+    #[default]
+    Circle,
+    RoundedRect,
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -5101,6 +5144,10 @@ mod tests {
             assert_eq!(segment.glide_speed, 0.5);
             assert!(!segment.instant_animation);
             assert_eq!(segment.edge_snap_ratio, 0.25);
+            assert_eq!(segment.style, ZoomStyle::Frame);
+            assert!(!segment.is_loupe());
+            assert_eq!(segment.loupe_size, ZoomSegment::default_loupe_size());
+            assert_eq!(segment.loupe_shape, LoupeShape::Circle);
         }
         assert!(matches!(timeline.zoom_segments[0].mode, ZoomMode::Auto));
         assert!(matches!(
@@ -5135,6 +5182,41 @@ mod tests {
         assert_eq!(spring.stiffness, default_spring.stiffness);
         assert_eq!(spring.damping, default_spring.damping);
         assert_eq!(spring.mass, default_spring.mass);
+    }
+
+    #[test]
+    fn loupe_zoom_segment_round_trips_and_clamps_size() {
+        let segment: ZoomSegment = serde_json::from_value(serde_json::json!({
+            "start": 1.0,
+            "end": 4.0,
+            "amount": 2.5,
+            "mode": { "manual": { "x": 0.3, "y": 0.6 } },
+            "style": "loupe",
+            "loupeSize": 0.3,
+            "loupeShape": "roundedRect"
+        }))
+        .unwrap();
+        assert!(segment.is_loupe());
+        assert_eq!(segment.loupe_shape, LoupeShape::RoundedRect);
+        assert_eq!(segment.loupe_size(), 0.3);
+
+        let json = serde_json::to_value(&segment).unwrap();
+        assert_eq!(json["style"], "loupe");
+        assert_eq!(json["loupeShape"], "roundedRect");
+        let back: ZoomSegment = serde_json::from_value(json).unwrap();
+        assert_eq!(back, segment);
+
+        for (stored, resolved) in [
+            (5.0, ZoomSegment::LOUPE_SIZE_MAX),
+            (0.0, ZoomSegment::LOUPE_SIZE_MIN),
+            (f64::NAN, ZoomSegment::default_loupe_size()),
+        ] {
+            let segment = ZoomSegment {
+                loupe_size: stored,
+                ..back.clone()
+            };
+            assert_eq!(segment.loupe_size(), resolved);
+        }
     }
 
     #[test]

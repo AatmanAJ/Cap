@@ -24,9 +24,10 @@
 
 use cap_project::{
     AudioTrackSegment, Camera3DBlur, Camera3DBlurMode, Camera3DKeyframe, Camera3DProperties,
-    Camera3DSegment, CaptionTrackSegment, KeyboardTrackSegment, MaskKind, MaskSegment, SceneMode,
-    SceneSegment, SplitLayout, TextAlign, TextAnimation, TextBackgroundStyle, TextLayout,
-    TextSegment, TimelineConfiguration, XY, ZoomMode, ZoomSegment, mask_effect_contract,
+    Camera3DSegment, CaptionTrackSegment, KeyboardTrackSegment, LoupeShape, MaskKind, MaskSegment,
+    SceneMode, SceneSegment, SplitLayout, TextAlign, TextAnimation, TextBackgroundStyle,
+    TextLayout, TextSegment, TimelineConfiguration, XY, ZoomMode, ZoomSegment, ZoomStyle,
+    mask_effect_contract,
 };
 use gpui::{
     AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -2728,6 +2729,9 @@ pub enum PanelSlider {
     /// The multi-zoom panel's single Amount slider, which writes every selected
     /// segment at once.
     ZoomAmountAll,
+    /// A loupe segment's lens radius, shown as a percentage of the card's
+    /// shorter side.
+    ZoomLoupeSize,
 
     TextLayoutTransition,
     TextFontSize,
@@ -3384,6 +3388,11 @@ impl EditorWindow {
             PanelSlider::StyleCameraOnlyPadding => (0., 40., 1.),
             // `minValue={1} maxValue={4.5} step={0.001}` (`:5601-5603`).
             PanelSlider::ZoomAmount | PanelSlider::ZoomAmountAll => (1., 4.5, 0.001),
+            PanelSlider::ZoomLoupeSize => (
+                (ZoomSegment::LOUPE_SIZE_MIN * 100.) as f32,
+                (ZoomSegment::LOUPE_SIZE_MAX * 100.) as f32,
+                1.,
+            ),
             PanelSlider::TextLayoutTransition => (0.1, 1.5, 0.05),
             PanelSlider::TextFontSize => (TEXT_FONT_SIZE_MIN, TEXT_FONT_SIZE_MAX, 1.),
             PanelSlider::TextLineHeight => (0.8, 2., 0.05),
@@ -3443,6 +3452,10 @@ impl EditorWindow {
                 .zoom_segments
                 .get(index)
                 .map_or(1., |segment| segment.amount as f32),
+            PanelSlider::ZoomLoupeSize => timeline.zoom_segments.get(index).map_or(
+                (ZoomSegment::default_loupe_size() * 100.) as f32,
+                |segment| (segment.loupe_size() * 100.) as f32,
+            ),
             // `sharedAmount() ?? averageAmount()` (`:5919`).
             PanelSlider::ZoomAmountAll => {
                 let indices = self.zoom_selection_indices();
@@ -3589,6 +3602,13 @@ impl EditorWindow {
             PanelSlider::ZoomAmount => {
                 self.edit_zoom_segment("zoom-amount", index, window, cx, move |segment| {
                     segment.amount = f64::from(value);
+                    true
+                })
+            }
+            PanelSlider::ZoomLoupeSize => {
+                self.edit_zoom_segment("zoom-loupe-size", index, window, cx, move |segment| {
+                    segment.loupe_size = (f64::from(value) / 100.)
+                        .clamp(ZoomSegment::LOUPE_SIZE_MIN, ZoomSegment::LOUPE_SIZE_MAX);
                     true
                 })
             }
@@ -4326,10 +4346,12 @@ impl EditorWindow {
     /// `ZoomSegmentConfig` (`:5577-5881`).
     fn render_zoom_panel(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
-        let manual = self
+        let segment = self
             .timeline()
-            .and_then(|timeline| timeline.zoom_segments.get(index))
-            .is_some_and(|segment| matches!(segment.mode, ZoomMode::Manual { .. }));
+            .and_then(|timeline| timeline.zoom_segments.get(index));
+        let manual = segment.is_some_and(|segment| matches!(segment.mode, ZoomMode::Manual { .. }));
+        let loupe = segment.is_some_and(ZoomSegment::is_loupe);
+        let shape = segment.map_or(LoupeShape::Circle, |segment| segment.loupe_shape);
 
         div()
             .flex()
@@ -4341,6 +4363,108 @@ impl EditorWindow {
                 "x",
                 cx,
             ))
+            .child(
+                ui::Field::section(&theme, tr::editor::panel::zoom::style())
+                    .value(
+                        ui::SegmentedControl::editor(
+                            &theme,
+                            SharedString::from(format!("zoom-style-{index}")),
+                            vec![
+                                ui::SegmentOption::new(
+                                    tr::editor::panel::zoom::style_frame(),
+                                    !loupe,
+                                ),
+                                ui::SegmentOption::new(
+                                    tr::editor::panel::zoom::style_loupe(),
+                                    loupe,
+                                ),
+                            ],
+                        )
+                        .on_select(cx.listener(move |this, choice: &usize, window, cx| {
+                            let Some(style) =
+                                ui::option_at(&[ZoomStyle::Frame, ZoomStyle::Loupe], *choice)
+                            else {
+                                return;
+                            };
+                            this.edit_zoom_segment(
+                                "zoom-style",
+                                index,
+                                window,
+                                cx,
+                                move |segment| {
+                                    if segment.style == style {
+                                        return false;
+                                    }
+                                    segment.style = style;
+                                    true
+                                },
+                            );
+                        }))
+                        .into_any_element(),
+                    )
+                    .children(loupe.then(|| {
+                        div()
+                            .flex()
+                            .flex_col()
+                            .gap(px(14.))
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(Hsla::from(theme.gray_11))
+                                    .child(tr::editor::panel::zoom::loupe_help()),
+                            )
+                            .child(self.slider_field(
+                                tr::editor::panel::zoom::loupe_size(),
+                                SliderKey::Panel(PanelSlider::ZoomLoupeSize, index),
+                                "%",
+                                cx,
+                            ))
+                            .child(
+                                ui::Field::inline(&theme, tr::editor::panel::zoom::loupe_shape())
+                                    .value(
+                                        ui::SegmentedControl::editor(
+                                            &theme,
+                                            SharedString::from(format!("zoom-loupe-shape-{index}")),
+                                            vec![
+                                                ui::SegmentOption::new(
+                                                    tr::editor::panel::zoom::shape_circle(),
+                                                    shape == LoupeShape::Circle,
+                                                ),
+                                                ui::SegmentOption::new(
+                                                    tr::editor::panel::zoom::shape_rounded(),
+                                                    shape == LoupeShape::RoundedRect,
+                                                ),
+                                            ],
+                                        )
+                                        .on_select(cx.listener(
+                                            move |this, choice: &usize, window, cx| {
+                                                let Some(shape) = ui::option_at(
+                                                    &[LoupeShape::Circle, LoupeShape::RoundedRect],
+                                                    *choice,
+                                                ) else {
+                                                    return;
+                                                };
+                                                this.edit_zoom_segment(
+                                                    "zoom-loupe-shape",
+                                                    index,
+                                                    window,
+                                                    cx,
+                                                    move |segment| {
+                                                        if segment.loupe_shape == shape {
+                                                            return false;
+                                                        }
+                                                        segment.loupe_shape = shape;
+                                                        true
+                                                    },
+                                                );
+                                            },
+                                        ))
+                                        .into_any_element(),
+                                    ),
+                            )
+                            .into_any_element()
+                    })),
+            )
             .child(
                 ui::Field::section(&theme, tr::editor::panel::zoom::mode()).child(
                     div()

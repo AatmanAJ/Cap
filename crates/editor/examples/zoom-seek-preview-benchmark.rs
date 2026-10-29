@@ -52,6 +52,9 @@ async fn main() {
             glide_speed: 0.5,
             instant_animation: false,
             edge_snap_ratio: 0.25,
+            style: cap_project::ZoomStyle::Frame,
+            loupe_size: cap_project::ZoomSegment::default_loupe_size(),
+            loupe_shape: cap_project::LoupeShape::Circle,
         })
         .collect();
     project.write(&root).unwrap();

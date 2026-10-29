@@ -2,8 +2,8 @@ use anyhow::Result;
 use cap_project::{
     AspectRatio, Camera, CameraShape, CameraXPosition, CameraYPosition, ClipOffsets,
     ClipTransitionType, CornerStyle, Crop, CursorEvents, CursorType, FrameConfiguration,
-    FrameStyle, OverlayTrackKind, ProjectConfiguration, ProjectStyleCache, RecordingMeta,
-    SceneMode, StudioRecordingMeta, TimelineFrameMapping, TimelineSource, XY,
+    FrameStyle, LoupeShape, OverlayTrackKind, ProjectConfiguration, ProjectStyleCache,
+    RecordingMeta, SceneMode, StudioRecordingMeta, TimelineFrameMapping, TimelineSource, XY,
 };
 use composite_frame::{ColorGradeUniformParams, CompositeVideoFrameUniforms};
 use core::f64;
@@ -223,6 +223,7 @@ use takeover::InterpolatedTakeover;
 pub use takeover::TakeoverDisplayMorph;
 use text::{PreparedText, prepare_texts};
 use zoom::*;
+pub use zoom::{LoupeGeometry, LoupeSample};
 pub use zoom_spring::{CursorCropMap, ZoomTransformTimeline};
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -3449,6 +3450,44 @@ fn resolve_motion_descriptor(
     }
 }
 
+/// Lens content must slide at least this many output px per frame before the
+/// loupe motion blur engages.
+const LOUPE_MOTION_ACTIVATION_PX: f32 = 0.75;
+/// Longest smear inside the lens, in lens radii.
+const LOUPE_MOTION_MAX_RADII: f32 = 0.25;
+
+struct LoupeFrame<'a> {
+    current: Option<LoupeSample>,
+    previous: Option<LoupeSample>,
+    cursor: Option<&'a InterpolatedCursorPosition>,
+    prev_cursor: Option<&'a InterpolatedCursorPosition>,
+}
+
+/// Resolves a lens sample on the card: `cursor` is raw display UV,
+/// `content_crop` the crop the sample's content UV refers to, and `card_crop`
+/// (source px) / `card_size` (output px) the rect the card actually shows.
+fn loupe_geometry_on_card(
+    sample: &LoupeSample,
+    cursor: Option<XY<f64>>,
+    screen_size: XY<u32>,
+    content_crop: &Crop,
+    card_crop: [f32; 4],
+    card_size: XY<f64>,
+) -> Option<LoupeGeometry> {
+    let crop_origin = content_crop.position.map(f64::from);
+    let crop_size = content_crop.size.map(|v| f64::from(v.max(1)));
+    let screen = screen_size.map(f64::from);
+    let cursor_content = cursor.map(|uv| (uv * screen - crop_origin) / crop_size);
+    let focus_px = crop_origin + sample.focus(cursor_content) * crop_size;
+
+    let card_origin = XY::new(f64::from(card_crop[0]), f64::from(card_crop[1]));
+    let card_span = XY::new(
+        f64::from(card_crop[2] - card_crop[0]).max(f64::EPSILON),
+        f64::from(card_crop[3] - card_crop[1]).max(f64::EPSILON),
+    );
+    LoupeGeometry::resolve(sample, (focus_px - card_origin) / card_span, card_size)
+}
+
 fn normalized_motion_amount(user_motion_blur: f32, fps: f32) -> f32 {
     if user_motion_blur <= f32::EPSILON {
         0.0
@@ -3992,6 +4031,89 @@ impl ProjectUniforms {
         )
     }
 
+    /// Fills the display's loupe and sampling fields; everything else stays at
+    /// its default. `card_crop` is the source-pixel rect the card shows and
+    /// `card_size` its on-screen size, both after any split/takeover morph.
+    fn loupe_and_sampling_uniforms(
+        frame: LoupeFrame<'_>,
+        screen_size: XY<u32>,
+        content_crop: &Crop,
+        card_crop: [f32; 4],
+        card_size: [f32; 2],
+        motion_amount: f32,
+        display_zoom: f32,
+    ) -> CompositeVideoFrameUniforms {
+        let card = XY::new(f64::from(card_size[0]), f64::from(card_size[1]));
+        let resolve = |sample: Option<LoupeSample>, cursor: Option<&InterpolatedCursorPosition>| {
+            let sample = sample?;
+            let geometry = loupe_geometry_on_card(
+                &sample,
+                cursor.map(|cursor| cursor.position.coord),
+                screen_size,
+                content_crop,
+                card_crop,
+                card,
+            )?;
+            Some((sample, geometry))
+        };
+        let current = resolve(frame.current, frame.cursor);
+        let mut uniforms = CompositeVideoFrameUniforms {
+            sampling_params: [
+                display_zoom,
+                match current.map(|(sample, _)| sample.shape) {
+                    Some(LoupeShape::RoundedRect) => 1.0,
+                    _ => 0.0,
+                },
+                0.0,
+                0.0,
+            ],
+            ..Default::default()
+        };
+        let Some((_, geometry)) = current else {
+            return uniforms;
+        };
+
+        let to_uv = |point: XY<f64>| [(point.x / card.x) as f32, (point.y / card.y) as f32];
+        let [center_u, center_v] = to_uv(geometry.center);
+        let [anchor_u, anchor_v] = to_uv(geometry.anchor);
+        uniforms.loupe_position = [center_u, center_v, anchor_u, anchor_v];
+        uniforms.loupe_shape = [
+            geometry.half_extent.x as f32,
+            geometry.half_extent.y as f32,
+            geometry.corner_radius as f32,
+            geometry.magnification as f32,
+        ];
+
+        if motion_amount > f32::EPSILON
+            && let Some((_, previous)) = resolve(frame.previous, frame.prev_cursor)
+        {
+            let [prev_center_u, prev_center_v] = to_uv(previous.center);
+            let [prev_anchor_u, prev_anchor_v] = to_uv(previous.anchor);
+            let travel = [
+                center_u - prev_center_u,
+                center_v - prev_center_v,
+                anchor_u - prev_anchor_u,
+                anchor_v - prev_anchor_v,
+            ];
+            let magnification = geometry.magnification as f32;
+            let content_travel_px = ((travel[2] * magnification - travel[0]) * card_size[0])
+                .hypot((travel[3] * magnification - travel[1]) * card_size[1]);
+            if content_travel_px >= LOUPE_MOTION_ACTIVATION_PX {
+                let radius = geometry.half_extent.x.min(geometry.half_extent.y) as f32;
+                let max_smear_px = LOUPE_MOTION_MAX_RADII * radius;
+                let smear_px = content_travel_px * motion_amount;
+                let scale = if smear_px > max_smear_px {
+                    motion_amount * max_smear_px / smear_px
+                } else {
+                    motion_amount
+                };
+                uniforms.loupe_motion = travel.map(|value| value * scale);
+            }
+        }
+
+        uniforms
+    }
+
     fn display_bounds(
         zoom: &InterpolatedZoom,
         display_offset: Coord<FrameSpace>,
@@ -4414,6 +4536,13 @@ impl ProjectUniforms {
         // segment starts, ends and re-aims by construction.
         let zoom = zoom_timeline.sample(frame_time);
         let prev_zoom = zoom_timeline.sample(prev_frame_time);
+        let loupe = zoom_timeline.sample_loupe(frame_time);
+        let prev_loupe = if has_previous {
+            zoom_timeline.sample_loupe(prev_frame_time)
+        } else {
+            None
+        };
+        let loupe_snapped = zoom_timeline.snapped_within(prev_frame_time, frame_time);
 
         let motion_sample_frames = frame_number.min(DISPLAY_MOTION_SAMPLE_FRAMES);
         let motion_frame_delta = motion_sample_frames as f32 / fps_f32;
@@ -4854,6 +4983,10 @@ impl ProjectUniforms {
                         color_adjust_a: [0.0; 4],
                         color_adjust_b: [0.0; 4],
                         grain_params: [0.0; 4],
+                        loupe_position: [0.0; 4],
+                        loupe_shape: [0.0; 4],
+                        loupe_motion: [0.0; 4],
+                        sampling_params: [0.0; 4],
                     },
                     style: frame.style,
                     theme: frame.theme,
@@ -4923,6 +5056,10 @@ impl ProjectUniforms {
                             color_adjust_a: [0.0; 4],
                             color_adjust_b: [0.0; 4],
                             grain_params: [0.0; 4],
+                            loupe_position: [0.0; 4],
+                            loupe_shape: [0.0; 4],
+                            loupe_motion: [0.0; 4],
+                            sampling_params: [0.0; 4],
                         },
                         raster_size: [unzoomed.full_size[0] as f64, unzoomed.full_size[1] as f64],
                         source_crop: placement.source_crop,
@@ -4983,6 +5120,20 @@ impl ProjectUniforms {
                     color_adjust_a: screen_color_grade.color_adjust_a,
                     color_adjust_b: screen_color_grade.color_adjust_b,
                     grain_params: screen_color_grade.grain_params,
+                    ..Self::loupe_and_sampling_uniforms(
+                        LoupeFrame {
+                            current: loupe,
+                            previous: prev_loupe.filter(|_| !loupe_snapped),
+                            cursor: interpolated_cursor.as_ref(),
+                            prev_cursor: prev_interpolated_cursor.as_ref(),
+                        },
+                        options.screen_size,
+                        &crop,
+                        final_crop_bounds,
+                        final_target_size,
+                        normalized_screen_motion,
+                        zoom.display_amount() as f32,
+                    )
                 },
                 display_parent_motion_px,
                 frame_chrome,
@@ -5212,6 +5363,10 @@ impl ProjectUniforms {
                     color_adjust_a: camera_color_grade.color_adjust_a,
                     color_adjust_b: camera_color_grade.color_adjust_b,
                     grain_params: camera_color_grade.grain_params,
+                    loupe_position: [0.0; 4],
+                    loupe_shape: [0.0; 4],
+                    loupe_motion: [0.0; 4],
+                    sampling_params: [0.0; 4],
                 }
             });
 
@@ -5338,6 +5493,10 @@ impl ProjectUniforms {
                     color_adjust_a: camera_color_grade.color_adjust_a,
                     color_adjust_b: camera_color_grade.color_adjust_b,
                     grain_params: camera_color_grade.grain_params,
+                    loupe_position: [0.0; 4],
+                    loupe_shape: [0.0; 4],
+                    loupe_motion: [0.0; 4],
+                    sampling_params: [0.0; 4],
                 }
             });
         let cutout_uniforms = |mut uniforms: CompositeVideoFrameUniforms| {
