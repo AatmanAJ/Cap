@@ -3021,8 +3021,6 @@ fn inset_crop_bounds(bounds: [f32; 4], frame_size: [f32; 2], inset: f32) -> [f32
     [x0 + inset_x, y0 + inset_y, x1 - inset_x, y1 - inset_y]
 }
 
-/// Top-left of the camera rect in output px. `manual_position` (normalized
-/// center, clamped fully in-frame) overrides the corner/edge `position` enum.
 fn camera_subject_size(shape: CameraShape, aspect: f32, short_side: f32) -> [f32; 2] {
     match shape {
         CameraShape::Source => {
@@ -3036,6 +3034,8 @@ fn camera_subject_size(shape: CameraShape, aspect: f32, short_side: f32) -> [f32
     }
 }
 
+/// Top-left of the camera rect in output px. `manual_position` (normalized
+/// center, clamped fully in-frame) overrides the corner/edge `position` enum.
 fn compute_camera_position(
     camera: &Camera,
     output_size: [f32; 2],
@@ -3471,8 +3471,6 @@ fn normalized_motion_amount(user_motion_blur: f32, fps: f32) -> f32 {
 }
 
 const CAMERA_PADDING: f32 = 50.0;
-/// Clearance kept between a zoom's focus and the camera overlay, as a
-/// fraction of the output's short side.
 const CAMERA_ZOOM_AVOID_MARGIN: f64 = 0.03;
 const CAMERA_EDGE_CROP_INSET_PX: f32 = 2.0;
 
@@ -4073,23 +4071,14 @@ impl ProjectUniforms {
         }
     }
 
-    /// The regular camera overlay's rect once a zoom has fully engaged
-    /// (scaled by "size during zoom"), grown by
-    /// [`CAMERA_ZOOM_AVOID_MARGIN`], in content-normalized output space.
-    /// `base` sizes the output and `project` is the style-resolved
-    /// configuration, mirroring [`Self::new`]. Normalized geometry does not
-    /// depend on the output resolution, so the base size stands in for it.
     pub(crate) fn camera_zoom_zone(
         options: &RenderOptions,
         base: &ProjectConfiguration,
         project: &ProjectConfiguration,
+        camera: &Camera,
     ) -> Option<CameraZone> {
         let camera_frame = options.camera_size?;
-        if project.camera.hide
-            || !project.camera.zoom_avoids_camera
-            || camera_frame.x == 0
-            || camera_frame.y == 0
-        {
+        if camera.hide || !camera.zoom_avoids_camera || camera_frame.x == 0 || camera_frame.y == 0 {
             return None;
         }
 
@@ -4118,13 +4107,13 @@ impl ProjectUniforms {
         let output = [output_size.0 as f32, output_size.1 as f32];
         let min_axis = output[0].min(output[1]);
         let camera_padding = CAMERA_PADDING * output[1] / 1080.0;
-        let scale = project.camera.size / 100.0 * project.camera.scale_during_zoom;
+        let scale = camera.size / 100.0 * camera.scale_during_zoom;
         let size = camera_subject_size(
-            project.camera.shape,
+            camera.shape,
             camera_frame.x as f32 / camera_frame.y as f32,
             min_axis * scale + camera_padding,
         );
-        let position = compute_camera_position(&project.camera, output, size, camera_padding);
+        let position = compute_camera_position(camera, output, size, camera_padding);
 
         let margin = f64::from(min_axis) * CAMERA_ZOOM_AVOID_MARGIN;
         let to_content = |point: XY<f64>| (point - layout.content_offset) / layout.content_size;
@@ -6415,7 +6404,12 @@ mod style_image_tests {
             recording_time: 3.0,
             segment_has_camera: true,
         };
-        let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 6.0, size);
+        let zoom = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            6.0,
+            crate::ZoomLayoutInputs::screen_only(size),
+        );
         let at = |project: &ProjectConfiguration, frame| {
             ProjectUniforms::new(
                 &constants,
@@ -6647,7 +6641,12 @@ mod style_image_tests {
             recording_time: 0.0,
             segment_has_camera: true,
         };
-        let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 3.0, XY::new(160, 90));
+        let zoom = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            3.0,
+            crate::ZoomLayoutInputs::screen_only(XY::new(160, 90)),
+        );
         let mut layers = RendererLayers::new(&constants.device, &constants.queue);
         let mut renderer = FrameRenderer::new(&constants);
         let shared_project = Arc::new(project.clone());
@@ -7202,7 +7201,12 @@ mod nv12_flush_tests {
             recording_time: 0.0,
             segment_has_camera: false,
         };
-        let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 1.0, XY::new(4, 4));
+        let zoom = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            1.0,
+            crate::ZoomLayoutInputs::screen_only(XY::new(4, 4)),
+        );
         let mut renderer = FrameRenderer::new(&constants);
         let mut session = RenderSession::new(&constants.device, 4, 4);
         let mut converter = frame_pipeline::RgbaToNv12Converter::new(&constants.device);
@@ -7325,7 +7329,12 @@ mod nv12_flush_tests {
                 recording_time: 0.0,
                 segment_has_camera: false,
             };
-            let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 1.0, XY::new(4, 4));
+            let zoom = ZoomTransformTimeline::from_project(
+                &project,
+                &cursor,
+                1.0,
+                crate::ZoomLayoutInputs::screen_only(XY::new(4, 4)),
+            );
             let uniforms = ProjectUniforms::new(
                 &constants,
                 &Arc::new(project.clone()),
@@ -9740,7 +9749,12 @@ mod project_uniforms_tests {
                 }),
                 Some(project.cursor.click_spring_config()),
             );
-            let zoom = ZoomTransformTimeline::from_project(&project, &events, 2.0, size);
+            let zoom = ZoomTransformTimeline::from_project(
+                &project,
+                &events,
+                2.0,
+                crate::ZoomLayoutInputs::screen_only(size),
+            );
             let project = Arc::new(project);
             let mut legacy_renderer = FrameRenderer::new(&constants);
             let mut indexed_renderer = FrameRenderer::new(&constants);
@@ -9853,8 +9867,12 @@ mod project_uniforms_tests {
                 clicks: Vec::new(),
             };
             let cursor = PrecomputedCursorTimeline::new(&events, None, None);
-            let zoom =
-                ZoomTransformTimeline::from_project(&project, &events, duration_secs as f64, size);
+            let zoom = ZoomTransformTimeline::from_project(
+                &project,
+                &events,
+                duration_secs as f64,
+                crate::ZoomLayoutInputs::screen_only(size),
+            );
             let mut samples = Vec::new();
             for index in 0..544 {
                 let frame_number = (duration_secs - 3) * 60 + index % 120;
@@ -9952,7 +9970,12 @@ mod project_uniforms_tests {
                 clicks: true
             }
         );
-        let zoom = ZoomTransformTimeline::from_project(&project, &events, 4.0, size);
+        let zoom = ZoomTransformTimeline::from_project(
+            &project,
+            &events,
+            4.0,
+            crate::ZoomLayoutInputs::screen_only(size),
+        );
         let project = Arc::new(project);
         let source = DecodedFrame::new(vec![160; 320 * 180 * 4], size.x, size.y);
         let mut ordered_renderer = FrameRenderer::new(&constants);
@@ -10070,7 +10093,7 @@ mod project_uniforms_tests {
                 &project,
                 &events,
                 f64::from(duration_secs),
-                size,
+                crate::ZoomLayoutInputs::screen_only(size),
             );
             let project = Arc::new(project);
             let mut renderer = FrameRenderer::new(&constants);
@@ -10148,8 +10171,12 @@ mod project_uniforms_tests {
         let mut project = ProjectConfiguration::default();
         project.background.padding = 0.0;
         let events = CursorEvents::default();
-        let zoom_timeline =
-            ZoomTransformTimeline::from_project(&project, &events, 1.0, screen_size);
+        let zoom_timeline = ZoomTransformTimeline::from_project(
+            &project,
+            &events,
+            1.0,
+            crate::ZoomLayoutInputs::screen_only(screen_size),
+        );
 
         for (source_size, bounds) in [
             (XY::new(1600, 900), [0.0, 0.0, 1600.0, 900.0]),
@@ -10475,12 +10502,8 @@ mod project_uniforms_tests {
                 moves: vec![cursor_move(0.0, position.x, position.y)],
                 clicks: vec![],
             };
-            let zoom_timeline = ZoomTransformTimeline::from_project(
-                &project,
-                &events,
-                4.0,
-                constants.options.screen_size,
-            );
+            let zoom_timeline =
+                ZoomTransformTimeline::from_project(&project, &events, 4.0, &constants.options);
             let uniforms = ProjectUniforms::new(
                 &constants,
                 &Arc::new(project.clone()),
@@ -10745,8 +10768,12 @@ mod project_uniforms_tests {
     ) -> ProjectUniforms {
         let screen_size = constants.options.screen_size;
         let events = CursorEvents::default();
-        let mut zoom_timeline =
-            ZoomTransformTimeline::from_project(project, &events, 60.0, screen_size);
+        let mut zoom_timeline = ZoomTransformTimeline::from_project(
+            project,
+            &events,
+            60.0,
+            crate::ZoomLayoutInputs::screen_only(screen_size),
+        );
         zoom_timeline.ensure_precomputed_until(60.0);
         let frames = DecodedSegmentFrames {
             screen_size,
@@ -10860,8 +10887,12 @@ mod project_uniforms_tests {
             ("60 min", 1200),
         ] {
             let project = Arc::new(captioned_project(segments));
-            let mut zoom_timeline =
-                ZoomTransformTimeline::from_project(&project, &events, 60.0, screen_size);
+            let mut zoom_timeline = ZoomTransformTimeline::from_project(
+                &project,
+                &events,
+                60.0,
+                crate::ZoomLayoutInputs::screen_only(screen_size),
+            );
             zoom_timeline.ensure_precomputed_until(60.0);
             let mut runs: Vec<f64> = (0..400)
                 .map(|frame| {
@@ -10993,7 +11024,12 @@ mod per_frame_cache_tests {
                 })
                 .collect(),
         };
-        let zoom = ZoomTransformTimeline::from_project(&project, &cursor, 1.0, size);
+        let zoom = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            1.0,
+            crate::ZoomLayoutInputs::screen_only(size),
+        );
         let mut renderer = FrameRenderer::new(&constants);
         let mut layers = RendererLayers::new_for_preparing_preview(
             &constants.device,

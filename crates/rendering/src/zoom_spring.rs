@@ -33,7 +33,7 @@ use cap_project::{
 use crate::{
     ProjectUniforms, RenderOptions,
     spring_mass_damper::{SpringMassDamperSimulation, SpringMassDamperSimulationConfig},
-    zoom::{CameraZone, InterpolatedZoom, SegmentBounds},
+    zoom::{CameraZone, InterpolatedZoom, SegmentBounds, ZoneExitSides},
 };
 
 /// Fixed precompute step (125 Hz), matching the sampling density the old
@@ -112,17 +112,14 @@ impl CursorCropMap {
     }
 }
 
-/// The render inputs zoom framing depends on: the raw recorded display size
-/// (cursor UV normalization) and, when a camera was recorded, its frame size
-/// (camera-aware framing). A bare display size leaves camera avoidance off.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ZoomLayoutInputs {
     pub screen_size: XY<u32>,
     pub camera_size: Option<XY<u32>>,
 }
 
-impl From<XY<u32>> for ZoomLayoutInputs {
-    fn from(screen_size: XY<u32>) -> Self {
+impl ZoomLayoutInputs {
+    pub fn screen_only(screen_size: XY<u32>) -> Self {
         Self {
             screen_size,
             camera_size: None,
@@ -139,16 +136,12 @@ impl From<&RenderOptions> for ZoomLayoutInputs {
     }
 }
 
-/// Camera zone in effect from `start` (TIMELINE secs) until the next span.
 #[derive(Clone, Debug, PartialEq)]
 struct CameraZoneSpan {
     start: f64,
     zone: Option<CameraZone>,
 }
 
-/// Where the camera overlay sits over time, split at every style and scene
-/// boundary since either can move, resize, hide or re-layout the camera.
-/// Empty when no span has a regular camera overlay to avoid.
 fn camera_zone_spans(
     project: &ProjectConfiguration,
     inputs: ZoomLayoutInputs,
@@ -192,9 +185,21 @@ fn camera_zone_spans(
             .iter()
             .find(|segment| probe >= segment.start && probe < segment.end)
             .is_none_or(|segment| matches!(segment.mode, SceneMode::Default));
-        let zone = camera_is_overlay
-            .then(|| ProjectUniforms::camera_zoom_zone(&options, project, &project.style_at(probe)))
-            .flatten();
+        let zone = if camera_is_overlay {
+            let (background, camera) = project.styled_background_and_camera_at(probe);
+            if std::ptr::eq(background, &project.background) {
+                ProjectUniforms::camera_zoom_zone(&options, project, project, camera)
+            } else {
+                let layout = ProjectConfiguration {
+                    aspect_ratio: project.aspect_ratio.clone(),
+                    background: background.clone(),
+                    ..Default::default()
+                };
+                ProjectUniforms::camera_zoom_zone(&options, project, &layout, camera)
+            }
+        } else {
+            None
+        };
         if spans.last().is_none_or(|last| last.zone != zone) {
             spans.push(CameraZoneSpan { start, zone });
         }
@@ -833,6 +838,7 @@ struct PrecomputeState {
     /// Last center target while a segment was active. Held during zoom-out so
     /// the outgoing framing stays anchored instead of re-aiming mid-flight.
     held_center_target: XY<f32>,
+    zone_sides: Option<(usize, ZoneExitSides)>,
 }
 
 struct StepTargets {
@@ -841,6 +847,7 @@ struct StepTargets {
     activity: f32,
     segment_active: bool,
     snap: bool,
+    zone_sides: Option<(usize, ZoneExitSides)>,
 }
 
 /// Segments with a NaN bound can never be active, so they are left out of the
@@ -1061,7 +1068,7 @@ impl ZoomTransformTimeline {
 
         // Seed the simulations at rest on the t=0 target so the very first
         // frame is already correct and `samples` is never empty.
-        let initial = timeline.targets_at(0.0, XY::new(0.5, 0.5));
+        let initial = timeline.targets_at(0.0, XY::new(0.5, 0.5), None);
         let mut center_sim = SpringMassDamperSimulation::new(spring_config);
         center_sim.set_position(initial.center);
         center_sim.set_velocity(XY::new(0.0, 0.0));
@@ -1085,6 +1092,7 @@ impl ZoomTransformTimeline {
             center_sim,
             aux_sim,
             held_center_target: initial.center,
+            zone_sides: initial.zone_sides,
         });
         timeline
     }
@@ -1129,8 +1137,7 @@ impl ZoomTransformTimeline {
     /// config and crop mapping out of a [`ProjectConfiguration`].
     /// `layout` carries the raw recorded display size in px, needed to
     /// normalize the project's pixel-space crop into cursor UV space, and the
-    /// camera frame size that camera-aware framing needs; pass the
-    /// [`RenderOptions`] to get both.
+    /// camera frame size camera-aware framing needs.
     pub fn from_project(
         project: &ProjectConfiguration,
         cursor_events: &CursorEvents,
@@ -1286,10 +1293,11 @@ impl ZoomTransformTimeline {
             return;
         };
         let held_center = state.held_center_target;
+        let held_sides = state.zone_sides;
 
         let step_index = self.samples.len();
         let step_secs = step_index as f64 * STEP_MS / 1000.0;
-        let targets = self.targets_at(step_secs, held_center);
+        let targets = self.targets_at(step_secs, held_center, held_sides);
 
         let Some(state) = self.state.as_mut() else {
             return;
@@ -1298,6 +1306,7 @@ impl ZoomTransformTimeline {
         if targets.segment_active {
             state.held_center_target = targets.center;
         }
+        state.zone_sides = targets.zone_sides;
 
         state.center_sim.set_target_position(targets.center);
         state
@@ -1355,7 +1364,12 @@ impl ZoomTransformTimeline {
         }
     }
 
-    fn targets_at(&self, timeline_secs: f64, held_center: XY<f32>) -> StepTargets {
+    fn targets_at(
+        &self,
+        timeline_secs: f64,
+        held_center: XY<f32>,
+        held_sides: Option<(usize, ZoneExitSides)>,
+    ) -> StepTargets {
         let active = self.segment_index.active_at(timeline_secs);
         let snap = self.segment_index.snaps_at(timeline_secs);
 
@@ -1390,17 +1404,21 @@ impl ZoomTransformTimeline {
                         )
                     }
                 };
-                let center = match camera_zone_at(&self.camera_zones, timeline_secs) {
+                let (center, zone_sides) = match camera_zone_at(&self.camera_zones, timeline_secs) {
                     Some(zone) => {
-                        let moved = SegmentBounds::center_avoiding_zone(
+                        let held = held_sides
+                            .filter(|(segment, _)| *segment == index)
+                            .map(|(_, sides)| sides);
+                        let (moved, sides) = SegmentBounds::center_avoiding_zone(
                             amount,
                             XY::new(focus.0, focus.1),
                             XY::new(center.0, center.1),
                             zone,
+                            held,
                         );
-                        (moved.x, moved.y)
+                        ((moved.x, moved.y), sides.map(|sides| (index, sides)))
                     }
-                    None => center,
+                    None => (center, None),
                 };
 
                 StepTargets {
@@ -1409,6 +1427,7 @@ impl ZoomTransformTimeline {
                     activity: 1.0,
                     segment_active: true,
                     snap,
+                    zone_sides,
                 }
             }
             None => StepTargets {
@@ -1419,6 +1438,7 @@ impl ZoomTransformTimeline {
                 activity: 0.0,
                 segment_active: false,
                 snap,
+                zone_sides: None,
             },
         }
     }
@@ -1676,7 +1696,7 @@ mod tests {
                             &project,
                             &cursor,
                             duration,
-                            XY::new(1920, 1080),
+                            crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
                             clip,
                         )
                     } else {
@@ -1684,7 +1704,7 @@ mod tests {
                             &project,
                             &cursor,
                             duration,
-                            XY::new(1920, 1080),
+                            crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
                             clip,
                         )
                     }
@@ -1719,7 +1739,9 @@ mod tests {
             .rounding = 12.0;
         let screen = XY::new(1000, 1000);
         assert!(ZoomTransformTimeline::project_inputs_match(
-            &project, &edited, screen
+            &project,
+            &edited,
+            crate::ZoomLayoutInputs::screen_only(screen)
         ));
 
         let cursor = CursorEvents {
@@ -1739,7 +1761,7 @@ mod tests {
                         project,
                         &cursor,
                         duration,
-                        screen.into(),
+                        ZoomLayoutInputs::screen_only(screen),
                         Some(recording_clip),
                         outgoing,
                     )
@@ -1804,7 +1826,7 @@ mod tests {
                 !ZoomTransformTimeline::project_inputs_match(
                     &project,
                     &edited,
-                    XY::new(1000, 1000)
+                    crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000))
                 ),
                 "change {index} reused stale zoom samples"
             );
@@ -1820,17 +1842,21 @@ mod tests {
         let screen = XY::new(1000, 1000);
 
         assert!(!ZoomTransformTimeline::project_inputs_match(
-            &before, &after, screen
+            &before,
+            &after,
+            crate::ZoomLayoutInputs::screen_only(screen)
         ));
         assert!(!ZoomTransformTimeline::project_inputs_match(
-            &after, &before, screen
+            &after,
+            &before,
+            crate::ZoomLayoutInputs::screen_only(screen)
         ));
         let no_transitions = after.clone();
         after.background.padding = 24.0;
         assert!(ZoomTransformTimeline::project_inputs_match(
             &no_transitions,
             &after,
-            screen
+            crate::ZoomLayoutInputs::screen_only(screen)
         ));
     }
 
@@ -1852,11 +1878,15 @@ mod tests {
             moves: vec![move_event(0.0, 0.5, 0.75)],
             clicks: Vec::new(),
         };
-        let mut timeline =
-            ZoomTransformTimeline::from_project(&project, &cursor, 10.0, XY::new(1000, 1000));
+        let mut timeline = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            10.0,
+            crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
+        );
         for (time, expected_y) in [(1.999, 0.75), (2.0, 0.5), (4.999, 0.5), (5.0, 0.75)] {
             assert_eq!(
-                timeline.targets_at(time, XY::new(0.5, 0.5)).center,
+                timeline.targets_at(time, XY::new(0.5, 0.5), None).center,
                 follow_center((0.5, expected_y)),
                 "focus at {time}"
             );
@@ -1913,8 +1943,12 @@ mod tests {
             moves: vec![move_event(0.0, 0.4, 0.75)],
             clicks: Vec::new(),
         };
-        let timeline =
-            ZoomTransformTimeline::from_project(&project, &cursor, 10.0, XY::new(1000, 1000));
+        let timeline = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            10.0,
+            crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
+        );
         for time in [0.5, 1.0, 1.999, 2.0, 3.0, 4.0, 6.0, 7.0, 8.0, 9.0] {
             let resolved = project.style_at(time);
             let crop = resolved
@@ -1931,8 +1965,8 @@ mod tests {
                 crop,
             );
             assert_eq!(
-                timeline.targets_at(time, XY::new(0.5, 0.5)).center,
-                reference.targets_at(time, XY::new(0.5, 0.5)).center,
+                timeline.targets_at(time, XY::new(0.5, 0.5), None).center,
+                reference.targets_at(time, XY::new(0.5, 0.5), None).center,
                 "style precedence at {time}"
             );
         }
@@ -1960,11 +1994,16 @@ mod tests {
             moves: vec![move_event(1000.0, 0.4, 0.5), move_event(2000.0, 0.6, 0.5)],
             clicks: Vec::new(),
         };
-        let timeline =
-            ZoomTransformTimeline::from_project(&project, &cursor, 10.0, XY::new(1000, 1000));
+        let timeline = ZoomTransformTimeline::from_project(
+            &project,
+            &cursor,
+            10.0,
+            crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
+        );
         let expected = SegmentBounds::calculate_follow_center((0.3, 0.5), 0.25);
         assert!(
-            (f64::from(timeline.targets_at(1.5, XY::new(0.5, 0.5)).center.x) - expected.0).abs()
+            (f64::from(timeline.targets_at(1.5, XY::new(0.5, 0.5), None).center.x) - expected.0)
+                .abs()
                 < 1e-6
         );
         let base = timeline_for(
@@ -1973,7 +2012,7 @@ mod tests {
             10.0,
         );
         assert_eq!(
-            base.targets_at(1.5, XY::new(0.5, 0.5)).center,
+            base.targets_at(1.5, XY::new(0.5, 0.5), None).center,
             follow_center((0.5, 0.5))
         );
     }
@@ -2031,27 +2070,30 @@ mod tests {
             &project,
             &cursor,
             6.0,
-            XY::new(1000, 1000),
+            crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
             0,
         );
         let outgoing = ZoomTransformTimeline::from_project_for_outgoing_clip(
             &project,
             &cursor,
             6.0,
-            XY::new(1000, 1000),
+            crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
             0,
         );
         assert_eq!(
-            incoming.targets_at(0.999, XY::new(0.5, 0.5)).center,
+            incoming.targets_at(0.999, XY::new(0.5, 0.5), None).center,
             follow_center((0.5, 0.75))
         );
         assert_eq!(
-            incoming.targets_at(1.0, XY::new(0.5, 0.5)).center,
+            incoming.targets_at(1.0, XY::new(0.5, 0.5), None).center,
             follow_center((0.5, 0.5))
         );
-        assert_eq!(incoming.targets_at(1.75, XY::new(0.5, 0.5)).center.y, 0.0);
         assert_eq!(
-            outgoing.targets_at(1.75, XY::new(0.5, 0.5)).center,
+            incoming.targets_at(1.75, XY::new(0.5, 0.5), None).center.y,
+            0.0
+        );
+        assert_eq!(
+            outgoing.targets_at(1.75, XY::new(0.5, 0.5), None).center,
             follow_center((0.5, 0.5))
         );
     }
@@ -2085,8 +2127,12 @@ mod tests {
                 },
                 ..project_with_crop_styles(segments.clone(), styles)
             };
-            let mut styled =
-                ZoomTransformTimeline::from_project(&project, &cursor, 10.0, XY::new(1000, 1000));
+            let mut styled = ZoomTransformTimeline::from_project(
+                &project,
+                &cursor,
+                10.0,
+                crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
+            );
             let mut reference = ZoomTransformTimeline::new(
                 &segments,
                 project.timeline.as_ref(),
@@ -2135,8 +2181,14 @@ mod tests {
             ],
             clicks: Vec::new(),
         };
-        let build =
-            || ZoomTransformTimeline::from_project(&project, &cursor, 10.0, XY::new(1000, 1000));
+        let build = || {
+            ZoomTransformTimeline::from_project(
+                &project,
+                &cursor,
+                10.0,
+                crate::ZoomLayoutInputs::screen_only(XY::new(1000, 1000)),
+            )
+        };
         let mut sequential = build();
         for frame in 0..=600 {
             sequential.ensure_precomputed_until(frame as f32 / 60.0);
@@ -2483,7 +2535,7 @@ mod tests {
                 &project,
                 &cursor,
                 12.0,
-                XY::new(1920, 1080),
+                crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
                 0,
             );
             timeline.precompute();
@@ -2921,7 +2973,7 @@ mod tests {
                         &project,
                         &cursor,
                         duration_secs,
-                        screen_size,
+                        crate::ZoomLayoutInputs::screen_only(screen_size),
                         0,
                     );
                     let build_elapsed = build_start.elapsed();
@@ -2976,7 +3028,7 @@ mod tests {
                             clicks: Vec::new(),
                         },
                         8.0 / timescale,
-                        XY::new(1920, 1080),
+                        crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
                         0,
                     );
                     timeline.precompute();
@@ -2987,7 +3039,7 @@ mod tests {
                 for (time, position) in [(2.0 / timescale, first), (6.0 / timescale, second)] {
                     let focus = if position == 0.0 { 0.2 } else { 0.8 };
                     assert_eq!(
-                        expected.targets_at(time, XY::new(0.5, 0.5)).center,
+                        expected.targets_at(time, XY::new(0.5, 0.5), None).center,
                         follow_center((focus, focus))
                     );
                 }
@@ -3017,7 +3069,7 @@ mod tests {
                 clicks: Vec::new(),
             },
             8.0,
-            XY::new(1920, 1080),
+            crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
             0,
         );
         timeline.precompute();
@@ -3033,7 +3085,7 @@ mod tests {
         );
         for (time, focus) in [(2.0, 0.2), (6.0, 0.8)] {
             assert_eq!(
-                timeline.targets_at(time, XY::new(0.5, 0.5)).center,
+                timeline.targets_at(time, XY::new(0.5, 0.5), None).center,
                 follow_center((focus, focus))
             );
         }
@@ -3054,7 +3106,7 @@ mod tests {
         let expected = build(kept);
         assert_samples_identical(&expected, &build(with_cut_moves));
         assert_eq!(
-            expected.targets_at(2.0, XY::new(0.5, 0.5)).center,
+            expected.targets_at(2.0, XY::new(0.5, 0.5), None).center,
             follow_center((0.2, 0.2))
         );
     }
@@ -3150,7 +3202,7 @@ mod tests {
                         &project,
                         &cursor,
                         12.0,
-                        XY::new(1920, 1080),
+                        crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
                         0,
                     )
                 };
@@ -3590,7 +3642,8 @@ mod tests {
             screen_size: layout.screen_size,
             preserve_screen_alpha: false,
         };
-        ProjectUniforms::camera_zoom_zone(&options, project, project).expect("camera zone")
+        ProjectUniforms::camera_zoom_zone(&options, project, project, &project.camera)
+            .expect("camera zone")
     }
 
     fn precomputed(
@@ -3646,7 +3699,11 @@ mod tests {
         let project = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, focus.x, focus.y)]);
         let zone = camera_zone(&project);
 
-        let plain = precomputed(&project, XY::new(1920, 1080), 6.0);
+        let plain = precomputed(
+            &project,
+            ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
+            6.0,
+        );
         let aware = precomputed(&project, camera_layout(), 6.0);
         let plain_zoom = plain.sample(4.0);
         let aware_zoom = aware.sample(4.0);
@@ -3658,7 +3715,6 @@ mod tests {
         assert!(aware_zoom.bounds.top_left.x <= 1e-6 && aware_zoom.bounds.bottom_right.x >= 1.0);
         assert!(aware_zoom.bounds.top_left.y <= 1e-6 && aware_zoom.bounds.bottom_right.y >= 1.0);
 
-        // Before the zoom engages nothing moves.
         assert_eq!(
             plain.sample(0.5).bounds,
             aware.sample(0.5).bounds,
@@ -3669,7 +3725,11 @@ mod tests {
     #[test]
     fn camera_avoidance_is_off_unless_a_camera_overlay_is_shown() {
         let base = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, 0.85, 0.8)]);
-        let reference = precomputed(&base, XY::new(1920, 1080), 6.0);
+        let reference = precomputed(
+            &base,
+            ZoomLayoutInputs::screen_only(XY::new(1920, 1080)),
+            6.0,
+        );
 
         let mut toggled_off = base.clone();
         toggled_off.camera.zoom_avoids_camera = false;
@@ -3743,9 +3803,6 @@ mod tests {
 
     #[test]
     fn crossing_into_the_camera_keeps_framing_continuous() {
-        // Back-to-back zooms whose focus steps from clear of the camera to
-        // under it: the avoidance re-aim must ride the spring, not snap, and
-        // move no faster than the same re-aims without a camera.
         let project = project_with_camera(vec![
             manual_segment(0.5, 2.5, 2.0, 0.78, 0.8),
             manual_segment(2.5, 4.5, 2.0, 0.86, 0.8),
@@ -3761,7 +3818,7 @@ mod tests {
                 })
                 .fold(0.0_f64, f64::max)
         };
-        let plain = largest_step(XY::new(1920, 1080).into());
+        let plain = largest_step(ZoomLayoutInputs::screen_only(XY::new(1920, 1080)));
         let aware = largest_step(camera_layout());
         assert!(aware > 0.0 && plain > 0.0);
         assert!(aware < 0.02, "framing jumped by {aware} in one frame");
@@ -3787,7 +3844,7 @@ mod tests {
             assert!(ZoomTransformTimeline::project_inputs_match(
                 &before,
                 after,
-                XY::new(1920, 1080)
+                crate::ZoomLayoutInputs::screen_only(XY::new(1920, 1080))
             ));
         }
         assert!(ZoomTransformTimeline::project_inputs_match(

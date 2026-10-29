@@ -3623,8 +3623,6 @@ mod tests {
         assert_eq!(starts(0.3), vec![(0.7, 3.5), (9.7, 12.5)]);
         assert_eq!(starts(0.0), vec![(1.0, 3.5), (10.0, 12.5)]);
         assert_eq!(starts(1.0), vec![(0.001, 3.5), (9.0, 12.5)]);
-        // Out-of-range leads clamp to the slider's range; garbage falls back
-        // to the default.
         assert_eq!(starts(5.0), starts(1.0));
         assert_eq!(starts(-1.0), starts(0.0));
         assert_eq!(starts(f64::NAN), starts(0.3));

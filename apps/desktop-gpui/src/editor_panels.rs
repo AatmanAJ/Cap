@@ -2729,7 +2729,6 @@ pub enum PanelSlider {
     /// The multi-zoom panel's single Amount slider, which writes every selected
     /// segment at once.
     ZoomAmountAll,
-    /// The project's [`ProjectConfiguration::auto_zoom_lead`], in seconds.
     AutoZoomLead,
 
     TextLayoutTransition,
@@ -4379,8 +4378,6 @@ impl EditorWindow {
             .into_any_element()
     }
 
-    /// The project-wide "start earlier" lead the click-driven zoom generator
-    /// pads in front of each click.
     fn auto_zoom_lead_field(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = self.theme;
         div()

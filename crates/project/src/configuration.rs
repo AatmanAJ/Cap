@@ -565,10 +565,8 @@ pub struct Camera {
     pub scale_during_zoom: f32,
     #[serde(default)]
     pub background_blur: BackgroundBlurConfig,
-    /// Shift zoomed framing so the zoom focus does not sit under the camera.
-    /// The field-level default keeps old projects (and old style overrides
-    /// and presets) framed as before, while `Default::default()` turns it on
-    /// for new recordings.
+    /// Off unless set, so existing projects keep their framing; new
+    /// recordings opt in via [`ProjectConfiguration::for_new_recording`].
     #[serde(default)]
     pub zoom_avoids_camera: bool,
 }
@@ -615,7 +613,7 @@ impl Default for Camera {
             rounding_type: CornerStyle::default(),
             scale_during_zoom: Self::default_scale_during_zoom(),
             background_blur: BackgroundBlurConfig::default(),
-            zoom_avoids_camera: true,
+            zoom_avoids_camera: false,
         }
     }
 }
@@ -2714,7 +2712,6 @@ pub struct ProjectConfiguration {
     /// durations from `fade_duration`.
     #[serde(default)]
     pub text_anim_version: u32,
-    /// Seconds an auto-generated zoom starts before the click it frames.
     #[serde(default = "ProjectConfiguration::default_auto_zoom_lead")]
     pub auto_zoom_lead: f64,
 }
@@ -2854,6 +2851,7 @@ impl ProjectConfiguration {
         preset.text_anim_version = self.text_anim_version;
         preset.overlay_order = self.overlay_order.clone();
         preset.clips = self.clips.clone();
+        preset.auto_zoom_lead = self.auto_zoom_lead;
         preset
     }
 
@@ -2975,6 +2973,24 @@ impl ProjectConfiguration {
         selected
     }
 
+    pub fn styled_background_and_camera_at(
+        &self,
+        time: f64,
+    ) -> (&BackgroundConfiguration, &Camera) {
+        let Some(timeline) = &self.timeline else {
+            return (&self.background, &self.camera);
+        };
+        let [background, camera, _] = self.style_indices_at(time);
+        (
+            background
+                .and_then(|index| timeline.style_segments[index].overrides.background.as_ref())
+                .unwrap_or(&self.background),
+            camera
+                .and_then(|index| timeline.style_segments[index].overrides.camera.as_ref())
+                .unwrap_or(&self.camera),
+        )
+    }
+
     pub fn style_at(&self, time: f64) -> Cow<'_, Self> {
         let Some(timeline) = &self.timeline else {
             return Cow::Borrowed(self);
@@ -3026,6 +3042,12 @@ impl ProjectConfiguration {
     }
 
     pub const AUTO_ZOOM_LEAD_MAX: f64 = 1.0;
+
+    pub fn for_new_recording() -> Self {
+        let mut config = Self::default();
+        config.camera.zoom_avoids_camera = true;
+        config
+    }
 
     pub fn default_auto_zoom_lead() -> f64 {
         0.3
@@ -3326,9 +3348,14 @@ mod tests {
     }
 
     #[test]
-    fn camera_aware_zoom_is_on_for_new_projects_only() {
-        assert!(Camera::default().zoom_avoids_camera);
-        assert!(ProjectConfiguration::default().camera.zoom_avoids_camera);
+    fn camera_aware_zoom_is_on_for_new_recordings_only() {
+        assert!(
+            ProjectConfiguration::for_new_recording()
+                .camera
+                .zoom_avoids_camera
+        );
+        assert!(!ProjectConfiguration::default().camera.zoom_avoids_camera);
+        assert!(!Camera::default().zoom_avoids_camera);
 
         let legacy: ProjectConfiguration = serde_json::from_value(serde_json::json!({
             "camera": { "size": 30.0 }
@@ -3340,9 +3367,17 @@ mod tests {
             ProjectConfiguration::default_auto_zoom_lead()
         );
 
+        let no_camera: ProjectConfiguration =
+            serde_json::from_value(serde_json::json!({})).unwrap();
+        assert!(!no_camera.camera.zoom_avoids_camera);
+        assert_eq!(
+            no_camera.auto_zoom_lead,
+            ProjectConfiguration::default_auto_zoom_lead()
+        );
+
         let current = ProjectConfiguration {
             auto_zoom_lead: 0.75,
-            ..Default::default()
+            ..ProjectConfiguration::for_new_recording()
         };
         let round_trip: ProjectConfiguration =
             serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
