@@ -3450,10 +3450,7 @@ fn resolve_motion_descriptor(
     }
 }
 
-/// Lens content must slide at least this many output px per frame before the
-/// loupe motion blur engages.
 const LOUPE_MOTION_ACTIVATION_PX: f32 = 0.75;
-/// Longest smear inside the lens, in lens radii.
 const LOUPE_MOTION_MAX_RADII: f32 = 0.25;
 
 struct LoupeFrame<'a> {
@@ -3463,17 +3460,23 @@ struct LoupeFrame<'a> {
     prev_cursor: Option<&'a InterpolatedCursorPosition>,
 }
 
-/// Resolves a lens sample on the card: `cursor` is raw display UV,
-/// `content_crop` the crop the sample's content UV refers to, and `card_crop`
-/// (source px) / `card_size` (output px) the rect the card actually shows.
-fn loupe_geometry_on_card(
+// The lens is resolved on the unzoomed card so one that follows a frame zoom
+// grows in place instead of riding the zoom-out in from off screen.
+struct LoupePlacement<'a> {
+    screen_size: XY<u32>,
+    content_crop: &'a Crop,
+    card_crop: [f32; 4],
+    card_bounds: [f32; 4],
+    visible_bounds: [f32; 4],
+}
+
+fn loupe_focus_on_card(
     sample: &LoupeSample,
     cursor: Option<XY<f64>>,
     screen_size: XY<u32>,
     content_crop: &Crop,
     card_crop: [f32; 4],
-    card_size: XY<f64>,
-) -> Option<LoupeGeometry> {
+) -> XY<f64> {
     let crop_origin = content_crop.position.map(f64::from);
     let crop_size = content_crop.size.map(|v| f64::from(v.max(1)));
     let screen = screen_size.map(f64::from);
@@ -3485,7 +3488,7 @@ fn loupe_geometry_on_card(
         f64::from(card_crop[2] - card_crop[0]).max(f64::EPSILON),
         f64::from(card_crop[3] - card_crop[1]).max(f64::EPSILON),
     );
-    LoupeGeometry::resolve(sample, (focus_px - card_origin) / card_span, card_size)
+    (focus_px - card_origin) / card_span
 }
 
 fn normalized_motion_amount(user_motion_blur: f32, fps: f32) -> f32 {
@@ -4031,28 +4034,46 @@ impl ProjectUniforms {
         )
     }
 
-    /// Fills the display's loupe and sampling fields; everything else stays at
-    /// its default. `card_crop` is the source-pixel rect the card shows and
-    /// `card_size` its on-screen size, both after any split/takeover morph.
     fn loupe_and_sampling_uniforms(
         frame: LoupeFrame<'_>,
-        screen_size: XY<u32>,
-        content_crop: &Crop,
-        card_crop: [f32; 4],
-        card_size: [f32; 2],
+        placement: LoupePlacement<'_>,
         motion_amount: f32,
         display_zoom: f32,
     ) -> CompositeVideoFrameUniforms {
-        let card = XY::new(f64::from(card_size[0]), f64::from(card_size[1]));
+        let card_origin = XY::new(
+            f64::from(placement.card_bounds[0]),
+            f64::from(placement.card_bounds[1]),
+        );
+        let card_size = XY::new(
+            f64::from(placement.card_bounds[2] - placement.card_bounds[0]).max(f64::EPSILON),
+            f64::from(placement.card_bounds[3] - placement.card_bounds[1]).max(f64::EPSILON),
+        );
+        let visible_origin = XY::new(
+            f64::from(placement.visible_bounds[0]),
+            f64::from(placement.visible_bounds[1]),
+        );
+        let visible_size = XY::new(
+            f64::from(placement.visible_bounds[2] - placement.visible_bounds[0]),
+            f64::from(placement.visible_bounds[3] - placement.visible_bounds[1]),
+        );
+        let to_card_uv = |point: XY<f64>| {
+            let uv = (visible_origin + point - card_origin) / card_size;
+            [uv.x as f32, uv.y as f32]
+        };
         let resolve = |sample: Option<LoupeSample>, cursor: Option<&InterpolatedCursorPosition>| {
             let sample = sample?;
-            let geometry = loupe_geometry_on_card(
+            let focus = loupe_focus_on_card(
                 &sample,
                 cursor.map(|cursor| cursor.position.coord),
-                screen_size,
-                content_crop,
-                card_crop,
-                card,
+                placement.screen_size,
+                placement.content_crop,
+                placement.card_crop,
+            );
+            let focus_on_screen = card_origin + focus * card_size;
+            let geometry = LoupeGeometry::resolve(
+                &sample,
+                (focus_on_screen - visible_origin) / visible_size,
+                visible_size,
             )?;
             Some((sample, geometry))
         };
@@ -4073,9 +4094,8 @@ impl ProjectUniforms {
             return uniforms;
         };
 
-        let to_uv = |point: XY<f64>| [(point.x / card.x) as f32, (point.y / card.y) as f32];
-        let [center_u, center_v] = to_uv(geometry.center);
-        let [anchor_u, anchor_v] = to_uv(geometry.anchor);
+        let [center_u, center_v] = to_card_uv(geometry.center);
+        let [anchor_u, anchor_v] = to_card_uv(geometry.anchor);
         uniforms.loupe_position = [center_u, center_v, anchor_u, anchor_v];
         uniforms.loupe_shape = [
             geometry.half_extent.x as f32,
@@ -4087,8 +4107,8 @@ impl ProjectUniforms {
         if motion_amount > f32::EPSILON
             && let Some((_, previous)) = resolve(frame.previous, frame.prev_cursor)
         {
-            let [prev_center_u, prev_center_v] = to_uv(previous.center);
-            let [prev_anchor_u, prev_anchor_v] = to_uv(previous.anchor);
+            let [prev_center_u, prev_center_v] = to_card_uv(previous.center);
+            let [prev_anchor_u, prev_anchor_v] = to_card_uv(previous.anchor);
             let travel = [
                 center_u - prev_center_u,
                 center_v - prev_center_v,
@@ -4096,8 +4116,8 @@ impl ProjectUniforms {
                 anchor_v - prev_anchor_v,
             ];
             let magnification = geometry.magnification as f32;
-            let content_travel_px = ((travel[2] * magnification - travel[0]) * card_size[0])
-                .hypot((travel[3] * magnification - travel[1]) * card_size[1]);
+            let content_travel_px = ((travel[2] * magnification - travel[0]) * card_size.x as f32)
+                .hypot((travel[3] * magnification - travel[1]) * card_size.y as f32);
             if content_travel_px >= LOUPE_MOTION_ACTIVATION_PX {
                 let radius = geometry.half_extent.x.min(geometry.half_extent.y) as f32;
                 let max_smear_px = LOUPE_MOTION_MAX_RADII * radius;
@@ -4542,7 +4562,7 @@ impl ProjectUniforms {
         } else {
             None
         };
-        let loupe_snapped = zoom_timeline.snapped_within(prev_frame_time, frame_time);
+        let loupe_snapped = zoom_timeline.loupe_snapped_within(prev_frame_time, frame_time);
 
         let motion_sample_frames = frame_number.min(DISPLAY_MOTION_SAMPLE_FRAMES);
         let motion_frame_delta = motion_sample_frames as f32 / fps_f32;
@@ -4844,6 +4864,19 @@ impl ProjectUniforms {
                 lerp_bounds(pre_takeover_bounds, target, takeover_t)
             });
 
+            let unzoomed_target_bounds = {
+                let (start, end) = Self::display_bounds(
+                    &InterpolatedZoom::default(),
+                    display_offset,
+                    display_size,
+                );
+                let bounds = [start.x as f32, start.y as f32, end.x as f32, end.y as f32];
+                let bounds = split_layout
+                    .as_ref()
+                    .map_or(bounds, |s| lerp_bounds(bounds, s.screen.target, split_t));
+                takeover_target.map_or(bounds, |target| lerp_bounds(bounds, target, takeover_t))
+            };
+
             let final_target_size = [
                 final_target_bounds[2] - final_target_bounds[0],
                 final_target_bounds[3] - final_target_bounds[1],
@@ -5127,10 +5160,13 @@ impl ProjectUniforms {
                             cursor: interpolated_cursor.as_ref(),
                             prev_cursor: prev_interpolated_cursor.as_ref(),
                         },
-                        options.screen_size,
-                        &crop,
-                        final_crop_bounds,
-                        final_target_size,
+                        LoupePlacement {
+                            screen_size: options.screen_size,
+                            content_crop: &crop,
+                            card_crop: final_crop_bounds,
+                            card_bounds: final_target_bounds,
+                            visible_bounds: unzoomed_target_bounds,
+                        },
                         normalized_screen_motion,
                         zoom.display_amount() as f32,
                     )
@@ -9546,6 +9582,106 @@ pub fn create_shader_render_pipeline(
         multiview: None,
         cache: None,
     })
+}
+
+#[cfg(test)]
+mod loupe_placement_tests {
+    use super::*;
+
+    const OUTPUT: [f32; 4] = [0.0, 0.0, 1920.0, 1080.0];
+
+    fn uniforms_at(timeline: &ZoomTransformTimeline, time: f32) -> CompositeVideoFrameUniforms {
+        let zoom = timeline.sample(time);
+        let (start, end) = ProjectUniforms::display_bounds(
+            &zoom,
+            Coord::new(XY::new(0.0, 0.0)),
+            Coord::new(XY::new(1920.0, 1080.0)),
+        );
+        let crop = Crop {
+            position: XY::new(0, 0),
+            size: XY::new(1920, 1080),
+        };
+        ProjectUniforms::loupe_and_sampling_uniforms(
+            LoupeFrame {
+                current: timeline.sample_loupe(time),
+                previous: None,
+                cursor: None,
+                prev_cursor: None,
+            },
+            LoupePlacement {
+                screen_size: XY::new(1920, 1080),
+                content_crop: &crop,
+                card_crop: [0.0, 0.0, 1920.0, 1080.0],
+                card_bounds: [start.x as f32, start.y as f32, end.x as f32, end.y as f32],
+                visible_bounds: OUTPUT,
+            },
+            0.0,
+            zoom.display_amount() as f32,
+        )
+    }
+
+    #[test]
+    fn loupe_after_a_frame_zoom_grows_in_place_on_screen() {
+        let project: ProjectConfiguration = ProjectConfiguration {
+            timeline: Some(
+                serde_json::from_value(serde_json::json!({
+                    "segments": [{ "recordingClip": 0, "start": 0.0, "end": 6.0, "timescale": 1.0 }],
+                    "zoomSegments": [
+                        { "start": 1.0, "end": 2.0, "amount": 2.5,
+                          "mode": { "manual": { "x": 0.2, "y": 0.2 } } },
+                        { "start": 2.0, "end": 4.0, "amount": 2.0,
+                          "mode": { "manual": { "x": 0.8, "y": 0.8 } }, "style": "loupe" }
+                    ]
+                }))
+                .unwrap(),
+            ),
+            ..Default::default()
+        };
+        let mut timeline = ZoomTransformTimeline::from_project(
+            &project,
+            &CursorEvents::default(),
+            6.0,
+            XY::new(1920, 1080),
+        );
+        timeline.precompute();
+
+        let settled = uniforms_at(&timeline, 3.5);
+        let settled_radius = settled.loupe_shape[0];
+        let mut handover_seen = false;
+        for frame in 121..240 {
+            let time = frame as f32 / 60.0;
+            let zoom = timeline.sample(time);
+            let uniforms = uniforms_at(&timeline, time);
+            if uniforms.loupe_shape[3] < 1.0 {
+                continue;
+            }
+            handover_seen |= zoom.display_amount() > 1.05;
+            let (start, end) = ProjectUniforms::display_bounds(
+                &zoom,
+                Coord::new(XY::new(0.0, 0.0)),
+                Coord::new(XY::new(1920.0, 1080.0)),
+            );
+            let size = end - start;
+            let center_x = start.x as f32 + uniforms.loupe_position[0] * size.x as f32;
+            let center_y = start.y as f32 + uniforms.loupe_position[1] * size.y as f32;
+            let [half_w, half_h, ..] = uniforms.loupe_shape;
+            assert!(
+                center_x - half_w >= -0.5
+                    && center_x + half_w <= 1920.5
+                    && center_y - half_h >= -0.5
+                    && center_y + half_h <= 1080.5,
+                "lens leaves the screen at t={time}: center ({center_x}, {center_y}) half {half_w}"
+            );
+            assert!(
+                half_w <= settled_radius * 1.12,
+                "lens is oversized at t={time}: {half_w} vs settled {settled_radius}"
+            );
+        }
+        assert!(
+            handover_seen,
+            "the frame zoom is still easing out as the lens grows"
+        );
+    }
 }
 
 #[cfg(test)]

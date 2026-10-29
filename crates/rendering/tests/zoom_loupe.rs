@@ -140,8 +140,6 @@ fn plain_project(zoom_segments: serde_json::Value) -> ProjectConfiguration {
     project
 }
 
-/// R encodes source x and G source y, so a rendered pixel says which source
-/// point it shows.
 fn coordinate_pattern(size: XY<u32>) -> Vec<u8> {
     let mut pixels = Vec::with_capacity((size.x * size.y * 4) as usize);
     for y in 0..size.y {
@@ -302,10 +300,6 @@ async fn rounded_rect_loupe_is_wider_than_tall() {
     );
 }
 
-/// A 2x zoom of a hard 64 -> 192 edge, upscaled 4x overall. Bilinear spreads
-/// the step evenly across 4 output px (max step 32); the Catmull-Rom + CAS
-/// path must be visibly steeper while never leaving the [64, 192] range
-/// (no dark or bright halo on either side of the edge).
 #[tokio::test]
 async fn zoomed_edges_are_sharper_without_halos() {
     let source = XY::new(512, 288);
@@ -427,9 +421,6 @@ async fn benchmark_zoom_and_loupe_render_cost() {
     }
 }
 
-/// Isolates the display shader: one 4K source drawn 200 times per submission
-/// into a 1080p or 4K target, so the timing is GPU-bound and excludes upload,
-/// readback and the rest of the frame.
 #[tokio::test]
 #[ignore]
 async fn benchmark_display_shader_gpu_cost() {
@@ -514,7 +505,17 @@ async fn benchmark_display_shader_gpu_cost() {
             loupe_shape: [radius, radius, radius, 2.0],
             ..base
         };
-        for (label, uniforms) in [("1x", base), ("2x zoom", zoomed), ("loupe 2x", loupe)] {
+        let zoom_blur = CompositeVideoFrameUniforms {
+            motion_blur_params: [2.0, 1.0, 0.04, 0.0],
+            motion_blur_zoom_center: [0.4, 0.6],
+            ..zoomed
+        };
+        for (label, uniforms) in [
+            ("1x", base),
+            ("2x zoom", zoomed),
+            ("2x zoom + zoom blur", zoom_blur),
+            ("loupe 2x", loupe),
+        ] {
             let buffer = uniforms.to_buffer(&device);
             let bind_group = pipeline.bind_group(&device, &buffer, &view);
             let run = |draws: u32| {
@@ -553,4 +554,288 @@ async fn benchmark_display_shader_gpu_cost() {
             println!("{}x{} {label}: {best:.3} ms/draw", output.x, output.y);
         }
     }
+}
+
+mod shader {
+    use cap_rendering::composite_frame::{
+        CompositeVideoFramePipeline, CompositeVideoFrameUniforms,
+    };
+
+    pub const SOURCE: (u32, u32) = (256, 144);
+    pub const OUTPUT: (u32, u32) = (512, 288);
+
+    pub struct Gpu {
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        pipeline: CompositeVideoFramePipeline,
+    }
+
+    impl Gpu {
+        pub async fn new() -> Option<Self> {
+            let instance = cap_rendering::create_wgpu_instance_sync();
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions::default())
+                .await
+                .ok()?;
+            let (device, queue) = adapter
+                .request_device(&wgpu::DeviceDescriptor::default())
+                .await
+                .ok()?;
+            let pipeline = CompositeVideoFramePipeline::new(&device);
+            Some(Self {
+                device,
+                queue,
+                pipeline,
+            })
+        }
+
+        pub fn render(&self, pixels: &[u8], uniforms: CompositeVideoFrameUniforms) -> Vec<u8> {
+            let texture =
+                CompositeVideoFramePipeline::create_frame_texture(&self.device, SOURCE.0, SOURCE.1);
+            self.queue.write_texture(
+                texture.as_image_copy(),
+                pixels,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(SOURCE.0 * 4),
+                    rows_per_image: None,
+                },
+                wgpu::Extent3d {
+                    width: SOURCE.0,
+                    height: SOURCE.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            let view = texture.create_view(&Default::default());
+            let target = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: None,
+                size: wgpu::Extent3d {
+                    width: OUTPUT.0,
+                    height: OUTPUT.1,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let target_view = target.create_view(&Default::default());
+            let buffer = uniforms.to_buffer(&self.device);
+            let bind_group = self.pipeline.bind_group(&self.device, &buffer, &view);
+            let readback = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(OUTPUT.0 * OUTPUT.1 * 4),
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut encoder = self.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: None,
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &target_view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                pass.set_pipeline(&self.pipeline.render_pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.draw(0..3, 0..1);
+            }
+            encoder.copy_texture_to_buffer(
+                target.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(OUTPUT.0 * 4),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width: OUTPUT.0,
+                    height: OUTPUT.1,
+                    depth_or_array_layers: 1,
+                },
+            );
+            self.queue.submit([encoder.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            self.device.poll(wgpu::PollType::Wait).unwrap();
+            readback.slice(..).get_mapped_range().to_vec()
+        }
+    }
+
+    pub fn display(zoom: f32) -> CompositeVideoFrameUniforms {
+        let (w, h) = (OUTPUT.0 as f32, OUTPUT.1 as f32);
+        let (zw, zh) = (w * zoom, h * zoom);
+        CompositeVideoFrameUniforms {
+            output_size: [w, h],
+            frame_size: [SOURCE.0 as f32, SOURCE.1 as f32],
+            crop_bounds: [0.0, 0.0, SOURCE.0 as f32, SOURCE.1 as f32],
+            target_bounds: [
+                (w - zw) * 0.5,
+                (h - zh) * 0.5,
+                (w + zw) * 0.5,
+                (h + zh) * 0.5,
+            ],
+            target_size: [zw, zh],
+            sampling_params: [zoom, 0.0, 0.0, 0.0],
+            ..Default::default()
+        }
+    }
+
+    pub fn stripes() -> Vec<u8> {
+        let mut pixels = Vec::new();
+        for y in 0..SOURCE.1 {
+            for x in 0..SOURCE.0 {
+                let value = if (x / 5 + y / 7) % 2 == 0 { 40 } else { 220 };
+                pixels.extend_from_slice(&[value, value / 2 + 30, 255 - value, 255]);
+            }
+        }
+        pixels
+    }
+
+    pub fn max_difference(a: &[u8], b: &[u8]) -> u8 {
+        a.iter()
+            .zip(b)
+            .map(|(a, b)| a.abs_diff(*b))
+            .max()
+            .unwrap_or(0)
+    }
+
+    pub fn pixel(data: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let offset = ((y * OUTPUT.0 + x) * 4) as usize;
+        data[offset..offset + 4].try_into().unwrap()
+    }
+}
+
+#[tokio::test]
+async fn sharp_sampling_fades_in_without_a_pop_at_zoom_start() {
+    let Some(gpu) = shader::Gpu::new().await else {
+        return;
+    };
+    let pixels = shader::stripes();
+    let unzoomed = gpu.render(&pixels, shader::display(1.0));
+
+    let mut just_zoomed = shader::display(1.0);
+    just_zoomed.sampling_params[0] = 1.002;
+    let just_zoomed = gpu.render(&pixels, just_zoomed);
+    let step = shader::max_difference(&unzoomed, &just_zoomed);
+    assert!(step <= 1, "first zoomed frame jumps by {step}");
+
+    let mut settled = shader::display(1.0);
+    settled.sampling_params[0] = 2.0;
+    let settled = gpu.render(&pixels, settled);
+    assert!(
+        shader::max_difference(&unzoomed, &settled) > 8,
+        "fully zoomed frames use the sharper sampler"
+    );
+
+    let mut previous = unzoomed;
+    for zoom in [1.02f32, 1.04, 1.06, 1.08, 1.10, 1.12, 1.14, 1.16] {
+        let mut uniforms = shader::display(1.0);
+        uniforms.sampling_params[0] = zoom;
+        let frame = gpu.render(&pixels, uniforms);
+        let step = shader::max_difference(&previous, &frame);
+        assert!(step <= 24, "sampler blend jumps by {step} at {zoom}x");
+        previous = frame;
+    }
+}
+
+#[tokio::test]
+async fn a_barely_moving_zoom_blur_matches_the_still_frame() {
+    let Some(gpu) = shader::Gpu::new().await else {
+        return;
+    };
+    let pixels = shader::stripes();
+    let still = gpu.render(&pixels, shader::display(2.0));
+    let mut moving = shader::display(2.0);
+    moving.motion_blur_params = [2.0, 1.0, 1e-5, 0.0];
+    moving.motion_blur_zoom_center = [0.3, 0.6];
+    let moving = gpu.render(&pixels, moving);
+    let difference = shader::max_difference(&still, &moving);
+    assert!(
+        difference <= 3,
+        "blur taps sample differently from the still frame: {difference}"
+    );
+
+    let mut directional = shader::display(2.0);
+    directional.motion_blur_params = [1.0, 1.0, 0.0, 0.0];
+    directional.motion_blur_vector = [1e-5, 0.0];
+    let directional = gpu.render(&pixels, directional);
+    let difference = shader::max_difference(&still, &directional);
+    assert!(
+        difference <= 3,
+        "directional blur taps differ: {difference}"
+    );
+}
+
+#[tokio::test]
+async fn lens_respects_the_cards_rounded_corners_and_source_alpha() {
+    let Some(gpu) = shader::Gpu::new().await else {
+        return;
+    };
+    let pixels = shader::stripes();
+    let radius = 90.0;
+    for display_blur in [[0.0f32; 2], [0.03, 0.02]] {
+        let mut card = shader::display(1.0);
+        card.rounding_px = 120.0;
+        if display_blur != [0.0; 2] {
+            card.motion_blur_params = [1.0, 1.0, 0.0, 0.0];
+            card.motion_blur_vector = display_blur;
+        }
+        let bare = gpu.render(&pixels, card);
+        let mut cornered = card;
+        cornered.loupe_position = [0.12, 0.2, 0.12, 0.2];
+        cornered.loupe_shape = [radius, radius, radius, 2.0];
+        for travel in [[0.0; 4], [0.02, 0.01, 0.03, 0.02]] {
+            cornered.loupe_motion = travel;
+            let frame = gpu.render(&pixels, cornered);
+            for y in 0..70 {
+                for x in 0..70 {
+                    let lens = shader::pixel(&frame, x, y)[3];
+                    let card = shader::pixel(&bare, x, y)[3];
+                    assert!(
+                        lens <= card.saturating_add(2),
+                        "lens covers more than the rounded card at {x},{y}: {lens} > {card} \
+                         (display blur {display_blur:?}, travel {travel:?})"
+                    );
+                }
+            }
+            let inside = shader::pixel(&frame, 61, 57);
+            assert!(inside[3] > 250, "lens draws inside the card: {inside:?}");
+        }
+    }
+
+    let mut transparent = vec![0u8; pixels.len()];
+    for (index, chunk) in transparent.chunks_mut(4).enumerate() {
+        let x = index as u32 % shader::SOURCE.0;
+        chunk.copy_from_slice(&if x < shader::SOURCE.0 / 2 {
+            [200, 40, 40, 255]
+        } else {
+            [0, 0, 0, 0]
+        });
+    }
+    let mut alpha = shader::display(1.0);
+    alpha.preserve_source_alpha = 1.0;
+    alpha.loupe_position = [0.75, 0.5, 0.75, 0.5];
+    alpha.loupe_shape = [radius, radius, radius, 2.0];
+    let frame = gpu.render(&transparent, alpha);
+    let center = shader::pixel(&frame, 384, 144);
+    assert!(
+        center[3] <= 2,
+        "lens over transparent source stays transparent: {center:?}"
+    );
+    alpha.loupe_position = [0.25, 0.5, 0.25, 0.5];
+    let frame = gpu.render(&transparent, alpha);
+    let center = shader::pixel(&frame, 128, 144);
+    assert!(center[3] > 250 && center[0] > 150, "{center:?}");
 }

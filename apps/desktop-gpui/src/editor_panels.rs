@@ -2729,8 +2729,6 @@ pub enum PanelSlider {
     /// The multi-zoom panel's single Amount slider, which writes every selected
     /// segment at once.
     ZoomAmountAll,
-    /// A loupe segment's lens radius, shown as a percentage of the card's
-    /// shorter side.
     ZoomLoupeSize,
 
     TextLayoutTransition,

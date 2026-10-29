@@ -116,33 +116,20 @@ impl Default for InterpolatedZoom {
     }
 }
 
-/// A sampled loupe lens. Produced by `ZoomTransformTimeline::sample_loupe`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoupeSample {
-    /// Spring-driven 0..1 appearance. It may overshoot 1 slightly as the lens
-    /// settles; it scales the lens size and its magnification together.
     pub presence: f64,
-    /// Full magnification the lens settles at (the segment's zoom amount).
     pub magnification: f64,
-    /// Fixed focus in cropped-content UV: the manual point, or the Auto
-    /// segment's click-cluster focus used when no cursor is available.
     pub center: XY<f64>,
-    /// Lens radius as a fraction of the card's shorter side.
     pub size: f64,
-    /// 0..1 weight of the live cursor over `center` (1 for Auto segments).
     pub follow_cursor: f64,
     pub shape: LoupeShape,
 }
 
-/// Rounded-rect lenses are wider than tall so a line of text fits; both axes
-/// derive from the same radius so the size slider scales them together.
 const LOUPE_RECT_HALF_EXTENT: (f64, f64) = (1.3, 0.8);
 const LOUPE_RECT_CORNER: f64 = 0.45;
-/// Gap kept between the lens rim and the card edge, in lens radii.
 const LOUPE_EDGE_MARGIN: f64 = 0.06;
 const LOUPE_MAX_GROW: f64 = 1.1;
-/// How far from the lens center the focus may be drawn, as a fraction of the
-/// lens half extents.
 const LOUPE_MAX_FOCUS_REACH: f64 = 0.9;
 
 impl LoupeSample {
@@ -150,8 +137,6 @@ impl LoupeSample {
         1.0 + (self.magnification.max(1.0) - 1.0) * self.presence.clamp(0.0, 1.0)
     }
 
-    /// The content point the lens should magnify, in cropped-content UV.
-    /// `cursor` is the rendered cursor in the same space, when there is one.
     pub fn focus(&self, cursor: Option<XY<f64>>) -> XY<f64> {
         let follow = self.follow_cursor.clamp(0.0, 1.0);
         match cursor.filter(|cursor| cursor.x.is_finite() && cursor.y.is_finite()) {
@@ -161,14 +146,9 @@ impl LoupeSample {
     }
 }
 
-/// A lens resolved against a concrete card size, in card-local pixels.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LoupeGeometry {
-    /// Where the lens sits on the card.
     pub center: XY<f64>,
-    /// The content point drawn at the lens center. Equal to the focus away
-    /// from the card edges; near an edge the lens stays on the card while
-    /// the anchor keeps the magnified region inside the content.
     pub anchor: XY<f64>,
     pub half_extent: XY<f64>,
     pub corner_radius: f64,
@@ -176,8 +156,6 @@ pub struct LoupeGeometry {
 }
 
 impl LoupeGeometry {
-    /// `focus` is in card UV (0..1 across the card). Returns `None` when the
-    /// lens is too small to draw or the card is degenerate.
     pub fn resolve(sample: &LoupeSample, focus: XY<f64>, card_size: XY<f64>) -> Option<Self> {
         if !(card_size.x >= 1.0 && card_size.y >= 1.0) {
             return None;
@@ -360,8 +338,6 @@ mod test {
         }
     }
 
-    /// Where a card-local content point shows up through the lens (ignoring
-    /// the refracting rim), or `None` when it lands outside the lens.
     fn magnified_position(geometry: &LoupeGeometry, content: XY<f64>) -> Option<XY<f64>> {
         let shown = geometry.center + (content - geometry.anchor) * geometry.magnification;
         let offset = shown - geometry.center;

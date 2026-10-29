@@ -1047,7 +1047,6 @@ pub struct ZoomSegment {
     pub edge_snap_ratio: f64,
     #[serde(default)]
     pub style: ZoomStyle,
-    /// Lens radius as a fraction of the display card's shorter side.
     #[serde(default = "ZoomSegment::default_loupe_size")]
     pub loupe_size: f64,
     #[serde(default)]
