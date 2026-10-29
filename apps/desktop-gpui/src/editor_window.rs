@@ -1458,6 +1458,7 @@ pub struct EditorWindow {
     hovering_generate_zoom: bool,
     pub(crate) generating_keyboard: bool,
     pub(crate) keyboard_generation_message: Option<String>,
+    pub(crate) typing_speedup: crate::editor_typing_speedup::TypingSpeedupState,
     clip_speed: Option<ClipSpeedMenu>,
     timeline_scroll: gpui::ScrollHandle,
     minimap_drag: Option<timeline::MinimapDrag>,
@@ -1476,7 +1477,7 @@ pub struct EditorWindow {
     clip_anim_generation: u64,
     /// `editorInstance.recordings.segments[i].display.duration`, which the clip
     /// trim clamps read (`TL/ClipTrack.tsx:1160-1162`).
-    clip_display_durations: Vec<f64>,
+    pub(crate) clip_display_durations: Vec<f64>,
     /// `editorInstance.recordingDuration` = `recordings.duration()`.
     recording_duration: f64,
     /// `meta().hasCamera` and "more than one recording clip", the two facts
@@ -2117,6 +2118,7 @@ impl EditorWindow {
             hovering_generate_zoom: false,
             generating_keyboard: false,
             keyboard_generation_message: None,
+            typing_speedup: Default::default(),
             clip_speed: None,
             timeline_scroll: gpui::ScrollHandle::new(),
             minimap_drag: None,
@@ -2373,7 +2375,7 @@ impl EditorWindow {
         true
     }
 
-    fn edit(
+    pub(crate) fn edit(
         &mut self,
         change: impl FnOnce(&mut TimelineConfiguration) -> bool,
         window: &mut Window,
@@ -2412,7 +2414,7 @@ impl EditorWindow {
     /// `note_transform` exists: a drag's arithmetic is only checkable end to
     /// end if the numbers come out of the running app. Intermediate drag
     /// frames log at `debug`; the line below is the settled one.
-    fn note_edit(&self, reason: &'static str, track: Option<TrackKind>) {
+    pub(crate) fn note_edit(&self, reason: &'static str, track: Option<TrackKind>) {
         let timeline = self.project.timeline.as_ref();
         // The affected track's boxes, four decimals, so a scripted drag's
         // predicted seconds can be checked against what actually landed.

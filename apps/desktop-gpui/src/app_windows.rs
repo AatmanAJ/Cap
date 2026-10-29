@@ -5966,6 +5966,7 @@ fn load_editor_waveforms(
     handle: WindowHandle<EditorWindow>,
     cx: &mut gpui::AsyncApp,
 ) {
+    let project_path = instance.project_path.clone();
     cx.spawn(async move |cx| {
         let task = cx.update(|cx| {
             gpui_tokio::Tokio::spawn(cx, async move {
@@ -5985,9 +5986,11 @@ fn load_editor_waveforms(
         let Ok((mic, system)) = task.await else {
             return;
         };
-        let peaks = cx
+        let (peaks, typing_inputs) = cx
             .background_executor()
             .spawn(async move {
+                let typing_inputs =
+                    crate::editor_typing_speedup::TypingSpeedupInputs::load(&project_path, &mic);
                 let [mic, system] = [mic, system].map(|tracks| {
                     tracks
                         .into_iter()
@@ -6002,10 +6005,11 @@ fn load_editor_waveforms(
                         })
                         .collect::<Vec<_>>()
                 });
-                (mic, system)
+                ((mic, system), typing_inputs)
             })
             .await;
         let _ = handle.update(cx, |view, window, cx| {
+            view.typing_speedup.inputs = Some(std::sync::Arc::new(typing_inputs));
             tracing::info!(
                 mic = peaks.0.iter().filter(|peaks| !peaks.is_empty()).count(),
                 system = peaks.1.iter().filter(|peaks| !peaks.is_empty()).count(),

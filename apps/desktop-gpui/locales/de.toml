@@ -2623,6 +2623,15 @@ text_color = "Textfarbe"
 timeline_unavailable = "Die Projektzeitleiste ist nicht verfügbar."
 timeline_unreadable = "Die Projektzeitleiste konnte nicht gelesen werden."
 title = "Tastatur anzeigen"
+typing_analyzing = "Suche nach Tippen..."
+typing_apply = "Beschleunigen"
+typing_description = "Spielt die Stellen schneller ab, an denen Sie tippen, ohne zu sprechen. Jede Stelle wird ein eigener stummer Clip."
+typing_found = { one = "{count} Abschnitt gefunden · spart {duration}", other = "{count} Abschnitte gefunden · spart {duration}" }
+typing_no_keyboard = "Diese Aufnahme enthält keine Tastaturdaten."
+typing_no_speech_check = "Es gibt keine Transkription und kein Mikrofon, daher lässt sich Tippen beim Sprechen nicht erkennen."
+typing_none_found = "Kein Tippen mehr zum Beschleunigen."
+typing_speed = "Geschwindigkeit"
+typing_title = "Tippen beschleunigen"
 uppercase = "Großbuchstaben"
 
 [editor.tabs.position]

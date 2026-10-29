@@ -47,6 +47,7 @@ const FORMATTED: &[&str] = &[
     "editor.tabs.captions.generate_failed",
     "editor.tabs.captions.model_downloaded",
     "editor.tabs.keyboard.load_failed",
+    "editor.tabs.keyboard.typing_found",
     "editor.tabs.sync.clip",
     "editor.timeline.add_shot_with_look",
     "editor.timeline.segment.numbered_clip",
@@ -710,6 +711,32 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
         ),
         (tr::editor::tabs::keyboard::title(), "Show keyboard"),
         (tr::editor::tabs::keyboard::uppercase(), "Uppercase"),
+        (
+            tr::editor::tabs::keyboard::typing_analyzing(),
+            "Looking for typing...",
+        ),
+        (tr::editor::tabs::keyboard::typing_apply(), "Speed Up"),
+        (
+            tr::editor::tabs::keyboard::typing_description(),
+            "Plays the parts where you type without talking faster. Each part becomes its own muted clip.",
+        ),
+        (
+            tr::editor::tabs::keyboard::typing_no_keyboard(),
+            "This recording has no keyboard data.",
+        ),
+        (
+            tr::editor::tabs::keyboard::typing_no_speech_check(),
+            "There's no transcript or microphone, so typing over talking can't be told apart.",
+        ),
+        (
+            tr::editor::tabs::keyboard::typing_none_found(),
+            "No typing left to speed up.",
+        ),
+        (tr::editor::tabs::keyboard::typing_speed(), "Speed"),
+        (
+            tr::editor::tabs::keyboard::typing_title(),
+            "Speed Up Typing",
+        ),
         (tr::editor::tabs::position::bottom_center(), "Bottom Center"),
         (tr::editor::tabs::position::bottom_left(), "Bottom Left"),
         (tr::editor::tabs::position::bottom_right(), "Bottom Right"),
@@ -1374,6 +1401,14 @@ fn editor_shell_messages_format_like_the_code_they_replaced() {
     assert_eq!(
         tr::editor::tabs::keyboard::load_failed(&error),
         format!("Failed to load recording data: {error}")
+    );
+    assert_eq!(
+        tr::editor::tabs::keyboard::typing_found(1, "0:04"),
+        "1 section found \u{b7} saves 0:04"
+    );
+    assert_eq!(
+        tr::editor::tabs::keyboard::typing_found(3, "1:05"),
+        "3 sections found \u{b7} saves 1:05"
     );
 
     let look = "Glide across";

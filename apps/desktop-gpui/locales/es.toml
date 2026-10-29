@@ -2623,6 +2623,15 @@ text_color = "Color del texto"
 timeline_unavailable = "La línea de tiempo del proyecto no está disponible."
 timeline_unreadable = "No se pudo leer la línea de tiempo del proyecto."
 title = "Mostrar teclado"
+typing_analyzing = "Buscando tecleo..."
+typing_apply = "Acelerar"
+typing_description = "Reproduce más rápido las partes en las que escribes sin hablar. Cada parte se convierte en su propio clip silenciado."
+typing_found = { one = "{count} sección encontrada · ahorra {duration}", many = "{count} de secciones encontradas · ahorra {duration}", other = "{count} secciones encontradas · ahorra {duration}" }
+typing_no_keyboard = "Esta grabación no tiene datos de teclado."
+typing_no_speech_check = "No hay transcripción ni micrófono, así que no se puede distinguir el tecleo mientras hablas."
+typing_none_found = "No queda tecleo que acelerar."
+typing_speed = "Velocidad"
+typing_title = "Acelerar el tecleo"
 uppercase = "Mayúsculas"
 
 [editor.tabs.position]

@@ -2625,6 +2625,15 @@ text_color = "Text Color"
 timeline_unavailable = "The project timeline is unavailable."
 timeline_unreadable = "The project timeline could not be read."
 title = "Show keyboard"
+typing_analyzing = "Looking for typing..."
+typing_apply = "Speed Up"
+typing_description = "Plays the parts where you type without talking faster. Each part becomes its own muted clip."
+typing_found = { one = "{count} section found · saves {duration}", other = "{count} sections found · saves {duration}", context = "{duration} is a clock time such as 0:12 or 1:05." }
+typing_no_keyboard = "This recording has no keyboard data."
+typing_no_speech_check = "There's no transcript or microphone, so typing over talking can't be told apart."
+typing_none_found = "No typing left to speed up."
+typing_speed = "Speed"
+typing_title = "Speed Up Typing"
 uppercase = "Uppercase"
 
 [editor.tabs.position]

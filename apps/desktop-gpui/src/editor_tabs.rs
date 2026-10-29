@@ -2636,7 +2636,7 @@ impl EditorWindow {
 
         // The whole tab is one `Field` with the master toggle in its header and
         // a `Beta` badge (`KeyboardTab.tsx:128-135`).
-        ui::Field::section(&theme, tr::editor::tabs::keyboard::title())
+        let overlay = ui::Field::section(&theme, tr::editor::tabs::keyboard::title())
             .badge(tr::editor::tabs::keyboard::beta())
             .value(
                 ui::Toggle::plain(&theme, "keyboard-enabled", enabled)
@@ -2659,7 +2659,14 @@ impl EditorWindow {
                     }))
                     .into_any_element(),
             )
-            .child(body)
+            .child(body);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(24.))
+            .child(overlay)
+            .child(self.render_typing_speedup(cx))
             .into_any_element()
     }
 

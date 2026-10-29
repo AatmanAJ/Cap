@@ -2623,6 +2623,15 @@ text_color = "文字颜色"
 timeline_unavailable = "项目时间线不可用。"
 timeline_unreadable = "无法读取项目时间线。"
 title = "显示键盘"
+typing_analyzing = "正在查找打字片段..."
+typing_apply = "加速"
+typing_description = "加速播放你只打字不说话的部分。每个部分会成为单独的静音片段。"
+typing_found = { other = "找到 {count} 处 · 节省 {duration}" }
+typing_no_keyboard = "此录制没有键盘数据。"
+typing_no_speech_check = "没有转写或麦克风，因此无法区分边说话边打字的部分。"
+typing_none_found = "没有可加速的打字片段了。"
+typing_speed = "速度"
+typing_title = "加速打字片段"
 uppercase = "大写"
 
 [editor.tabs.position]

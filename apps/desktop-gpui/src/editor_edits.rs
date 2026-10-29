@@ -2260,8 +2260,16 @@ pub fn split_clip_segment(
     }
     let Some(index) = index else { return false };
 
-    let segment = timeline.segments[index].clone();
     let local_time = time - offsets.get(index).copied().unwrap_or(0.);
+    split_clip_at(timeline, index, local_time)
+}
+
+/// Splits clip `index` `local_time` output seconds into it, refusing a cut on
+/// either edge or inside the room its transitions need.
+pub fn split_clip_at(timeline: &mut TimelineConfiguration, index: usize, local_time: f64) -> bool {
+    let Some(segment) = timeline.segments.get(index).cloned() else {
+        return false;
+    };
     let duration = segment.duration();
     if local_time <= 0. || local_time >= duration {
         return false;
