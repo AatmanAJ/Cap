@@ -137,6 +137,18 @@ impl Capturer {
     pub async fn stop(&self) -> Result<(), arc::R<ns::Error>> {
         self.stream.stop().await
     }
+
+    /// The returned future holds no reference to `filter`, so callers can
+    /// await it from `Send` contexts.
+    pub fn update_content_filter(
+        &self,
+        filter: &sc::ContentFilter,
+    ) -> impl Future<Output = Result<(), arc::R<ns::Error>>> + Send + 'static {
+        let (future, mut block) = cidre::blocks::ok();
+        self.stream
+            .update_content_filter_ch_block(filter, Some(&mut block));
+        future
+    }
 }
 
 pub struct VideoFrame {

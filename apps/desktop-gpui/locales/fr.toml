@@ -999,6 +999,15 @@ not_connected = "Déconnecté"
 off = "Non"
 on = "Oui"
 
+[main.device.system_audio_apps]
+all_apps = "Toutes les apps"
+choose = "Choisir les apps dont enregistrer le son"
+count = { one = "{count} app", many = "{count} d'apps", other = "{count} apps" }
+description = "Enregistrez le son de toutes les apps, ou seulement des apps que vous choisissez."
+no_apps = "Aucune app trouvée"
+no_matching_apps = "Aucune app correspondante"
+not_running = "Non ouverte"
+
 [main.error]
 camera_only_needs_camera = "L'enregistrement caméra seule nécessite une caméra sélectionnée."
 copy = "Copier l'erreur"

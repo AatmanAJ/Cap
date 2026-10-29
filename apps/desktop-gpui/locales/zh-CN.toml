@@ -999,6 +999,15 @@ not_connected = "未连接"
 off = "关"
 on = "开"
 
+[main.device.system_audio_apps]
+all_apps = "所有应用"
+choose = "选择要录制音频的应用"
+count = { other = "{count} 个应用" }
+description = "录制所有应用的声音，或只录制你选择的应用。"
+no_apps = "未找到应用"
+no_matching_apps = "没有匹配的应用"
+not_running = "未运行"
+
 [main.error]
 camera_only_needs_camera = "仅摄像头录制需要先选择摄像头。"
 copy = "复制错误信息"

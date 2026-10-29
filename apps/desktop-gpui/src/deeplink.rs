@@ -423,6 +423,11 @@ impl DeepLinkAction {
                                     microphone: mic_label,
                                     camera,
                                     system_audio: capture_system_audio,
+                                    #[cfg(target_os = "macos")]
+                                    system_audio_apps: crate::store::recording_system_audio_apps()
+                                        .into_iter()
+                                        .map(|app| app.id)
+                                        .collect(),
                                     excluded_windows: Vec::new(),
                                     camera_feed,
                                     mic_feed,

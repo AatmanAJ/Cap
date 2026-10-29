@@ -999,6 +999,15 @@ not_connected = "Nicht verbunden"
 off = "Aus"
 on = "Ein"
 
+[main.device.system_audio_apps]
+all_apps = "Alle Apps"
+choose = "Apps für die Audioaufnahme auswählen"
+count = { one = "{count} App", other = "{count} Apps" }
+description = "Ton aus allen Apps aufnehmen oder nur aus den Apps, die Sie auswählen."
+no_apps = "Keine Apps gefunden"
+no_matching_apps = "Keine passenden Apps"
+not_running = "Nicht geöffnet"
+
 [main.error]
 camera_only_needs_camera = "Für reine Kameraaufnahmen muss eine Kamera ausgewählt sein."
 copy = "Fehler kopieren"

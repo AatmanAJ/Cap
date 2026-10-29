@@ -1001,6 +1001,15 @@ not_connected = { text = "Not connected", max_px = 130, size = 11 }
 off = { text = "Off", max_px = 130, size = 11 }
 on = { text = "On", max_px = 130, size = 11 }
 
+[main.device.system_audio_apps]
+all_apps = { text = "All apps", max_px = 120, size = 11 }
+choose = "Choose which apps to record audio from"
+count = { one = "{count} app", other = "{count} apps", context = "Button on the system audio row when specific apps are chosen." }
+description = "Record sound from every app, or only from the apps you pick."
+no_apps = "No apps found"
+no_matching_apps = "No matching apps"
+not_running = "Not running"
+
 [main.error]
 camera_only_needs_camera = "Camera-only recording requires a selected camera."
 copy = "Copy error"

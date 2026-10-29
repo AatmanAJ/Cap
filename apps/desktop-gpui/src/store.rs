@@ -1260,6 +1260,46 @@ pub fn set_recording_system_audio(enabled: bool) -> bool {
     set_store_setting(RECORDING_SETTINGS, "systemAudio", Value::Bool(enabled))
 }
 
+/// An app picked to record system audio from, by bundle id. The name is kept
+/// so the choice still reads right while the app is not running.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemAudioApp {
+    pub id: String,
+    pub name: String,
+}
+
+/// `RecordingSettingsStore.systemAudioApps`. Empty (or absent) records every
+/// app; malformed and repeated entries are dropped.
+pub fn recording_system_audio_apps() -> Vec<SystemAudioApp> {
+    let Some(Value::Array(entries)) = store_section(RECORDING_SETTINGS).remove("systemAudioApps")
+    else {
+        return Vec::new();
+    };
+
+    let mut apps: Vec<SystemAudioApp> = Vec::new();
+    for entry in entries {
+        let Ok(app) = serde_json::from_value::<SystemAudioApp>(entry) else {
+            continue;
+        };
+        if app.id.trim().is_empty()
+            || apps
+                .iter()
+                .any(|existing| existing.id.eq_ignore_ascii_case(&app.id))
+        {
+            continue;
+        }
+        apps.push(app);
+    }
+    apps
+}
+
+pub fn set_recording_system_audio_apps(apps: &[SystemAudioApp]) -> bool {
+    let Ok(value) = serde_json::to_value(apps) else {
+        return false;
+    };
+    set_store_setting(RECORDING_SETTINGS, "systemAudioApps", value)
+}
+
 pub fn set_recording_microphone_name(name: Option<&str>) -> bool {
     set_store_setting(
         RECORDING_SETTINGS,
@@ -2698,6 +2738,69 @@ mod tests {
             Some(r#"{"recording_settings":{"systemAudio":"yes"}}"#),
         );
         assert!(!recording_system_audio());
+    }
+
+    #[test]
+    fn system_audio_apps_default_to_every_app() {
+        let _store = TempStore::new(
+            "recording-system-audio-apps-absent",
+            Some(r#"{"recording_settings":{"systemAudio":true}}"#),
+        );
+        assert!(recording_system_audio_apps().is_empty());
+    }
+
+    #[test]
+    fn system_audio_apps_round_trip_beside_other_settings() {
+        let store = TempStore::new(
+            "recording-system-audio-apps-round-trip",
+            Some(r#"{"recording_settings":{"systemAudio":true,"micName":"Desk"}}"#),
+        );
+        let apps = vec![
+            SystemAudioApp {
+                id: "com.apple.Music".into(),
+                name: "Music".into(),
+            },
+            SystemAudioApp {
+                id: "com.apple.Safari".into(),
+                name: "Safari".into(),
+            },
+        ];
+
+        assert!(set_recording_system_audio_apps(&apps));
+        assert_eq!(recording_system_audio_apps(), apps);
+        assert_eq!(
+            store.read()[RECORDING_SETTINGS]["systemAudioApps"][0]["id"],
+            "com.apple.Music"
+        );
+        assert_eq!(store.read()[RECORDING_SETTINGS]["micName"], "Desk");
+        assert!(recording_system_audio());
+
+        assert!(set_recording_system_audio_apps(&[]));
+        assert!(recording_system_audio_apps().is_empty());
+    }
+
+    #[test]
+    fn malformed_system_audio_apps_are_dropped() {
+        let store = TempStore::new(
+            "recording-system-audio-apps-malformed",
+            Some(
+                r#"{"recording_settings":{"systemAudioApps":[{"id":"com.apple.Music","name":"Music"},{"id":"com.apple.music","name":"Music"},{"id":"","name":"Blank"},{"id":42},"com.apple.Safari",{"id":"com.spotify.client","name":"Spotify"}]}}"#,
+            ),
+        );
+        assert_eq!(
+            recording_system_audio_apps()
+                .into_iter()
+                .map(|app| app.id)
+                .collect::<Vec<_>>(),
+            vec!["com.apple.Music", "com.spotify.client"]
+        );
+        drop(store);
+
+        let _store = TempStore::new(
+            "recording-system-audio-apps-not-a-list",
+            Some(r#"{"recording_settings":{"systemAudioApps":"com.apple.Music"}}"#),
+        );
+        assert!(recording_system_audio_apps().is_empty());
     }
 
     #[test]

@@ -230,6 +230,173 @@ fn grouped_list(theme: Theme, rows: Vec<gpui::AnyElement>, inset: f32) -> gpui::
     group
 }
 
+fn list_row_icon(theme: Theme, path: &'static str) -> gpui::AnyElement {
+    svg()
+        .path(path)
+        .size(px(16.))
+        .flex_shrink_0()
+        .text_color(theme.gray_11)
+        .into_any_element()
+}
+
+#[derive(Clone)]
+struct AudioAppEntry {
+    id: String,
+    name: String,
+    icon: Option<std::sync::Arc<gpui::Image>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AudioAppRow {
+    id: String,
+    name: String,
+    /// Index into the running apps; `None` for a chosen app that is closed.
+    running: Option<usize>,
+    selected: bool,
+}
+
+/// The running apps in list order, then any chosen app that is not running,
+/// so a choice can still be seen and undone while its app is closed.
+fn audio_app_rows(
+    running: &[AudioAppEntry],
+    selected: &[crate::store::SystemAudioApp],
+) -> Vec<AudioAppRow> {
+    let is_selected = |id: &str| selected.iter().any(|app| app.id.eq_ignore_ascii_case(id));
+    let mut rows = running
+        .iter()
+        .enumerate()
+        .map(|(index, app)| AudioAppRow {
+            id: app.id.clone(),
+            name: app.name.clone(),
+            running: Some(index),
+            selected: is_selected(&app.id),
+        })
+        .collect::<Vec<_>>();
+    rows.extend(
+        selected
+            .iter()
+            .filter(|app| {
+                !running
+                    .iter()
+                    .any(|entry| entry.id.eq_ignore_ascii_case(&app.id))
+            })
+            .map(|app| AudioAppRow {
+                id: app.id.clone(),
+                name: app.name.clone(),
+                running: None,
+                selected: true,
+            }),
+    );
+    rows
+}
+
+fn toggled_audio_apps(
+    selected: &[crate::store::SystemAudioApp],
+    app: &crate::store::SystemAudioApp,
+) -> Vec<crate::store::SystemAudioApp> {
+    let mut apps = selected.to_vec();
+    let before = apps.len();
+    apps.retain(|existing| !existing.id.eq_ignore_ascii_case(&app.id));
+    if apps.len() == before {
+        apps.push(app.clone());
+    }
+    apps
+}
+
+fn system_audio_apps_label(selected: &[crate::store::SystemAudioApp]) -> String {
+    match selected {
+        [] => tr::main::device::system_audio_apps::all_apps().to_string(),
+        [app] => app.name.clone(),
+        apps => tr::main::device::system_audio_apps::count(apps.len()),
+    }
+}
+
+#[cfg(test)]
+mod system_audio_app_tests {
+    use super::*;
+    use crate::store::SystemAudioApp;
+
+    fn chosen(id: &str, name: &str) -> SystemAudioApp {
+        SystemAudioApp {
+            id: id.into(),
+            name: name.into(),
+        }
+    }
+
+    fn running(id: &str, name: &str) -> AudioAppEntry {
+        AudioAppEntry {
+            id: id.into(),
+            name: name.into(),
+            icon: None,
+        }
+    }
+
+    #[test]
+    fn rows_mark_chosen_apps_and_keep_closed_ones() {
+        let rows = audio_app_rows(
+            &[
+                running("com.apple.Music", "Music"),
+                running("com.apple.Safari", "Safari"),
+            ],
+            &[
+                chosen("com.apple.music", "Music"),
+                chosen("com.spotify.client", "Spotify"),
+            ],
+        );
+        assert_eq!(
+            rows,
+            vec![
+                AudioAppRow {
+                    id: "com.apple.Music".into(),
+                    name: "Music".into(),
+                    running: Some(0),
+                    selected: true,
+                },
+                AudioAppRow {
+                    id: "com.apple.Safari".into(),
+                    name: "Safari".into(),
+                    running: Some(1),
+                    selected: false,
+                },
+                AudioAppRow {
+                    id: "com.spotify.client".into(),
+                    name: "Spotify".into(),
+                    running: None,
+                    selected: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn toggling_adds_then_removes_an_app() {
+        let music = chosen("com.apple.Music", "Music");
+        let safari = chosen("com.apple.Safari", "Safari");
+        let apps = toggled_audio_apps(&[], &music);
+        assert_eq!(apps, vec![music.clone()]);
+        let apps = toggled_audio_apps(&apps, &safari);
+        assert_eq!(apps, vec![music.clone(), safari.clone()]);
+        let apps = toggled_audio_apps(&apps, &chosen("com.apple.music", "Music"));
+        assert_eq!(apps, vec![safari]);
+    }
+
+    #[test]
+    fn label_names_one_app_and_counts_several() {
+        assert_eq!(system_audio_apps_label(&[]), "All apps");
+        assert_eq!(
+            system_audio_apps_label(&[chosen("com.apple.Music", "Music")]),
+            "Music"
+        );
+        assert_eq!(
+            system_audio_apps_label(&[
+                chosen("com.apple.Music", "Music"),
+                chosen("com.apple.Safari", "Safari"),
+            ]),
+            "2 apps"
+        );
+    }
+}
+
 fn glass_hover(theme: Theme) -> Hsla {
     glass_tint(theme, 0.06, 0.07)
 }
@@ -813,6 +980,8 @@ pub enum Panel {
     ModeInfo,
     /// The header recordings / screenshots library.
     Library(LibraryKind),
+    /// Which apps system audio records from.
+    SystemAudioApps,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -962,6 +1131,11 @@ pub struct MainWindow {
     device_format_pending: Option<PendingDeviceFormat>,
     device_format_notice: Option<String>,
     system_audio: bool,
+    /// Apps system audio is limited to; empty records every app.
+    system_audio_apps: Vec<crate::store::SystemAudioApp>,
+    /// Running apps for the system audio picker, read each time it opens.
+    audio_apps: Option<Vec<AudioAppEntry>>,
+    audio_apps_task: Option<Task<()>>,
     /// Which display/window is selected for each split target.
     selected_display: Option<DisplayOption>,
     selected_window: Option<WindowOption>,
@@ -1263,6 +1437,9 @@ impl MainWindow {
             device_format_pending: None,
             device_format_notice: None,
             system_audio: crate::store::recording_system_audio(),
+            system_audio_apps: crate::store::recording_system_audio_apps(),
+            audio_apps: None,
+            audio_apps_task: None,
             selected_display: None,
             selected_window: None,
             panel: None,
@@ -2439,6 +2616,8 @@ impl MainWindow {
             microphone: self.microphone.as_ref().map(|mic| mic.name.clone()),
             camera: self.camera_id.clone(),
             system_audio: self.system_audio,
+            #[cfg(target_os = "macos")]
+            system_audio_apps: self.system_audio_app_ids(),
             excluded_windows,
             camera_feed,
             mic_feed,
@@ -2934,6 +3113,58 @@ impl MainWindow {
             }
             cx.notify();
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn system_audio_app_ids(&self) -> Vec<String> {
+        self.system_audio_apps
+            .iter()
+            .map(|app| app.id.clone())
+            .collect()
+    }
+
+    /// Picking anything in the app picker means system audio is wanted.
+    fn set_system_audio_apps(
+        &mut self,
+        apps: Vec<crate::store::SystemAudioApp>,
+        cx: &mut Context<Self>,
+    ) {
+        self.set_system_audio(true, cx);
+        if self.system_audio_apps != apps {
+            if !crate::store::set_recording_system_audio_apps(&apps) {
+                tracing::warn!("Could not save the system audio apps");
+            }
+            self.system_audio_apps = apps;
+            cx.notify();
+        }
+    }
+
+    fn refresh_audio_apps(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.audio_apps_task = Some(cx.spawn_in(window, async move |this, cx| {
+            let apps = cx
+                .background_executor()
+                .spawn(async { devices::list_audio_apps() })
+                .await;
+            this.update(cx, |this, cx| {
+                this.audio_apps = Some(
+                    apps.into_iter()
+                        .map(|app| AudioAppEntry {
+                            icon: app.icon.map(|bytes| {
+                                std::sync::Arc::new(gpui::Image::from_bytes(
+                                    gpui::ImageFormat::Png,
+                                    bytes,
+                                ))
+                            }),
+                            id: app.id,
+                            name: app.name,
+                        })
+                        .collect(),
+                );
+                this.audio_apps_task = None;
+                cx.notify();
+            })
+            .ok();
+        }));
     }
 }
 
@@ -4202,7 +4433,9 @@ impl MainWindow {
                     DeviceFormatTarget::Microphone(name) => name.clone(),
                 })
                 .into_any_element(),
-            Panel::Device(_) | Panel::Target(_) => self.render_search_field(cx).into_any_element(),
+            Panel::Device(_) | Panel::Target(_) | Panel::SystemAudioApps => {
+                self.render_search_field(cx).into_any_element()
+            }
         };
 
         div()
@@ -4283,6 +4516,9 @@ impl MainWindow {
                                 Panel::Library(kind) => {
                                     self.render_library_grid(kind, cx).into_any_element()
                                 }
+                                Panel::SystemAudioApps => {
+                                    self.render_system_audio_apps(cx).into_any_element()
+                                }
                             }),
                     ),
             )
@@ -4299,6 +4535,7 @@ impl MainWindow {
         self.search_input
             .update(cx, |input, cx| input.set_text("", cx));
         self.library_task = None;
+        self.audio_apps_task = None;
         // `enabled: displayMenuOpen()` / `windowMenuOpen()` -- nothing polls
         // and nothing captures while no picker is on screen. A sweep already in
         // flight is left to land, the way a TanStack refetch is.
@@ -4362,7 +4599,7 @@ impl MainWindow {
             .update(cx, |input, cx| input.set_text("", cx));
         if matches!(
             panel,
-            Panel::Device(_) | Panel::Target(_) | Panel::Library(_)
+            Panel::Device(_) | Panel::Target(_) | Panel::Library(_) | Panel::SystemAudioApps
         ) {
             let focus = self.search_input.read(cx).focus_handle();
             window.focus(&focus, cx);
@@ -4381,6 +4618,11 @@ impl MainWindow {
         }
         if let Panel::Device(menu) = panel {
             self.start_input_poll(menu, window, cx);
+        }
+        if panel == Panel::SystemAudioApps {
+            self.refresh_audio_apps(window, cx);
+        } else {
+            self.audio_apps_task = None;
         }
         if panel == Panel::ModeInfo {
             self.mode_info_opened_at = std::time::Instant::now();
@@ -5319,7 +5561,7 @@ impl MainWindow {
         let mut rows = vec![
             self.render_device_list_row(
                 SharedString::from(format!("{}-none", menu.id_name())),
-                "icons/circle-x.svg",
+                list_row_icon(theme, "icons/circle-x.svg"),
                 menu.none_label().to_string(),
                 None,
                 match menu {
@@ -5370,7 +5612,7 @@ impl MainWindow {
                             .child(
                                 self.render_device_list_row(
                                     SharedString::from(format!("camera-{}", camera.device_id)),
-                                    menu.icon(),
+                                    list_row_icon(theme, menu.icon()),
                                     camera.label.clone(),
                                     // The applied format lands a moment after
                                     // the camera opens; until then the row
@@ -5439,7 +5681,7 @@ impl MainWindow {
                             .child(
                                 self.render_device_list_row(
                                     SharedString::from(format!("mic-{}", mic.name)),
-                                    menu.icon(),
+                                    list_row_icon(theme, menu.icon()),
                                     mic.name.clone(),
                                     selected
                                         .then(|| {
@@ -5482,6 +5724,91 @@ impl MainWindow {
         let list = list.child(grouped_list(theme, rows, 34.));
         if matched == 0 {
             list.child(self.render_empty_state(menu.empty_message(!self.search.is_empty())))
+        } else {
+            list
+        }
+    }
+
+    fn render_system_audio_apps(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme;
+        let list = div().flex().flex_col().gap(px(4.)).w_full().child(
+            div()
+                .px(px(4.))
+                .text_size(px(12.))
+                .text_color(theme.gray_11)
+                .child(tr::main::device::system_audio_apps::description()),
+        );
+
+        let mut rows = vec![
+            self.render_device_list_row(
+                SharedString::from("system-audio-all-apps"),
+                list_row_icon(theme, "icons/screen.svg"),
+                tr::main::device::system_audio_apps::all_apps().to_string(),
+                None,
+                self.system_audio_apps.is_empty(),
+                None,
+                cx.listener(|this, _, _window, cx| {
+                    if this.device_changes_allowed(cx) {
+                        this.set_system_audio_apps(Vec::new(), cx);
+                    }
+                }),
+            )
+            .into_any_element(),
+        ];
+
+        let Some(apps) = &self.audio_apps else {
+            return list.child(grouped_list(theme, rows, 34.)).child(
+                div()
+                    .py(px(24.))
+                    .w_full()
+                    .text_size(px(14.))
+                    .text_color(theme.gray_11)
+                    .child(tr::common::loading()),
+            );
+        };
+
+        let mut matched = 0usize;
+        for row in audio_app_rows(apps, &self.system_audio_apps)
+            .into_iter()
+            .filter(|row| self.matches_search(&row.name))
+        {
+            matched += 1;
+            let icon = match row.running.and_then(|index| apps[index].icon.clone()) {
+                Some(image) => img(image).size(px(16.)).flex_shrink_0().into_any_element(),
+                None => list_row_icon(theme, "icons/app-window-mac.svg"),
+            };
+            let app = crate::store::SystemAudioApp {
+                id: row.id.clone(),
+                name: row.name.clone(),
+            };
+            rows.push(
+                self.render_device_list_row(
+                    SharedString::from(format!("system-audio-app-{}", row.id)),
+                    icon,
+                    row.name,
+                    row.running
+                        .is_none()
+                        .then(|| tr::main::device::system_audio_apps::not_running().to_string()),
+                    row.selected,
+                    None,
+                    cx.listener(move |this, _, _window, cx| {
+                        if this.device_changes_allowed(cx) {
+                            let apps = toggled_audio_apps(&this.system_audio_apps, &app);
+                            this.set_system_audio_apps(apps, cx);
+                        }
+                    }),
+                )
+                .into_any_element(),
+            );
+        }
+
+        let list = list.child(grouped_list(theme, rows, 34.));
+        if matched == 0 {
+            list.child(self.render_empty_state(if self.search.is_empty() {
+                tr::main::device::system_audio_apps::no_apps()
+            } else {
+                tr::main::device::system_audio_apps::no_matching_apps()
+            }))
         } else {
             list
         }
@@ -6391,7 +6718,7 @@ impl MainWindow {
     fn render_device_list_row(
         &self,
         id: SharedString,
-        icon: &'static str,
+        icon: gpui::AnyElement,
         label: String,
         detail: Option<String>,
         selected: bool,
@@ -6422,13 +6749,7 @@ impl MainWindow {
             .cursor_pointer()
             .hover(move |style| style.bg(glass_hover(theme)))
             .active(move |style| style.bg(glass_press(theme)))
-            .child(
-                svg()
-                    .path(icon)
-                    .size(px(16.))
-                    .flex_shrink_0()
-                    .text_color(theme.gray_11),
-            )
+            .child(icon)
             .child(
                 div()
                     .flex()
@@ -7087,6 +7408,51 @@ impl MainWindow {
             )
     }
 
+    /// Opens the app picker without toggling the row it sits in.
+    fn render_system_audio_apps_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme;
+        div()
+            .id("system-audio-apps")
+            .when(self.keyboard_nav, ui::keyboard_nav::stop)
+            .role(gpui::Role::Button)
+            .aria_label(tr::main::device::system_audio_apps::choose())
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(2.))
+            .h(px(24.))
+            .max_w(px(140.))
+            .pl(px(8.))
+            .pr(px(4.))
+            .flex_shrink_0()
+            .rounded_full()
+            .bg(theme.body_fill(5))
+            .text_size(px(11.))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme.gray_11)
+            .hover(move |style| style.bg(glass_hover(theme)))
+            .active(move |style| style.bg(glass_press(theme)))
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .child(system_audio_apps_label(&self.system_audio_apps)),
+            )
+            .child(
+                svg()
+                    .path("icons/chevron-right.svg")
+                    .size(px(12.))
+                    .flex_shrink_0()
+                    .text_color(theme.gray_11),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                cx.stop_propagation();
+                if this.device_changes_allowed(cx) {
+                    this.open_panel(Panel::SystemAudioApps, window, cx);
+                }
+            }))
+    }
+
     /// `DEVICE_ROW_CLASS`: 42px tall, `rounded-lg`, `border-gray-6`, `bg-gray-2`,
     /// `pl-3 pr-1.5 gap-2.5`.
     fn render_device_row(
@@ -7099,6 +7465,10 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
+        // The row without a device menu is system audio.
+        let system_audio_apps =
+            (menu.is_none() && self.system_audio && devices::app_audio_supported())
+                .then(|| self.render_system_audio_apps_button(cx));
 
         div()
             .id(SharedString::from(id))
@@ -7157,6 +7527,7 @@ impl MainWindow {
                     .truncate()
                     .child(label),
             )
+            .children(system_audio_apps)
             .child(
                 div()
                     .id(SharedString::from(format!("{id}-toggle")))

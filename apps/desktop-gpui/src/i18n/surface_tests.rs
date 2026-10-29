@@ -25,6 +25,7 @@ const FORMATTED: &[&str] = &[
     "main.device.format.apply_failed",
     "main.device.format.channels",
     "main.device.format.current",
+    "main.device.system_audio_apps.count",
     "main.library.clips",
     "main.recording.starts_in",
     "main.recovery.duration_minutes",
@@ -103,6 +104,27 @@ fn main_surfaces_match_the_literals_they_replaced() {
         ),
         (tr::main::device::system_audio_on(), "Record System Audio"),
         (tr::main::device::system_audio_off(), "No System Audio"),
+        (tr::main::device::system_audio_apps::all_apps(), "All apps"),
+        (
+            tr::main::device::system_audio_apps::choose(),
+            "Choose which apps to record audio from",
+        ),
+        (
+            tr::main::device::system_audio_apps::description(),
+            "Record sound from every app, or only from the apps you pick.",
+        ),
+        (
+            tr::main::device::system_audio_apps::no_apps(),
+            "No apps found",
+        ),
+        (
+            tr::main::device::system_audio_apps::no_matching_apps(),
+            "No matching apps",
+        ),
+        (
+            tr::main::device::system_audio_apps::not_running(),
+            "Not running",
+        ),
         (tr::main::device::pill::on(), "On"),
         (tr::main::device::pill::off(), "Off"),
         (tr::main::device::pill::not_connected(), "Not connected"),
@@ -658,6 +680,13 @@ fn main_surface_messages_format_like_the_code_they_replaced() {
         tr::main::device::format::current("Default"),
         format!("Current: {}", "Default")
     );
+    assert_eq!(tr::main::device::system_audio_apps::count(1), "1 app");
+    for count in [2, 3, 12] {
+        assert_eq!(
+            tr::main::device::system_audio_apps::count(count),
+            format!("{count} apps")
+        );
+    }
     for clip_count in [2_u32, 3, 12] {
         assert_eq!(
             tr::main::library::clips(clip_count as usize),

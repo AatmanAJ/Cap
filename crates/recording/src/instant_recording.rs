@@ -875,6 +875,8 @@ pub struct ActorBuilder {
     max_fps: u32,
     #[cfg(target_os = "macos")]
     excluded_windows: Vec<scap_targets::WindowId>,
+    #[cfg(target_os = "macos")]
+    system_audio_apps: Vec<String>,
     #[cfg(target_os = "linux")]
     lifetime: InstantLifetimeOwner,
     start_gate: Option<RecordingStartGate>,
@@ -903,6 +905,8 @@ impl ActorBuilder {
             lifetime: InstantLifetimeOwner::new(),
             #[cfg(target_os = "macos")]
             excluded_windows: Vec::new(),
+            #[cfg(target_os = "macos")]
+            system_audio_apps: Vec::new(),
             start_gate: None,
         }
     }
@@ -989,6 +993,13 @@ impl ActorBuilder {
         self
     }
 
+    /// Record system audio from these bundle ids only. Empty records every app.
+    #[cfg(target_os = "macos")]
+    pub fn with_system_audio_apps(mut self, system_audio_apps: Vec<String>) -> Self {
+        self.system_audio_apps = system_audio_apps;
+        self
+    }
+
     pub async fn build(
         self,
         #[cfg(target_os = "macos")] shareable_content: Option<SendableShareableContent>,
@@ -1006,6 +1017,8 @@ impl ActorBuilder {
                 shareable_content,
                 #[cfg(target_os = "macos")]
                 excluded_windows: self.excluded_windows,
+                #[cfg(target_os = "macos")]
+                system_audio_apps: self.system_audio_apps,
             },
             self.max_output_size,
             self.max_fps,
@@ -1382,6 +1395,8 @@ async fn build_instant_recording_actor(
             )
             .await
             .context("screen capture init")?;
+            #[cfg(target_os = "macos")]
+            let screen_source = screen_source.with_system_audio_apps(inputs.system_audio_apps);
 
             debug!("screen capture: {screen_source:#?}");
 

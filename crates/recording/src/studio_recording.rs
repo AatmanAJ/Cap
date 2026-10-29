@@ -2156,6 +2156,8 @@ pub struct ActorBuilder {
     quality: crate::StudioQuality,
     #[cfg(target_os = "macos")]
     excluded_windows: Vec<scap_targets::WindowId>,
+    #[cfg(target_os = "macos")]
+    system_audio_apps: Vec<String>,
     start_gate: Option<RecordingStartGate>,
 }
 
@@ -2181,6 +2183,8 @@ impl ActorBuilder {
             quality: crate::StudioQuality::Balanced,
             #[cfg(target_os = "macos")]
             excluded_windows: Vec::new(),
+            #[cfg(target_os = "macos")]
+            system_audio_apps: Vec::new(),
             start_gate: None,
         }
     }
@@ -2250,6 +2254,13 @@ impl ActorBuilder {
         self
     }
 
+    /// Record system audio from these bundle ids only. Empty records every app.
+    #[cfg(target_os = "macos")]
+    pub fn with_system_audio_apps(mut self, system_audio_apps: Vec<String>) -> Self {
+        self.system_audio_apps = system_audio_apps;
+        self
+    }
+
     #[cfg(target_os = "linux")]
     pub fn lifecycle(&self) -> StudioLifecycle {
         self.lifetime.lifecycle.clone()
@@ -2282,6 +2293,8 @@ impl ActorBuilder {
                 shareable_content,
                 #[cfg(target_os = "macos")]
                 excluded_windows: self.excluded_windows,
+                #[cfg(target_os = "macos")]
+                system_audio_apps: self.system_audio_apps,
             },
             self.custom_cursor,
             self.keyboard_capture,
@@ -3438,6 +3451,9 @@ async fn create_segment_pipeline(
         )
         .await
         .context("screen capture init")?;
+        #[cfg(target_os = "macos")]
+        let screen_config =
+            screen_config.with_system_audio_apps(base_inputs.system_audio_apps.clone());
 
         let screen_info = screen_config.info();
         let output_size = calculate_gpu_compatible_size(
@@ -4012,6 +4028,8 @@ mod tests {
                         shareable_content: None,
                         #[cfg(target_os = "macos")]
                         excluded_windows: Vec::new(),
+                        #[cfg(target_os = "macos")]
+                        system_audio_apps: Vec::new(),
                     },
                     false,
                     false,
@@ -4123,6 +4141,8 @@ mod tests {
                 shareable_content: None,
                 #[cfg(target_os = "macos")]
                 excluded_windows: Vec::new(),
+                #[cfg(target_os = "macos")]
+                system_audio_apps: Vec::new(),
             },
             false,
             false,
@@ -4220,6 +4240,8 @@ mod tests {
                 start_gate: None,
                 shareable_content: None,
                 excluded_windows: Vec::new(),
+                #[cfg(target_os = "macos")]
+                system_audio_apps: Vec::new(),
             },
             false,
             false,
@@ -4360,6 +4382,8 @@ mod tests {
                     shareable_content: None,
                     #[cfg(target_os = "macos")]
                     excluded_windows: Vec::new(),
+                    #[cfg(target_os = "macos")]
+                    system_audio_apps: Vec::new(),
                 },
                 false,
                 false,
@@ -4605,6 +4629,8 @@ mod tests {
                     shareable_content: None,
                     #[cfg(target_os = "macos")]
                     excluded_windows: Vec::new(),
+                    #[cfg(target_os = "macos")]
+                    system_audio_apps: Vec::new(),
                 },
                 false,
                 false,

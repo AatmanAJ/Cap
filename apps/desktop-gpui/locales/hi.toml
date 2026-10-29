@@ -999,6 +999,15 @@ not_connected = "कनेक्ट नहीं है"
 off = "बंद"
 on = "चालू"
 
+[main.device.system_audio_apps]
+all_apps = "सभी ऐप्स"
+choose = "चुनें कि किन ऐप्स का ऑडियो रिकॉर्ड करना है"
+count = { one = "{count} ऐप", other = "{count} ऐप्स" }
+description = "सभी ऐप्स की आवाज़ रिकॉर्ड करें, या सिर्फ़ उन ऐप्स की जिन्हें आप चुनते हैं।"
+no_apps = "कोई ऐप नहीं मिला"
+no_matching_apps = "कोई मिलता-जुलता ऐप नहीं"
+not_running = "खुला नहीं है"
+
 [main.error]
 camera_only_needs_camera = "सिर्फ़ कैमरा रिकॉर्डिंग के लिए कोई कैमरा चुना होना ज़रूरी है।"
 copy = "त्रुटि कॉपी करें"

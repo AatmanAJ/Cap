@@ -999,6 +999,15 @@ not_connected = "未接続"
 off = "オフ"
 on = "オン"
 
+[main.device.system_audio_apps]
+all_apps = "すべてのアプリ"
+choose = "音声を録音するアプリを選択"
+count = { other = "{count}個のアプリ" }
+description = "すべてのアプリの音声を録音するか、選んだアプリの音声だけを録音します。"
+no_apps = "アプリが見つかりません"
+no_matching_apps = "一致するアプリはありません"
+not_running = "起動していません"
+
 [main.error]
 camera_only_needs_camera = "カメラのみの録画にはカメラを選択する必要があります。"
 copy = "エラーをコピー"

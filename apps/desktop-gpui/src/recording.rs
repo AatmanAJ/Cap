@@ -43,6 +43,9 @@ pub struct StartConfig {
     pub device_settings: crate::store::RecordingDeviceSettings,
     pub input_readiness: crate::feeds::InputReadiness,
     pub system_audio: bool,
+    /// Bundle ids to record system audio from; empty records every app.
+    #[cfg(target_os = "macos")]
+    pub system_audio_apps: Vec<String>,
     /// Our own windows (the recording controls bar; the camera bubble in studio
     /// mode), excluded from capture the way the Tauri app excludes them.
     pub excluded_windows: Vec<scap_targets::WindowId>,
@@ -2516,7 +2519,9 @@ async fn start_attempt_with_upload(
             }
             #[cfg(target_os = "macos")]
             {
-                builder = builder.with_excluded_windows(excluded_windows.clone());
+                builder = builder
+                    .with_excluded_windows(excluded_windows.clone())
+                    .with_system_audio_apps(config.system_audio_apps.clone());
             }
             if let Some(lock) = camera_lock.clone() {
                 builder = builder.with_camera_feed(lock);
@@ -2545,7 +2550,9 @@ async fn start_attempt_with_upload(
             }
             #[cfg(target_os = "macos")]
             {
-                builder = builder.with_excluded_windows(excluded_windows.clone());
+                builder = builder
+                    .with_excluded_windows(excluded_windows.clone())
+                    .with_system_audio_apps(config.system_audio_apps.clone());
             }
             if let Some(lock) = camera_lock.clone() {
                 builder = builder.with_camera_feed(lock);

@@ -302,6 +302,9 @@ pub struct ScreenCaptureConfig<TCaptureFormat: ScreenCaptureFormat> {
     shareable_content: cidre::arc::R<cidre::sc::ShareableContent>,
     #[cfg(target_os = "macos")]
     pub excluded_windows: Vec<WindowId>,
+    /// Bundle ids whose audio is recorded. Empty records every app.
+    #[cfg(target_os = "macos")]
+    pub system_audio_apps: Vec<String>,
 }
 
 fn constrain_capture_size(size: PhysicalSize, max_size: Option<(u32, u32)>) -> PhysicalSize {
@@ -370,6 +373,8 @@ impl<TCaptureFormat: ScreenCaptureFormat> Clone for ScreenCaptureConfig<TCapture
             shareable_content: self.shareable_content.clone(),
             #[cfg(target_os = "macos")]
             excluded_windows: self.excluded_windows.clone(),
+            #[cfg(target_os = "macos")]
+            system_audio_apps: self.system_audio_apps.clone(),
         }
     }
 }
@@ -609,7 +614,15 @@ impl<TCaptureFormat: ScreenCaptureFormat> ScreenCaptureConfig<TCaptureFormat> {
             shareable_content: shareable_content.retained(),
             #[cfg(target_os = "macos")]
             excluded_windows,
+            #[cfg(target_os = "macos")]
+            system_audio_apps: Vec::new(),
         })
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn with_system_audio_apps(mut self, system_audio_apps: Vec<String>) -> Self {
+        self.system_audio_apps = system_audio_apps;
+        self
     }
 
     #[cfg(windows)]
