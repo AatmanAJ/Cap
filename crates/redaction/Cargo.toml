@@ -1,0 +1,14 @@
+[package]
+name = "cap-redaction"
+version = "0.1.0"
+edition = "2024"
+
+[lints]
+workspace = true
+
+[dependencies]
+cap-project = { path = "../project" }
+workspace-hack = { version = "0.1", path = "../workspace-hack" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cidre = { workspace = true }
