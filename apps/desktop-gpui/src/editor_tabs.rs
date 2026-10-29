@@ -22,10 +22,10 @@ use std::{
 #[cfg(test)]
 use cap_project::CaptionsData;
 use cap_project::{
-    BackgroundBlurConfig, BackgroundBlurMode, CameraShape, CameraXPosition, CameraYPosition,
-    CaptionSegment, CaptionSettings, CornerStyle, CursorAnimationStyle, CursorRippleConfig,
-    KeyboardData, KeyboardSettings, ProjectConfiguration, RecordingMeta, ShadowConfiguration,
-    StereoMode, transcription_ranges_cover, transcription_source_ranges,
+    BackgroundBlurConfig, BackgroundBlurMode, Camera, CameraShape, CameraXPosition,
+    CameraYPosition, CaptionSegment, CaptionSettings, CornerStyle, CursorAnimationStyle,
+    CursorRippleConfig, KeyboardData, KeyboardSettings, ProjectConfiguration, RecordingMeta,
+    ShadowConfiguration, StereoMode, transcription_ranges_cover, transcription_source_ranges,
 };
 use gpui::{
     AnyElement, Bounds, Context, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -393,6 +393,8 @@ pub enum CameraSlider {
     ShadowSize,
     ShadowOpacity,
     ShadowBlur,
+    SilenceDelay,
+    FaceZoom,
 }
 
 impl CameraSlider {
@@ -408,7 +410,9 @@ impl CameraSlider {
             | Self::Shadow
             | Self::ShadowSize
             | Self::ShadowOpacity
-            | Self::ShadowBlur => false,
+            | Self::ShadowBlur
+            | Self::SilenceDelay
+            | Self::FaceZoom => false,
         }
     }
 
@@ -417,6 +421,16 @@ impl CameraSlider {
             // `minValue={20} maxValue={80} step={0.1}` (`:3204-3206`).
             Self::Size => (20., 80., 0.1),
             Self::ZoomSize => (10., 100., 0.1),
+            Self::SilenceDelay => (
+                Camera::HIDE_WHEN_SILENT_DELAY_RANGE.0,
+                Camera::HIDE_WHEN_SILENT_DELAY_RANGE.1,
+                0.1,
+            ),
+            Self::FaceZoom => (
+                Camera::FACE_ZOOM_RANGE.0 * 100.,
+                Camera::FACE_ZOOM_RANGE.1 * 100.,
+                1.,
+            ),
             _ => (0., 100., 0.1),
         }
     }
@@ -432,6 +446,8 @@ impl CameraSlider {
             Self::ShadowSize => shadow.map_or(UI_SHADOW_FALLBACK.size, |s| s.size),
             Self::ShadowOpacity => shadow.map_or(UI_SHADOW_FALLBACK.opacity, |s| s.opacity),
             Self::ShadowBlur => shadow.map_or(UI_SHADOW_FALLBACK.blur, |s| s.blur),
+            Self::SilenceDelay => camera.hide_when_silent_delay_clamped(),
+            Self::FaceZoom => camera.face_zoom_clamped() * 100.,
         }
     }
 }
@@ -1212,6 +1228,14 @@ impl EditorWindow {
                     CameraSlider::ZoomSize => camera.scale_during_zoom = value / 100.,
                     CameraSlider::Rounding => camera.rounding = value,
                     CameraSlider::Shadow => camera.shadow = value,
+                    CameraSlider::SilenceDelay => {
+                        let (min, max) = Camera::HIDE_WHEN_SILENT_DELAY_RANGE;
+                        camera.hide_when_silent_delay = (value.clamp(min, max) * 10.).round() / 10.
+                    }
+                    CameraSlider::FaceZoom => {
+                        let (min, max) = Camera::FACE_ZOOM_RANGE;
+                        camera.face_zoom = (value / 100.).clamp(min, max)
+                    }
                     // `...(project.camera.advancedShadow ?? {50, 18, 50})`
                     // (`:3253-3259`) -- the same UI fallback the background tab has.
                     CameraSlider::ShadowSize
@@ -1483,6 +1507,7 @@ impl EditorWindow {
                                 ),
                             ),
                         )
+                        .child(self.render_camera_automation(cx))
                         .child(
                             ui::Subfield::plain(&theme, tr::editor::tabs::camera::mirror()).child(
                                 ui::Toggle::plain(&theme, "camera-mirror", camera.mirror).on_click(
@@ -1615,6 +1640,89 @@ impl EditorWindow {
                     )
                     .into_any_element()
             }))
+            .into_any_element()
+    }
+
+    fn render_camera_automation(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        let camera = &self.project.camera;
+        let silent = camera.hide_when_silent;
+        let mut body = div().flex().flex_col().gap(px(14.)).child(
+            ui::Subfield::plain(&theme, tr::editor::tabs::camera::hide_when_silent()).child(
+                ui::Toggle::plain(&theme, "camera-hide-when-silent", silent).on_click(cx.listener(
+                    |this, _, window, cx| {
+                        let next = !this.style_control_project().camera.hide_when_silent;
+                        this.edit_project("camera-hide-when-silent", window, cx, move |p| {
+                            p.camera.hide_when_silent = next;
+                            true
+                        });
+                    },
+                )),
+            ),
+        );
+        if silent {
+            body = body.child(self.camera_readout_slider(
+                tr::editor::tabs::camera::silence_delay(),
+                CameraSlider::SilenceDelay,
+                "s",
+                format!("{:.1}s", camera.hide_when_silent_delay_clamped()),
+                cx,
+            ));
+        }
+        if cfg!(target_os = "macos") {
+            let tracking = camera.track_face;
+            body = body.child(
+                ui::Subfield::plain(&theme, tr::editor::tabs::camera::track_face()).child(
+                    ui::Toggle::plain(&theme, "camera-track-face", tracking).on_click(cx.listener(
+                        |this, _, window, cx| {
+                            let next = !this.style_control_project().camera.track_face;
+                            this.edit_project("camera-track-face", window, cx, move |p| {
+                                p.camera.track_face = next;
+                                true
+                            });
+                        },
+                    )),
+                ),
+            );
+            if tracking {
+                body = body.child(self.camera_readout_slider(
+                    tr::editor::tabs::camera::face_zoom(),
+                    CameraSlider::FaceZoom,
+                    "%",
+                    format!("{:.0}%", camera.face_zoom_clamped() * 100.),
+                    cx,
+                ));
+            }
+        }
+        body.into_any_element()
+    }
+
+    fn camera_readout_slider(
+        &self,
+        label: &'static str,
+        slider: CameraSlider,
+        unit: &'static str,
+        readout: String,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        ui::Subfield::plain(&self.theme, label)
+            .gap(px(16.))
+            .child(
+                div()
+                    .flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap(px(12.))
+                    .items_center()
+                    .child(self.slider_flex(SliderKey::Camera(slider), unit, cx))
+                    .child(
+                        div()
+                            .w(px(48.))
+                            .text_size(px(12.))
+                            .text_color(Hsla::from(self.theme.gray_11))
+                            .child(readout),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -4531,6 +4639,8 @@ mod tests {
             CameraSlider::ShadowSize,
             CameraSlider::ShadowOpacity,
             CameraSlider::ShadowBlur,
+            CameraSlider::SilenceDelay,
+            CameraSlider::FaceZoom,
         ] {
             assert!(
                 !slider.changes_timeline_model(),

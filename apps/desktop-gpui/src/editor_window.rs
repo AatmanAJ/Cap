@@ -2566,6 +2566,7 @@ impl EditorWindow {
             return;
         };
         instance.project_config.0.send(self.project.clone()).ok();
+        instance.ensure_camera_analysis(&self.project);
         if !self.playing {
             let time = self.view.preview_time.unwrap_or(self.playhead).max(0.0);
             request_frame(
@@ -2975,6 +2976,9 @@ impl EditorWindow {
             .map(|_| self.initial_frame_number());
         if instance.preparing_adoption().is_some() {
             self.ordinary_handoff_frame = None;
+        }
+        if matches!(&self.state, LoadState::Ready(_)) {
+            instance.ensure_camera_analysis(&self.project);
         }
         self.instance = Some(instance);
     }

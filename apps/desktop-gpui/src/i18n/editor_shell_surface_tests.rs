@@ -408,7 +408,12 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
             tr::editor::tabs::camera::custom_position(),
             "Custom position (dragged on canvas)",
         ),
+        (tr::editor::tabs::camera::face_zoom(), "Face Zoom"),
         (tr::editor::tabs::camera::hide(), "Hide Camera"),
+        (
+            tr::editor::tabs::camera::hide_when_silent(),
+            "Hide When Silent",
+        ),
         (
             tr::editor::tabs::camera::keep_size_during_zoom(),
             "Keep original size during zoom",
@@ -427,11 +432,16 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
         (tr::editor::tabs::camera::shape::square(), "Square"),
         (tr::editor::tabs::camera::shape_label(), "Shape"),
         (
+            tr::editor::tabs::camera::silence_delay(),
+            "Silence Before Hiding",
+        ),
+        (
             tr::editor::tabs::camera::size_during_zoom(),
             "Size During Zoom",
         ),
         (tr::editor::tabs::camera::size_label(), "Size"),
         (tr::editor::tabs::camera::title(), "Camera"),
+        (tr::editor::tabs::camera::track_face(), "Track Face"),
         (
             tr::editor::tabs::captions::active_word_highlight(),
             "Active Word Highlight",

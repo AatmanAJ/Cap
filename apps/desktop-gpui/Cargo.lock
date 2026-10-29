@@ -1627,6 +1627,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "cap-audio",
+ "cap-camera-effects",
  "cap-media",
  "cap-media-info",
  "cap-project",
