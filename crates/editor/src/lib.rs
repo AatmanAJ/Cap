@@ -11,6 +11,7 @@ mod preparing_handoff;
 mod preparing_playback;
 mod preparing_preview;
 mod segments;
+mod sensitive_scan;
 mod telemetry;
 mod thumbnail;
 
@@ -56,6 +57,9 @@ pub use preparing_preview::{
 };
 pub use segments::{
     audio_segment_from_decoded, get_audio_segments, load_music_tracks, load_music_tracks_uncached,
+};
+pub use sensitive_scan::{
+    SensitiveScanOptions, SensitiveScanResult, scan_for_sensitive_info, sensitive_scan_available,
 };
 pub use telemetry::{
     PlaybackFrameSource, PlaybackRenderOutputFormat, PlaybackSkipReason, PlaybackTelemetry,

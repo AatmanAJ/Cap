@@ -684,6 +684,20 @@ impl RecordingSegmentDecoders {
         .flatten()
     }
 
+    /// Offline analysis: waits past playback deadlines like an export does,
+    /// and reports a stalled decode as no frame.
+    pub async fn get_frames_offline(
+        &self,
+        segment_time: f32,
+        offsets: ClipOffsets,
+        initial: bool,
+    ) -> Option<DecodedSegmentFrames> {
+        self.get_frames_for_export(segment_time, false, true, offsets, initial)
+            .await
+            .ok()
+            .flatten()
+    }
+
     /// Offline export variant: screen and camera requests wait past their
     /// playback deadlines for the same frame (see `EXPORT_STALL_LIMIT`).
     async fn get_frames_for_export(
@@ -3656,6 +3670,69 @@ pub struct FrameLayout {
     pub output_size: [u32; 2],
 }
 
+/// Where the screen recording lands in the output frame on one frame: source
+/// pixels inside `crop_bounds` map linearly onto output pixels inside
+/// `target_bounds` (zoom, padding, crop, split and takeover morphs included;
+/// a 3D pose warps the card further and is not included).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DisplayPlacement {
+    pub source_size: [f32; 2],
+    pub crop_bounds: [f32; 4],
+    pub target_bounds: [f32; 4],
+    pub output_size: [u32; 2],
+    pub visible: bool,
+}
+
+impl DisplayPlacement {
+    /// A point in the source frame, normalized, to the output frame,
+    /// normalized.
+    pub fn source_to_output(&self, x: f64, y: f64) -> (f64, f64) {
+        let [crop_x0, crop_y0, crop_x1, crop_y1] = self.crop_bounds.map(f64::from);
+        let [target_x0, target_y0, target_x1, target_y1] = self.target_bounds.map(f64::from);
+        let source_x = x * f64::from(self.source_size[0]);
+        let source_y = y * f64::from(self.source_size[1]);
+        let output_x = target_x0
+            + (source_x - crop_x0) / (crop_x1 - crop_x0).max(f64::EPSILON)
+                * (target_x1 - target_x0);
+        let output_y = target_y0
+            + (source_y - crop_y0) / (crop_y1 - crop_y0).max(f64::EPSILON)
+                * (target_y1 - target_y0);
+        (
+            output_x / f64::from(self.output_size[0].max(1)),
+            output_y / f64::from(self.output_size[1].max(1)),
+        )
+    }
+}
+
+#[cfg(test)]
+mod display_placement_tests {
+    use super::DisplayPlacement;
+
+    #[test]
+    fn maps_cropped_padded_and_zoomed_sources_into_the_output() {
+        let padded = DisplayPlacement {
+            source_size: [1920.0, 1080.0],
+            crop_bounds: [0.0, 0.0, 1920.0, 1080.0],
+            target_bounds: [192.0, 108.0, 1728.0, 972.0],
+            output_size: [1920, 1080],
+            visible: true,
+        };
+        assert_eq!(padded.source_to_output(0.0, 0.0), (0.1, 0.1));
+        assert_eq!(padded.source_to_output(1.0, 1.0), (0.9, 0.9));
+        assert_eq!(padded.source_to_output(0.5, 0.5), (0.5, 0.5));
+
+        let cropped_and_zoomed = DisplayPlacement {
+            source_size: [1920.0, 1080.0],
+            crop_bounds: [960.0, 0.0, 1920.0, 540.0],
+            target_bounds: [-1920.0, 0.0, 1920.0, 2160.0],
+            output_size: [1920, 1080],
+            visible: true,
+        };
+        let (x, y) = cropped_and_zoomed.source_to_output(0.875, 0.25);
+        assert!((x - 0.5).abs() < 1e-9 && (y - 1.0).abs() < 1e-9, "{x} {y}");
+    }
+}
+
 /// Unzoomed placement of the display card in output-frame pixels. Without a
 /// decorative frame, outer == content.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -3676,6 +3753,16 @@ impl ProjectUniforms {
         self.takeover
             .as_ref()
             .map_or(1.0, |takeover| takeover.overlay_fade)
+    }
+
+    pub fn display_placement(&self) -> DisplayPlacement {
+        DisplayPlacement {
+            source_size: self.display.frame_size,
+            crop_bounds: self.display.crop_bounds,
+            target_bounds: self.display.target_bounds,
+            output_size: [self.output_size.0, self.output_size.1],
+            visible: self.scene.should_render_screen() && self.display.opacity > 0.01,
+        }
     }
 
     pub fn frame_layout(&self) -> FrameLayout {

@@ -26,6 +26,10 @@ path = "examples/audio-output-idle-benchmark.rs"
 name = "editor-startup-benchmark"
 path = "examples/editor-startup-benchmark.rs"
 
+[[example]]
+name = "sensitive-scan"
+path = "examples/sensitive-scan.rs"
+
 [features]
 # Offline audio output for the cap-verify suite. Never enabled by the app.
 test-hooks = []
@@ -35,6 +39,7 @@ cap-utils = { path = "../utils" }
 cap-media = { path = "../media" }
 cap-project = { path = "../project" }
 cap-rendering = { path = "../rendering" }
+cap-redaction = { path = "../redaction" }
 cap-audio = { path = "../audio" }
 cap-media-info = { path = "../media-info" }
 

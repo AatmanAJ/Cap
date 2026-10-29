@@ -1326,6 +1326,7 @@ dependencies = [
  "cap-media",
  "cap-media-info",
  "cap-project",
+ "cap-redaction",
  "cap-rendering",
  "cap-utils",
  "cpal",
@@ -1661,6 +1662,15 @@ dependencies = [
  "windows 0.60.0",
  "workspace-hack",
  "x11rb",
+]
+
+[[package]]
+name = "cap-redaction"
+version = "0.1.0"
+dependencies = [
+ "cap-project",
+ "cidre",
+ "workspace-hack",
 ]
 
 [[package]]
