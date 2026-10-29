@@ -8,9 +8,10 @@ pub const MIN_TYPING_SPEED: f64 = 1.5;
 pub const MAX_TYPING_SPEED: f64 = 8.0;
 pub const DEFAULT_TYPING_SPEED: f64 = 3.0;
 
-/// Clip edges closer than this to a sped-up range are absorbed into it rather
-/// than left behind as a sliver of normal-speed video.
 const CLIP_EDGE_SNAP: f64 = 0.1;
+// `clip.start + 2 * transition` minus `clip.start` can land a hair under
+// `2 * transition`, which the split would refuse.
+const TRANSITION_EDGE_MARGIN: f64 = 1e-6;
 
 // A modifier whose release was never recorded would otherwise turn every
 // later keystroke into a "shortcut" and hide all typing after it.
@@ -24,10 +25,10 @@ const MIC_SPEECH_MIN_DB: f32 = -50.0;
 const MIC_SPEECH_MIN_FRAMES: usize = 8;
 const MIC_SPEECH_MERGE_GAP: f64 = 0.3;
 
-const SHORTCUT_MODIFIERS: &[&str] = &[
-    "LControl", "RControl", "LAlt", "RAlt", "LOption", "ROption", "LMeta", "RMeta", "Meta",
-    "Command", "RCommand",
-];
+const COMMAND_KEYS: &[&str] = &["LMeta", "RMeta", "Meta", "Command", "RCommand"];
+const CONTROL_KEYS: &[&str] = &["LControl", "RControl"];
+const LEFT_ALT_KEYS: &[&str] = &["LAlt", "LOption"];
+const RIGHT_ALT_KEYS: &[&str] = &["RAlt", "ROption", "AltGr"];
 
 const NEUTRAL_KEYS: &[&str] = &[
     "LShift", "RShift", "CapsLock", "Function", "Fn", "Up", "Down", "Left", "Right", "Home", "End",
@@ -38,16 +39,13 @@ const TYPING_KEYS: &[&str] = &["Space", "Backspace", "Delete", "Enter", "Return"
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TypingRunSettings {
-    /// The longest pause between two keystrokes of the same run.
     pub max_key_gap: f64,
-    /// The shortest run (first to last keystroke) worth speeding up.
     pub min_duration: f64,
     pub min_keys: usize,
-    /// Runs this close together become one, unless a shortcut sits between.
     pub merge_gap: f64,
     pub padding: f64,
-    /// Kept at normal speed on each side of detected speech.
     pub speech_padding: f64,
+    pub option_types_characters: bool,
 }
 
 impl Default for TypingRunSettings {
@@ -59,6 +57,7 @@ impl Default for TypingRunSettings {
             merge_gap: 2.5,
             padding: 0.25,
             speech_padding: 0.3,
+            option_types_characters: true,
         }
     }
 }
@@ -71,8 +70,6 @@ pub enum SpeechSource {
     None,
 }
 
-/// A stretch of typing in one recording clip, in that clip's own time (the
-/// time base of [`crate::TimelineSegment::start`] / `end`).
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypingSection {
     pub recording_clip: u32,
@@ -80,7 +77,6 @@ pub struct TypingSection {
     pub end: f64,
 }
 
-/// One range of a timeline clip to speed up, in the clip's source time.
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlannedTypingSpeedup {
     pub clip_index: usize,
@@ -123,11 +119,24 @@ struct Burst {
     keys: usize,
 }
 
-/// Typing runs in one recording clip's time: ordinary keystrokes no more than
-/// `max_key_gap` apart, at least `min_duration` long, merged across short
-/// pauses and padded. A shortcut (a key pressed with Control, Option or
-/// Command held) or a non-typing key such as Escape ends a run and keeps the
-/// runs on either side apart.
+fn is_modifier_key(key: &str) -> bool {
+    [COMMAND_KEYS, CONTROL_KEYS, LEFT_ALT_KEYS, RIGHT_ALT_KEYS]
+        .iter()
+        .any(|keys| keys.contains(&key))
+}
+
+fn modifiers_make_shortcut(held: &[(&str, f64)], option_types_characters: bool) -> bool {
+    let has = |keys: &[&str]| held.iter().any(|(key, _)| keys.contains(key));
+    if has(COMMAND_KEYS) {
+        return true;
+    }
+    if option_types_characters {
+        return has(CONTROL_KEYS);
+    }
+    // Windows reports AltGr as RAlt plus a synthetic LControl.
+    has(LEFT_ALT_KEYS) || (has(CONTROL_KEYS) && !has(RIGHT_ALT_KEYS))
+}
+
 pub fn detect_typing_runs(
     events: &KeyboardEvents,
     capture_offset: f64,
@@ -141,7 +150,7 @@ pub fn detect_typing_runs(
     for event in ordered_events(events) {
         let time = event.time_ms / 1000.0 - capture_offset;
         let key = event.key.as_str();
-        if SHORTCUT_MODIFIERS.contains(&key) {
+        if is_modifier_key(key) {
             held.retain(|(held_key, _)| *held_key != key);
             if event.down {
                 held.push((key, time));
@@ -152,7 +161,7 @@ pub fn detect_typing_runs(
             continue;
         }
         held.retain(|(_, since)| time - since <= HELD_MODIFIER_TIMEOUT);
-        if !held.is_empty() || !is_typing_key(key) {
+        if modifiers_make_shortcut(&held, settings.option_types_characters) || !is_typing_key(key) {
             bursts.extend(current.take());
             breaks.push(time);
             continue;
@@ -214,8 +223,6 @@ fn merge_ranges(mut ranges: Vec<Range<f64>>) -> Vec<Range<f64>> {
     merged
 }
 
-/// `ranges` with every `remove` range (widened by `padding` on each side)
-/// cut out. Both inputs may be unsorted and overlapping.
 pub fn subtract_ranges(
     ranges: &[Range<f64>],
     remove: &[Range<f64>],
@@ -252,9 +259,6 @@ pub fn subtract_ranges(
     result
 }
 
-/// Spoken words from a source-timed transcript, split per recording clip and
-/// moved into that clip's time. `None` for a legacy transcript stored in
-/// edited output time, which cannot be placed against the recordings.
 pub fn transcript_speech_ranges(
     captions: &CaptionsData,
     recording_durations: &[f64],
@@ -297,8 +301,6 @@ pub fn transcript_speech_ranges(
     )
 }
 
-/// Mean absolute amplitude in dBFS for every [`SPEECH_FRAME_SECS`] of
-/// interleaved audio, the input [`microphone_speech_ranges`] expects.
 pub fn audio_frame_levels<'a>(
     slices: impl IntoIterator<Item = &'a [f32]>,
     channels: u16,
@@ -335,10 +337,8 @@ pub fn audio_frame_levels<'a>(
     levels
 }
 
-/// Voice activity from a microphone's [`audio_frame_levels`]: stretches that
-/// stay well above the track's noise floor for at least 80ms, allowing
-/// single-frame dips, merged across pauses of up to 0.3s. A keystroke's click
-/// on the same mic lasts 20 to 40ms, so typing alone does not read as speech.
+// A keystroke's click on the same mic lasts 20 to 40ms, so requiring 80ms of
+// sustained level keeps typing alone from reading as speech.
 pub fn microphone_speech_ranges(frame_levels_db: &[f32]) -> Vec<Range<f64>> {
     if frame_levels_db.is_empty() {
         return Vec::new();
@@ -388,12 +388,8 @@ pub fn microphone_speech_ranges(frame_levels_db: &[f32]) -> Vec<Range<f64>> {
     ranges
 }
 
-/// Speech per recording clip: the transcript's words when the project has a
-/// source-timed transcript, joined with the microphone's voice activity
-/// wherever a clip has a mic track (`mic_speech[i]` is `None` for a clip
-/// without one). Both are used when both exist, because a transcript can drop
-/// quiet or mumbled speech and the mic cannot tell talking from other loud
-/// sound; either way speech is kept at normal speed.
+// Both sources are used when both exist: a transcript can drop quiet or
+// mumbled speech, and the mic cannot tell talking from other loud sound.
 pub fn project_speech_ranges(
     captions: Option<&CaptionsData>,
     recording_durations: &[f64],
@@ -426,9 +422,6 @@ pub fn project_speech_ranges(
     (source, ranges)
 }
 
-/// Typing runs in every recording clip with speech cut out. `takes[i]` holds
-/// recording clip `i`'s keyboard events and their capture offset, as
-/// [`crate::load_project_keyboard_events`] returns them.
 pub fn find_typing_sections(
     takes: &[(KeyboardEvents, f64)],
     speech: &[Vec<Range<f64>>],
@@ -461,12 +454,6 @@ fn transition_duration(timeline: &TimelineConfiguration, index: usize) -> f64 {
         .map_or(0.0, |transition| transition.duration)
 }
 
-/// Where `sections` land on the current timeline: each part of a section
-/// that a normal-speed clip still shows, as a source range of that clip.
-/// Cut material is skipped, clips that already have a speed of their own are
-/// left alone, a range keeps clear of the clip's transitions the way a manual
-/// split must, and a part shorter than `min_duration` is dropped. Sorted by
-/// clip, then time.
 pub fn plan_typing_speedup(
     timeline: &TimelineConfiguration,
     sections: &[TypingSection],
@@ -483,8 +470,16 @@ pub fn plan_typing_speedup(
         }
         let incoming = transition_duration(timeline, clip_index) * 2.0;
         let outgoing = transition_duration(timeline, clip_index + 1) * 2.0;
-        let first = clip.start + incoming;
-        let last = clip.end - outgoing;
+        let first = if incoming > 0.0 {
+            clip.start + incoming + TRANSITION_EDGE_MARGIN
+        } else {
+            clip.start
+        };
+        let last = if outgoing > 0.0 {
+            clip.end - outgoing - TRANSITION_EDGE_MARGIN
+        } else {
+            clip.end
+        };
         let mut ranges: Vec<Range<f64>> = Vec::new();
         for section in sections
             .iter()

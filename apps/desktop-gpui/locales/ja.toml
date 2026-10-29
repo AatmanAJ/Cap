@@ -2625,7 +2625,7 @@ timeline_unreadable = "プロジェクトのタイムラインを読み込めま
 title = "キーボードを表示"
 typing_analyzing = "タイピングを探しています..."
 typing_apply = "速くする"
-typing_description = "話さずにタイピングしている部分を速く再生します。各部分はミュートされた個別のクリップになります。"
+typing_description = "話さずにタイピングしている部分を速くします。各部分はミュートされた個別のクリップになります。"
 typing_found = { other = "{count}か所見つかりました · {duration}短縮" }
 typing_no_keyboard = "この録画にはキーボードのデータがありません。"
 typing_no_speech_check = "文字起こしもマイクもないため、話しながらのタイピングを区別できません。"

@@ -5966,7 +5966,13 @@ fn load_editor_waveforms(
     handle: WindowHandle<EditorWindow>,
     cx: &mut gpui::AsyncApp,
 ) {
-    let project_path = instance.project_path.clone();
+    load_typing_keyboard(instance.clone(), handle, cx);
+    let owner = instance.clone();
+    let timing_repairs: Vec<f32> = instance
+        .segment_medias
+        .iter()
+        .map(|segment| segment.audio_timing_repair.mic_offset_secs)
+        .collect();
     cx.spawn(async move |cx| {
         let task = cx.update(|cx| {
             gpui_tokio::Tokio::spawn(cx, async move {
@@ -5984,13 +5990,20 @@ fn load_editor_waveforms(
             })
         });
         let Ok((mic, system)) = task.await else {
+            let _ = handle.update(cx, |view, window, cx| {
+                if view.is_instance(&owner) {
+                    view.typing_speedup
+                        .set_mic(Err("the recording's audio could not be loaded".to_string()));
+                    cx.notify();
+                    window.refresh();
+                }
+            });
             return;
         };
-        let (peaks, typing_inputs) = cx
+        let speech_source = mic.clone();
+        let peaks = cx
             .background_executor()
             .spawn(async move {
-                let typing_inputs =
-                    crate::editor_typing_speedup::TypingSpeedupInputs::load(&project_path, &mic);
                 let [mic, system] = [mic, system].map(|tracks| {
                     tracks
                         .into_iter()
@@ -6005,17 +6018,54 @@ fn load_editor_waveforms(
                         })
                         .collect::<Vec<_>>()
                 });
-                ((mic, system), typing_inputs)
+                (mic, system)
             })
             .await;
         let _ = handle.update(cx, |view, window, cx| {
-            view.typing_speedup.inputs = Some(std::sync::Arc::new(typing_inputs));
             tracing::info!(
                 mic = peaks.0.iter().filter(|peaks| !peaks.is_empty()).count(),
                 system = peaks.1.iter().filter(|peaks| !peaks.is_empty()).count(),
                 "editor waveforms ready"
             );
             view.set_waveforms(peaks.0, peaks.1, window, cx)
+        });
+        let speech = cx
+            .background_executor()
+            .spawn(async move {
+                crate::editor_typing_speedup::TypingMicSpeech::detect(
+                    &speech_source,
+                    timing_repairs,
+                )
+            })
+            .await;
+        let _ = handle.update(cx, |view, window, cx| {
+            if view.is_instance(&owner) {
+                view.typing_speedup.set_mic(Ok(speech));
+                cx.notify();
+                window.refresh();
+            }
+        });
+    })
+    .detach();
+}
+
+fn load_typing_keyboard(
+    instance: Arc<cap_editor::EditorInstance>,
+    handle: WindowHandle<EditorWindow>,
+    cx: &mut gpui::AsyncApp,
+) {
+    cx.spawn(async move |cx| {
+        let project_path = instance.project_path.clone();
+        let keyboard = cx
+            .background_executor()
+            .spawn(async move { crate::editor_typing_speedup::TypingKeyboard::load(&project_path) })
+            .await;
+        let _ = handle.update(cx, |view, window, cx| {
+            if view.is_instance(&instance) {
+                view.typing_speedup.set_keyboard(keyboard);
+                cx.notify();
+                window.refresh();
+            }
         });
     })
     .detach();

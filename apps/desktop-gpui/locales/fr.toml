@@ -2625,7 +2625,7 @@ timeline_unreadable = "Impossible de lire la timeline du projet."
 title = "Afficher le clavier"
 typing_analyzing = "Recherche de frappe..."
 typing_apply = "Accélérer"
-typing_description = "Lit plus vite les passages où vous tapez sans parler. Chaque passage devient un clip muet distinct."
+typing_description = "Accélère les passages où vous tapez sans parler. Chaque passage devient un clip muet distinct."
 typing_found = { one = "{count} passage trouvé · gagne {duration}", many = "{count} de passages trouvés · gagne {duration}", other = "{count} passages trouvés · gagne {duration}" }
 typing_no_keyboard = "Cet enregistrement ne contient pas de données clavier."
 typing_no_speech_check = "Il n'y a ni transcription ni micro, la frappe pendant que vous parlez ne peut donc pas être distinguée."

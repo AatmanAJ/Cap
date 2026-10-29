@@ -718,7 +718,7 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
         (tr::editor::tabs::keyboard::typing_apply(), "Speed Up"),
         (
             tr::editor::tabs::keyboard::typing_description(),
-            "Plays the parts where you type without talking faster. Each part becomes its own muted clip.",
+            "Speeds up the parts where you're typing and not talking. Each part becomes its own muted clip.",
         ),
         (
             tr::editor::tabs::keyboard::typing_no_keyboard(),

@@ -554,12 +554,112 @@ fn plan_snaps_to_clip_edges_and_stays_clear_of_transitions() {
     let plan = plan_typing_speedup(&timeline, &sections, &settings());
     let ranges: Vec<_> = plan
         .iter()
-        .map(|range| (range.clip_index, range.start, range.end))
+        .map(|range| (range.clip_index, range.start..range.end))
         .collect();
+    assert_eq!(ranges.len(), 3, "{ranges:?}");
     assert_eq!(
-        ranges,
-        vec![(0, 0.0, 10.0), (0, 12.0, 19.0), (1, 21.0, 40.0)]
+        ranges.iter().map(|(index, _)| *index).collect::<Vec<_>>(),
+        vec![0, 0, 1]
     );
+    assert_ranges(
+        &ranges
+            .into_iter()
+            .map(|(_, range)| range)
+            .collect::<Vec<_>>(),
+        &[(0.0, 10.0), (12.0, 19.0 - 1e-6), (21.0 + 1e-6, 40.0)],
+    );
+}
+
+#[test]
+fn planned_edges_clear_transitions_after_float_rounding() {
+    let mut state = 0x9e37_79b9_u32;
+    let mut next = || {
+        state ^= state << 13;
+        state ^= state >> 17;
+        state ^= state << 5;
+        f64::from(state) / f64::from(u32::MAX)
+    };
+    for _ in 0..2000 {
+        let start = next() * 500.0;
+        let incoming = 0.1 + next() * 0.9;
+        let outgoing = 0.1 + next() * 0.9;
+        let mut timeline = timeline(vec![
+            clip(0, 0.0, 10.0, 1.0),
+            clip(0, start, start + 20.0, 1.0),
+            clip(0, start + 30.0, start + 40.0, 1.0),
+        ]);
+        timeline.transitions = vec![
+            ClipTransition {
+                segment_index: 1,
+                kind: ClipTransitionType::CrossFade,
+                duration: incoming,
+            },
+            ClipTransition {
+                segment_index: 2,
+                kind: ClipTransitionType::CrossFade,
+                duration: outgoing,
+            },
+        ];
+        let plan = plan_typing_speedup(&timeline, &[section(0, start, start + 20.0)], &settings());
+        let range = plan
+            .iter()
+            .find(|range| range.clip_index == 1)
+            .expect("planned");
+        assert!(range.start - start >= incoming * 2.0, "{start} {incoming}");
+        assert!(
+            20.0 - (range.end - start) >= outgoing * 2.0,
+            "{start} {outgoing}"
+        );
+    }
+}
+
+#[test]
+fn option_and_altgr_characters_are_typing_but_shortcuts_are_not() {
+    let with_modifier = |modifier: &str| {
+        let mut events = KeyboardEvents::default();
+        for index in 0..12 {
+            let time = index as f64 * 0.3;
+            events.presses.push(press(modifier, time, true));
+            events.presses.push(press("@", time + 0.05, true));
+            events.presses.push(press(modifier, time + 0.1, false));
+        }
+        events
+    };
+    let mac = settings();
+    let other = TypingRunSettings {
+        option_types_characters: false,
+        ..settings()
+    };
+
+    assert_ranges(
+        &detect_typing_runs(&with_modifier("LAlt"), 0.0, &mac),
+        &[(-0.2, 3.6)],
+    );
+    assert_ranges(
+        &detect_typing_runs(&with_modifier("ROption"), 0.0, &mac),
+        &[(-0.2, 3.6)],
+    );
+    assert!(detect_typing_runs(&with_modifier("LControl"), 0.0, &mac).is_empty());
+    assert!(detect_typing_runs(&with_modifier("Meta"), 0.0, &mac).is_empty());
+
+    assert_ranges(
+        &detect_typing_runs(&with_modifier("RAlt"), 0.0, &other),
+        &[(-0.2, 3.6)],
+    );
+    assert!(detect_typing_runs(&with_modifier("LAlt"), 0.0, &other).is_empty());
+    assert!(detect_typing_runs(&with_modifier("LControl"), 0.0, &other).is_empty());
+
+    let mut altgr = KeyboardEvents::default();
+    for index in 0..12 {
+        let time = index as f64 * 0.3;
+        altgr.presses.push(press("LControl", time, true));
+        altgr.presses.push(press("RAlt", time, true));
+        altgr.presses.push(press("@", time + 0.05, true));
+        altgr.presses.push(press("RAlt", time + 0.1, false));
+        altgr.presses.push(press("LControl", time + 0.1, false));
+    }
+    assert_ranges(&detect_typing_runs(&altgr, 0.0, &other), &[(-0.2, 3.6)]);
+    assert!(detect_typing_runs(&altgr, 0.0, &mac).is_empty());
 }
 
 #[test]

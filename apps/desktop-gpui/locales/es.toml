@@ -2625,7 +2625,7 @@ timeline_unreadable = "No se pudo leer la línea de tiempo del proyecto."
 title = "Mostrar teclado"
 typing_analyzing = "Buscando tecleo..."
 typing_apply = "Acelerar"
-typing_description = "Reproduce más rápido las partes en las que escribes sin hablar. Cada parte se convierte en su propio clip silenciado."
+typing_description = "Acelera las partes en las que escribes y no hablas. Cada parte se convierte en su propio clip silenciado."
 typing_found = { one = "{count} sección encontrada · ahorra {duration}", many = "{count} de secciones encontradas · ahorra {duration}", other = "{count} secciones encontradas · ahorra {duration}" }
 typing_no_keyboard = "Esta grabación no tiene datos de teclado."
 typing_no_speech_check = "No hay transcripción ni micrófono, así que no se puede distinguir el tecleo mientras hablas."
