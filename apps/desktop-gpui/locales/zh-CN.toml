@@ -1007,6 +1007,7 @@ description = "录制所有应用的声音，或只录制你选择的应用。"
 no_apps = "未找到应用"
 no_matching_apps = "没有匹配的应用"
 not_running = "未运行"
+web_audio_note = "选择应用后，Safari 以及以与 Safari 相同方式显示网页的其他应用中的网页声音不会被录制。"
 
 [main.error]
 camera_only_needs_camera = "仅摄像头录制需要先选择摄像头。"

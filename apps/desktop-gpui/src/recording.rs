@@ -43,7 +43,6 @@ pub struct StartConfig {
     pub device_settings: crate::store::RecordingDeviceSettings,
     pub input_readiness: crate::feeds::InputReadiness,
     pub system_audio: bool,
-    /// Bundle ids to record system audio from; empty records every app.
     #[cfg(target_os = "macos")]
     pub system_audio_apps: Vec<String>,
     /// Our own windows (the recording controls bar; the camera bubble in studio

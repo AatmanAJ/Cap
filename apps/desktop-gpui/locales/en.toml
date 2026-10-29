@@ -1009,6 +1009,7 @@ description = "Record sound from every app, or only from the apps you pick."
 no_apps = "No apps found"
 no_matching_apps = "No matching apps"
 not_running = "Not running"
+web_audio_note = "Sound from web pages in Safari, and in other apps that show web pages the way Safari does, isn't recorded when you pick apps."
 
 [main.error]
 camera_only_needs_camera = "Camera-only recording requires a selected camera."

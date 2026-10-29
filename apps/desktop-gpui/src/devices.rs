@@ -845,17 +845,13 @@ pub fn topmost_foreign_window_at_cursor() -> Option<Window> {
     Window::get_topmost_at_cursor()
 }
 
-/// A running app system audio can be limited to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioAppOption {
     pub id: String,
     pub name: String,
-    /// PNG bytes.
-    pub icon: Option<Vec<u8>>,
+    pub icon_png: Option<Vec<u8>>,
 }
 
-/// Recording audio from chosen apps only is a ScreenCaptureKit filter, so it
-/// is offered on macOS 13+ alone.
 pub fn app_audio_supported() -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -875,7 +871,7 @@ pub fn list_audio_apps() -> Vec<AudioAppOption> {
             .map(|app| AudioAppOption {
                 id: app.bundle_id,
                 name: app.name,
-                icon: app.icon,
+                icon_png: app.icon_png,
             })
             .collect()
     }

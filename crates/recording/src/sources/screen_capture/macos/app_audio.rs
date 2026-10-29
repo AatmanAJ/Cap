@@ -4,20 +4,17 @@ use objc::runtime::Object;
 const APP_ICON_SIZE: f64 = 64.0;
 const NS_BITMAP_IMAGE_FILE_TYPE_PNG: u64 = 4;
 
-/// A running app whose audio can be recorded on its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AudioApp {
     pub bundle_id: String,
     pub name: String,
-    /// PNG bytes.
-    pub icon: Option<Vec<u8>>,
+    pub icon_png: Option<Vec<u8>>,
 }
 
 pub fn app_audio_supported() -> bool {
     scap_screencapturekit::is_system_audio_supported()
 }
 
-/// The regular (Dock) apps that are running, one entry per bundle id, by name.
 pub fn list_audio_apps() -> Vec<AudioApp> {
     use cocoa::{
         appkit::{NSApplicationActivationPolicy, NSApplicationActivationPolicyRegular},
@@ -47,12 +44,12 @@ pub fn list_audio_apps() -> Vec<AudioApp> {
                 let bundle_id = ns_string_to_string(msg_send![app, bundleIdentifier])?;
                 let name = ns_string_to_string(msg_send![app, localizedName])
                     .unwrap_or_else(|| bundle_id.clone());
-                let icon = image_png(msg_send![app, icon]);
+                let icon_png = image_png(msg_send![app, icon]);
 
                 Some(AudioApp {
                     bundle_id,
                     name,
-                    icon,
+                    icon_png,
                 })
             })
             .collect::<Vec<_>>()
@@ -141,30 +138,44 @@ unsafe fn image_png(image: cocoa::base::id) -> Option<Vec<u8>> {
     }
 }
 
-/// Whether a running app belongs to the selection. Helper processes that
-/// share the selected bundle id as a prefix (`com.google.Chrome.helper`) play
-/// audio on behalf of the app, so they are included with it.
+/// Helpers are not matched: ScreenCaptureKit only lists apps that own a
+/// window, so windowless helpers such as `com.apple.WebKit.GPU` (which plays
+/// Safari's web audio) can't be added to the filter at all.
 pub fn bundle_id_selected(bundle_id: &str, selected: &[String]) -> bool {
-    if bundle_id.is_empty() {
-        return false;
-    }
-
-    selected.iter().any(|id| {
-        !id.is_empty()
-            && bundle_id.len() >= id.len()
-            && bundle_id.is_char_boundary(id.len())
-            && bundle_id[..id.len()].eq_ignore_ascii_case(id)
-            && (bundle_id.len() == id.len() || bundle_id.as_bytes()[id.len()] == b'.')
-    })
+    !bundle_id.is_empty() && selected.iter().any(|id| id.eq_ignore_ascii_case(bundle_id))
 }
 
-/// The process set a filter was built from, in a stable order so a refresh can
-/// tell whether anything launched or quit since.
 pub fn normalized_pids(pids: impl IntoIterator<Item = i32>) -> Vec<i32> {
     let mut pids = pids.into_iter().collect::<Vec<_>>();
     pids.sort_unstable();
     pids.dedup();
     pids
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AppAudioStep {
+    Keep,
+    Stop,
+    Start,
+    Update,
+}
+
+/// No stream exists while none of the selected apps runs, so a filter is never
+/// built from an empty app list. A stream that has not started yet, or was
+/// stopped by the system, is rebuilt rather than updated in place.
+pub fn next_step(
+    active_pids: Option<&[i32]>,
+    pids: &[i32],
+    started: bool,
+    rebuild: bool,
+) -> AppAudioStep {
+    match active_pids {
+        Some(active) if !rebuild && active == pids => AppAudioStep::Keep,
+        Some(_) if pids.is_empty() => AppAudioStep::Stop,
+        None if pids.is_empty() => AppAudioStep::Keep,
+        Some(_) if started && !rebuild => AppAudioStep::Update,
+        _ => AppAudioStep::Start,
+    }
 }
 
 pub fn selected_running_apps(
@@ -251,15 +262,50 @@ mod tests {
     }
 
     #[test]
-    fn helper_processes_follow_their_app() {
+    fn only_the_selected_bundle_matches() {
         let selected = selection(&["com.google.Chrome"]);
-        assert!(bundle_id_selected("com.google.Chrome.helper", &selected));
-        assert!(bundle_id_selected(
-            "com.google.Chrome.helper.Renderer",
-            &selected
-        ));
+        assert!(!bundle_id_selected("com.google.Chrome.helper", &selected));
         assert!(!bundle_id_selected("com.google.ChromeBeta", &selected));
         assert!(!bundle_id_selected("com.google", &selected));
+    }
+
+    #[test]
+    fn no_stream_exists_until_a_selected_app_runs() {
+        assert_eq!(next_step(None, &[], false, false), AppAudioStep::Keep);
+        assert_eq!(next_step(None, &[], true, false), AppAudioStep::Keep);
+        assert_eq!(next_step(None, &[42], false, false), AppAudioStep::Start);
+        assert_eq!(next_step(None, &[42], true, false), AppAudioStep::Start);
+    }
+
+    #[test]
+    fn a_running_stream_follows_launches_and_quits() {
+        assert_eq!(
+            next_step(Some(&[42]), &[42], true, false),
+            AppAudioStep::Keep
+        );
+        assert_eq!(
+            next_step(Some(&[42]), &[42, 77], true, false),
+            AppAudioStep::Update
+        );
+        assert_eq!(
+            next_step(Some(&[42]), &[77], true, false),
+            AppAudioStep::Update
+        );
+        assert_eq!(next_step(Some(&[42]), &[], true, false), AppAudioStep::Stop);
+    }
+
+    #[test]
+    fn an_unstarted_or_stopped_stream_is_rebuilt() {
+        assert_eq!(
+            next_step(Some(&[42]), &[42, 77], false, false),
+            AppAudioStep::Start
+        );
+        assert_eq!(
+            next_step(Some(&[42]), &[42], true, true),
+            AppAudioStep::Start
+        );
+        assert_eq!(next_step(Some(&[42]), &[], true, true), AppAudioStep::Stop);
+        assert_eq!(next_step(None, &[], true, true), AppAudioStep::Keep);
     }
 
     #[test]
@@ -269,22 +315,11 @@ mod tests {
         assert!(!bundle_id_selected("com.apple.Music", &[]));
     }
 
-    #[test]
-    fn multibyte_ids_do_not_panic() {
-        let selected = selection(&["com.example.é"]);
-        assert!(bundle_id_selected("com.example.é", &selected));
-        assert!(!bundle_id_selected("com.example.", &selected));
-        assert!(!bundle_id_selected(
-            "com.exampleé",
-            &selection(&["com.example"])
-        ));
-    }
-
     fn app(bundle_id: &str, name: &str) -> AudioApp {
         AudioApp {
             bundle_id: bundle_id.to_string(),
             name: name.to_string(),
-            icon: None,
+            icon_png: None,
         }
     }
 

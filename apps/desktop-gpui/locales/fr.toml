@@ -1007,6 +1007,7 @@ description = "Enregistrez le son de toutes les apps, ou seulement des apps que 
 no_apps = "Aucune app trouvée"
 no_matching_apps = "Aucune app correspondante"
 not_running = "Non ouverte"
+web_audio_note = "Le son des pages web dans Safari, et dans les autres apps qui affichent les pages web comme Safari, n'est pas enregistré quand vous choisissez des apps."
 
 [main.error]
 camera_only_needs_camera = "L'enregistrement caméra seule nécessite une caméra sélectionnée."

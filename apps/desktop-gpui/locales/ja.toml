@@ -1007,6 +1007,7 @@ description = "すべてのアプリの音声を録音するか、選んだア�
 no_apps = "アプリが見つかりません"
 no_matching_apps = "一致するアプリはありません"
 not_running = "起動していません"
+web_audio_note = "アプリを選択した場合、SafariやSafariと同じ方法でWebページを表示するほかのアプリで再生されるWebページの音声は録音されません。"
 
 [main.error]
 camera_only_needs_camera = "カメラのみの録画にはカメラを選択する必要があります。"

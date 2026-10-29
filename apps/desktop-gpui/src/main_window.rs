@@ -250,13 +250,10 @@ struct AudioAppEntry {
 struct AudioAppRow {
     id: String,
     name: String,
-    /// Index into the running apps; `None` for a chosen app that is closed.
     running: Option<usize>,
     selected: bool,
 }
 
-/// The running apps in list order, then any chosen app that is not running,
-/// so a choice can still be seen and undone while its app is closed.
 fn audio_app_rows(
     running: &[AudioAppEntry],
     selected: &[crate::store::SystemAudioApp],
@@ -980,7 +977,6 @@ pub enum Panel {
     ModeInfo,
     /// The header recordings / screenshots library.
     Library(LibraryKind),
-    /// Which apps system audio records from.
     SystemAudioApps,
 }
 
@@ -1131,9 +1127,7 @@ pub struct MainWindow {
     device_format_pending: Option<PendingDeviceFormat>,
     device_format_notice: Option<String>,
     system_audio: bool,
-    /// Apps system audio is limited to; empty records every app.
     system_audio_apps: Vec<crate::store::SystemAudioApp>,
-    /// Running apps for the system audio picker, read each time it opens.
     audio_apps: Option<Vec<AudioAppEntry>>,
     audio_apps_task: Option<Task<()>>,
     /// Which display/window is selected for each split target.
@@ -3123,7 +3117,6 @@ impl MainWindow {
             .collect()
     }
 
-    /// Picking anything in the app picker means system audio is wanted.
     fn set_system_audio_apps(
         &mut self,
         apps: Vec<crate::store::SystemAudioApp>,
@@ -3149,7 +3142,7 @@ impl MainWindow {
                 this.audio_apps = Some(
                     apps.into_iter()
                         .map(|app| AudioAppEntry {
-                            icon: app.icon.map(|bytes| {
+                            icon: app.icon_png.map(|bytes| {
                                 std::sync::Arc::new(gpui::Image::from_bytes(
                                     gpui::ImageFormat::Png,
                                     bytes,
@@ -5731,13 +5724,25 @@ impl MainWindow {
 
     fn render_system_audio_apps(&self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = self.theme;
-        let list = div().flex().flex_col().gap(px(4.)).w_full().child(
-            div()
-                .px(px(4.))
-                .text_size(px(12.))
-                .text_color(theme.gray_11)
-                .child(tr::main::device::system_audio_apps::description()),
-        );
+        let list = div()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .w_full()
+            .child(
+                div()
+                    .px(px(4.))
+                    .text_size(px(12.))
+                    .text_color(theme.gray_11)
+                    .child(tr::main::device::system_audio_apps::description()),
+            )
+            .child(
+                div()
+                    .px(px(4.))
+                    .text_size(px(11.))
+                    .text_color(theme.gray_10)
+                    .child(tr::main::device::system_audio_apps::web_audio_note()),
+            );
 
         let mut rows = vec![
             self.render_device_list_row(
@@ -7408,7 +7413,6 @@ impl MainWindow {
             )
     }
 
-    /// Opens the app picker without toggling the row it sits in.
     fn render_system_audio_apps_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
         div()
@@ -7465,7 +7469,6 @@ impl MainWindow {
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
         let theme = self.theme;
-        // The row without a device menu is system audio.
         let system_audio_apps =
             (menu.is_none() && self.system_audio && devices::app_audio_supported())
                 .then(|| self.render_system_audio_apps_button(cx));

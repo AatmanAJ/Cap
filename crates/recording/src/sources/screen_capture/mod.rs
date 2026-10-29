@@ -302,7 +302,6 @@ pub struct ScreenCaptureConfig<TCaptureFormat: ScreenCaptureFormat> {
     shareable_content: cidre::arc::R<cidre::sc::ShareableContent>,
     #[cfg(target_os = "macos")]
     pub excluded_windows: Vec<WindowId>,
-    /// Bundle ids whose audio is recorded. Empty records every app.
     #[cfg(target_os = "macos")]
     pub system_audio_apps: Vec<String>,
 }

@@ -32,6 +32,7 @@ pub use app_audio::{AudioApp, app_audio_supported, list_audio_apps};
 const MAX_CAPTURE_RESTARTS: u32 = 3;
 const RESTART_DELAY: Duration = Duration::from_secs(2);
 const APP_AUDIO_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const APP_AUDIO_TIMEOUT: Duration = Duration::from_secs(5);
 
 // The display filter is what hides excluded windows, so an excluded selection must stay on
 // the display-crop path instead of being captured on its own.
@@ -338,16 +339,7 @@ impl ScreenCaptureConfig<CMSampleBufferCapture> {
 
         // Only the audio follows the app selection: the screen stream keeps its
         // own filter and a second, audio-only stream carries the chosen apps.
-        let app_audio_content = if self.system_audio && !self.system_audio_apps.is_empty() {
-            Some(
-                app_audio::shareable_content_with_offscreen_apps()
-                    .await
-                    .map_err(|err| anyhow!("Failed to list apps for system audio: {err}"))?,
-            )
-        } else {
-            None
-        };
-        let (mut audio_tx, app_audio_tx) = if app_audio_content.is_some() {
+        let (mut audio_tx, app_audio_tx) = if !self.system_audio_apps.is_empty() {
             (None, system_audio_tx)
         } else {
             (system_audio_tx, None)
@@ -611,29 +603,19 @@ impl ScreenCaptureConfig<CMSampleBufferCapture> {
         let cancel_token = CancellationToken::new();
         let capturer = Capturer::new(Arc::new(builder.build()?));
 
-        let app_audio = match (app_audio_tx, app_audio_content) {
-            (Some(audio_tx), Some(content)) => {
-                let (app_error_tx, app_error_rx) = broadcast::channel(1);
-                let params = AppAudioParams {
-                    display_id: self.config.display.clone(),
-                    bundle_ids: self.system_audio_apps.clone(),
-                    audio_tx,
-                    error_tx: app_error_tx,
-                    frame_counter: system_audio_frame_counter.clone(),
-                    drop_counter: system_audio_drop_counter.clone(),
-                    stall_health_tx: stall_health_tx.clone(),
-                };
-                let active = params.build_capturer(&content)?;
-                Some((
-                    AppAudio {
-                        params,
-                        active: Arc::new(tokio::sync::Mutex::new(active)),
-                    },
-                    app_error_rx,
-                ))
-            }
-            _ => None,
-        };
+        let app_audio = app_audio_tx.map(|audio_tx| {
+            let (app_error_tx, app_error_rx) = broadcast::channel(1);
+            let app_audio = AppAudio::new(AppAudioParams {
+                display_id: self.config.display.clone(),
+                bundle_ids: self.system_audio_apps.clone(),
+                audio_tx,
+                error_tx: app_error_tx,
+                frame_counter: system_audio_frame_counter.clone(),
+                drop_counter: system_audio_drop_counter.clone(),
+                stall_health_tx: stall_health_tx.clone(),
+            });
+            (app_audio, app_error_rx)
+        });
 
         Ok((
             VideoSourceConfig {
@@ -698,10 +680,6 @@ impl Capturer {
 
     fn mark_stopped(&self) {
         self.started.store(false, atomic::Ordering::Relaxed);
-    }
-
-    fn is_started(&self) -> bool {
-        self.started.load(atomic::Ordering::Relaxed)
     }
 
     async fn start(&self) -> anyhow::Result<()> {
@@ -1327,9 +1305,17 @@ enum SystemAudioCapturer {
     Apps(AppAudio, broadcast::Receiver<arc::R<ns::Error>>),
 }
 
+#[derive(Clone)]
 struct AppAudio {
-    params: AppAudioParams,
-    active: Arc<tokio::sync::Mutex<ActiveAppAudio>>,
+    params: Arc<AppAudioParams>,
+    state: Arc<tokio::sync::Mutex<AppAudioState>>,
+}
+
+#[derive(Default)]
+struct AppAudioState {
+    active: Option<ActiveAppAudio>,
+    started: bool,
+    disabled: bool,
 }
 
 struct ActiveAppAudio {
@@ -1349,6 +1335,19 @@ struct AppAudioParams {
 
 type ContentFilterUpdate =
     std::pin::Pin<Box<dyn Future<Output = Result<(), arc::R<ns::Error>>> + Send>>;
+
+enum AppAudioPlan {
+    Keep,
+    Stop,
+    Start {
+        capturer: Capturer,
+        pids: Vec<i32>,
+    },
+    Update {
+        update: ContentFilterUpdate,
+        pids: Vec<i32>,
+    },
+}
 
 impl AppAudioParams {
     fn selected_apps(
@@ -1382,16 +1381,12 @@ impl AppAudioParams {
             .ok_or_else(|| anyhow!("Failed to create the system audio app filter"))
     }
 
-    fn build_capturer(&self, content: &sc::ShareableContent) -> anyhow::Result<ActiveAppAudio> {
-        let (apps, pids) = self.selected_apps(content);
-        let filter = self.content_filter(content, &apps)?;
-
-        info!(
-            selected = ?self.bundle_ids,
-            running = ?apps.iter().map(|app| app.bundle_id().to_string()).collect::<Vec<_>>(),
-            ?pids,
-            "Capturing system audio from selected apps"
-        );
+    fn build_capturer(
+        &self,
+        content: &sc::ShareableContent,
+        apps: &[arc::R<sc::RunningApp>],
+    ) -> anyhow::Result<Capturer> {
+        let filter = self.content_filter(content, apps)?;
 
         let settings = scap_screencapturekit::StreamCfgBuilder::default()
             .with_width(2)
@@ -1443,83 +1438,210 @@ impl AppAudioParams {
                 let _ = error_tx.send(err.retained());
             });
 
-        Ok(ActiveAppAudio {
-            capturer: Capturer::new(Arc::new(builder.build()?)),
-            pids,
-        })
+        Ok(Capturer::new(Arc::new(builder.build()?)))
     }
 
-    /// A selected app that launches, quits or relaunches changes the process
-    /// set, and the running stream's filter is swapped for one that matches.
-    fn filter_update(
+    /// Decides what the app stream needs for the apps running now. Built
+    /// synchronously, so no ScreenCaptureKit object outlives it across an await.
+    fn plan(
         &self,
         content: &sc::ShareableContent,
-        active: &ActiveAppAudio,
-    ) -> Option<(Vec<i32>, ContentFilterUpdate)> {
+        state: &AppAudioState,
+        rebuild: bool,
+    ) -> anyhow::Result<AppAudioPlan> {
         let (apps, pids) = self.selected_apps(content);
-        if pids == active.pids {
-            return None;
-        }
+        let active = state.active.as_ref();
 
-        match self.content_filter(content, &apps) {
-            Ok(filter) => Some((
-                pids,
-                Box::pin(active.capturer.capturer.update_content_filter(&filter)),
-            )),
-            Err(error) => {
-                warn!(%error, "Could not rebuild the system audio app filter");
-                None
-            }
-        }
+        Ok(
+            match app_audio::next_step(
+                active.map(|active| active.pids.as_slice()),
+                &pids,
+                state.started,
+                rebuild,
+            ) {
+                app_audio::AppAudioStep::Keep => AppAudioPlan::Keep,
+                app_audio::AppAudioStep::Stop => AppAudioPlan::Stop,
+                app_audio::AppAudioStep::Update => {
+                    let filter = self.content_filter(content, &apps)?;
+                    let update = active
+                        .map(|active| active.capturer.capturer.update_content_filter(&filter))
+                        .ok_or_else(|| anyhow!("No app audio stream to update"))?;
+                    AppAudioPlan::Update {
+                        update: Box::pin(update),
+                        pids,
+                    }
+                }
+                app_audio::AppAudioStep::Start => AppAudioPlan::Start {
+                    capturer: self.build_capturer(content, &apps)?,
+                    pids,
+                },
+            },
+        )
     }
 }
 
 impl AppAudio {
-    async fn refresh(&self) {
-        let content = match app_audio::shareable_content_with_offscreen_apps().await {
-            Ok(content) => content,
-            Err(error) => {
-                debug!(%error, "Could not refresh apps for system audio");
-                return;
-            }
-        };
-
-        let mut active = self.active.lock().await;
-        if !active.capturer.is_started() {
-            return;
-        }
-
-        let Some((pids, update)) = self.params.filter_update(&content, &active) else {
-            return;
-        };
-
-        match update.await {
-            Ok(()) => {
-                info!(
-                    previous = ?active.pids,
-                    current = ?pids,
-                    "Selected apps changed, updated system audio filter"
-                );
-                active.pids = pids;
-            }
-            Err(error) => warn!(%error, "Failed to update the system audio app filter"),
+    fn new(params: AppAudioParams) -> Self {
+        Self {
+            params: Arc::new(params),
+            state: Arc::default(),
         }
     }
 
-    async fn restart(&self, cancel: &CancellationToken) -> anyhow::Result<()> {
-        let content = app_audio::shareable_content_with_offscreen_apps()
-            .await
-            .map_err(|err| anyhow!("Failed to list apps for system audio restart: {err}"))?;
+    async fn shareable_content() -> Option<arc::R<sc::ShareableContent>> {
+        match tokio::time::timeout(
+            APP_AUDIO_TIMEOUT,
+            app_audio::shareable_content_with_offscreen_apps(),
+        )
+        .await
+        {
+            Ok(Ok(content)) => Some(content),
+            Ok(Err(error)) => {
+                warn!(%error, "Could not list apps for system audio");
+                None
+            }
+            Err(_) => {
+                warn!("Listing apps for system audio timed out");
+                None
+            }
+        }
+    }
 
-        let mut active = self.active.lock().await;
-        if cancel.is_cancelled() {
+    async fn sync(
+        &self,
+        content: arc::R<sc::ShareableContent>,
+        rebuild: bool,
+    ) -> anyhow::Result<()> {
+        let mut state = self.state.lock().await;
+        if state.disabled {
             return Ok(());
         }
 
-        let rebuilt = self.params.build_capturer(&content)?;
-        rebuilt.capturer.start().await?;
-        *active = rebuilt;
+        let plan = self.params.plan(&content, &state, rebuild)?;
+        drop(content);
+
+        match plan {
+            AppAudioPlan::Keep => {}
+            AppAudioPlan::Stop => {
+                if let Some(active) = state.active.take() {
+                    info!(previous = ?active.pids, "Selected apps closed, pausing app audio");
+                    if let Err(error) = active.capturer.stop().await {
+                        warn!(%error, "Failed to stop the app audio stream");
+                    }
+                }
+            }
+            AppAudioPlan::Start { capturer, pids } => {
+                if state.started {
+                    tokio::time::timeout(APP_AUDIO_TIMEOUT, capturer.start())
+                        .await
+                        .map_err(|_| anyhow!("Starting the app audio stream timed out"))??;
+                }
+                info!(
+                    selected = ?self.params.bundle_ids,
+                    ?pids,
+                    "Capturing system audio from selected apps"
+                );
+                state.active = Some(ActiveAppAudio { capturer, pids });
+            }
+            AppAudioPlan::Update { update, pids } => {
+                match tokio::time::timeout(APP_AUDIO_TIMEOUT, update).await {
+                    Ok(Ok(())) => {
+                        if let Some(active) = state.active.as_mut() {
+                            info!(
+                                previous = ?active.pids,
+                                current = ?pids,
+                                "Selected apps changed, updated system audio filter"
+                            );
+                            active.pids = pids;
+                        }
+                    }
+                    Ok(Err(error)) => {
+                        warn!(%error, "Failed to update the system audio app filter")
+                    }
+                    Err(_) => warn!("Updating the system audio app filter timed out"),
+                }
+            }
+        }
+
         Ok(())
+    }
+
+    async fn refresh(self, cancel: CancellationToken) -> anyhow::Result<()> {
+        loop {
+            if let Some(content) = Self::shareable_content().await
+                && let Err(error) = self.sync(content, false).await
+            {
+                warn!(%error, "Could not follow the selected apps for system audio");
+            }
+
+            tokio::select! {
+                _ = cancel.cancelled() => return Ok(()),
+                _ = tokio::time::sleep(APP_AUDIO_REFRESH_INTERVAL) => {}
+            }
+        }
+    }
+
+    async fn start(&self) {
+        let mut state = self.state.lock().await;
+        state.started = true;
+        if let Some(active) = &state.active
+            && let Err(error) = active.capturer.start().await
+        {
+            warn!(%error, "Failed to start the app audio stream, recording silence");
+            state.active = None;
+        }
+    }
+
+    async fn stop(&self) {
+        let mut state = self.state.lock().await;
+        state.started = false;
+        state.disabled = true;
+        if let Some(active) = state.active.take()
+            && let Err(error) = active.capturer.stop().await
+        {
+            warn!(%error, "Failed to stop the app audio stream");
+        }
+    }
+
+    /// App audio is optional: when it can't be kept running, the track records
+    /// silence instead of failing the recording.
+    async fn disable(&self) {
+        let mut state = self.state.lock().await;
+        state.disabled = true;
+        if let Some(active) = state.active.take()
+            && let Err(error) = active.capturer.stop().await
+        {
+            debug!(%error, "Failed to stop the app audio stream");
+        }
+    }
+
+    async fn restart(&self, cancel: &CancellationToken, restart_count: &mut u32) -> bool {
+        while *restart_count < MAX_CAPTURE_RESTARTS {
+            *restart_count += 1;
+            warn!(
+                restart_count = *restart_count,
+                max_restarts = MAX_CAPTURE_RESTARTS,
+                "App audio stream stopped by system, attempting restart"
+            );
+
+            tokio::select! {
+                _ = cancel.cancelled() => return true,
+                _ = tokio::time::sleep(RESTART_DELAY) => {}
+            }
+
+            let Some(content) = Self::shareable_content().await else {
+                continue;
+            };
+            match self.sync(content, true).await {
+                Ok(()) => {
+                    info!(restart_count = *restart_count, "App audio stream restarted");
+                    return true;
+                }
+                Err(error) => warn!(%error, "Failed to restart the app audio stream"),
+            }
+        }
+
+        false
     }
 
     async fn monitor(
@@ -1532,8 +1654,6 @@ impl AppAudio {
     ) -> anyhow::Result<()> {
         let mut screen_errors_open = true;
         let mut restart_count = 0u32;
-        let mut refresh = tokio::time::interval(APP_AUDIO_REFRESH_INTERVAL);
-        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -1556,7 +1676,9 @@ impl AppAudio {
                         Err(broadcast::error::RecvError::Closed) => break,
                     };
 
-                    self.active.lock().await.capturer.mark_stopped();
+                    if let Some(active) = &self.state.lock().await.active {
+                        active.capturer.mark_stopped();
+                    }
 
                     if is_user_stop_error(err.as_ref()) {
                         info!("App audio stream stopped from macOS sharing controls");
@@ -1566,28 +1688,16 @@ impl AppAudio {
                     }
 
                     if !is_system_stop_error(err.as_ref()) {
-                        return Err(anyhow!("{err}"));
+                        error!(%err, "App audio stream failed, recording silence");
+                        self.disable().await;
+                        continue;
                     }
 
-                    if restart_count >= MAX_CAPTURE_RESTARTS {
-                        return Err(anyhow!(system_stop_message()));
+                    if !self.restart(&cancel, &mut restart_count).await {
+                        error!("App audio stream could not be restarted, recording silence");
+                        self.disable().await;
                     }
-                    restart_count += 1;
-                    warn!(
-                        restart_count,
-                        max_restarts = MAX_CAPTURE_RESTARTS,
-                        "App audio stream stopped by system, attempting restart"
-                    );
-
-                    tokio::select! {
-                        _ = cancel.cancelled() => break,
-                        _ = tokio::time::sleep(RESTART_DELAY) => {}
-                    }
-
-                    self.restart(&cancel).await?;
-                    info!(restart_count, "App audio stream restarted");
                 }
-                _ = refresh.tick() => self.refresh().await,
             }
         }
 
@@ -1597,7 +1707,7 @@ impl AppAudio {
 
 enum SystemAudioControl {
     Screen(Capturer),
-    Apps(Arc<tokio::sync::Mutex<ActiveAppAudio>>),
+    Apps(AppAudio),
 }
 
 pub struct SystemAudioSource {
@@ -1694,10 +1804,13 @@ impl output_pipeline::AudioSource for SystemAudioSource {
                 SystemAudioControl::Screen(capturer)
             }
             SystemAudioCapturer::Apps(app_audio, app_error_rx) => {
-                let active = app_audio.active.clone();
+                ctx.tasks().spawn(
+                    "system-audio-apps",
+                    app_audio.clone().refresh(cancel_token.child_token()),
+                );
                 ctx.tasks().spawn(
                     "system-audio",
-                    app_audio.monitor(
+                    app_audio.clone().monitor(
                         app_error_rx,
                         screen_error_rx,
                         cancel_token.child_token(),
@@ -1705,7 +1818,7 @@ impl output_pipeline::AudioSource for SystemAudioSource {
                         stop_signal,
                     ),
                 );
-                SystemAudioControl::Apps(active)
+                SystemAudioControl::Apps(app_audio)
             }
         };
 
@@ -1759,7 +1872,10 @@ impl output_pipeline::AudioSource for SystemAudioSource {
     async fn start(&mut self) -> anyhow::Result<()> {
         match &self.capturer {
             SystemAudioControl::Screen(capturer) => capturer.start().await,
-            SystemAudioControl::Apps(active) => active.lock().await.capturer.start().await,
+            SystemAudioControl::Apps(app_audio) => {
+                app_audio.start().await;
+                Ok(())
+            }
         }
     }
 
@@ -1767,7 +1883,10 @@ impl output_pipeline::AudioSource for SystemAudioSource {
         self.cancel_token.cancel();
         match &self.capturer {
             SystemAudioControl::Screen(capturer) => capturer.stop().await,
-            SystemAudioControl::Apps(active) => active.lock().await.capturer.stop().await,
+            SystemAudioControl::Apps(app_audio) => {
+                app_audio.stop().await;
+                Ok(())
+            }
         }
     }
 

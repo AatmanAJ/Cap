@@ -2254,7 +2254,6 @@ impl ActorBuilder {
         self
     }
 
-    /// Record system audio from these bundle ids only. Empty records every app.
     #[cfg(target_os = "macos")]
     pub fn with_system_audio_apps(mut self, system_audio_apps: Vec<String>) -> Self {
         self.system_audio_apps = system_audio_apps;

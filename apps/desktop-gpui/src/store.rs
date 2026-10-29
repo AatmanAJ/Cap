@@ -1260,16 +1260,12 @@ pub fn set_recording_system_audio(enabled: bool) -> bool {
     set_store_setting(RECORDING_SETTINGS, "systemAudio", Value::Bool(enabled))
 }
 
-/// An app picked to record system audio from, by bundle id. The name is kept
-/// so the choice still reads right while the app is not running.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SystemAudioApp {
     pub id: String,
     pub name: String,
 }
 
-/// `RecordingSettingsStore.systemAudioApps`. Empty (or absent) records every
-/// app; malformed and repeated entries are dropped.
 pub fn recording_system_audio_apps() -> Vec<SystemAudioApp> {
     let Some(Value::Array(entries)) = store_section(RECORDING_SETTINGS).remove("systemAudioApps")
     else {

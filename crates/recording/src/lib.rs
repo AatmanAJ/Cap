@@ -101,7 +101,6 @@ pub struct RecordingBaseInputs {
     pub shareable_content: Option<SendableShareableContent>,
     #[cfg(target_os = "macos")]
     pub excluded_windows: Vec<scap_targets::WindowId>,
-    /// Bundle ids whose audio system audio records. Empty records every app.
     #[cfg(target_os = "macos")]
     pub system_audio_apps: Vec<String>,
     /// Present when the pipeline is primed ahead of the start cue; capture is

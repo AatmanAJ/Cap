@@ -125,6 +125,10 @@ fn main_surfaces_match_the_literals_they_replaced() {
             tr::main::device::system_audio_apps::not_running(),
             "Not running",
         ),
+        (
+            tr::main::device::system_audio_apps::web_audio_note(),
+            "Sound from web pages in Safari, and in other apps that show web pages the way Safari does, isn't recorded when you pick apps.",
+        ),
         (tr::main::device::pill::on(), "On"),
         (tr::main::device::pill::off(), "Off"),
         (tr::main::device::pill::not_connected(), "Not connected"),

@@ -1007,6 +1007,7 @@ description = "Ton aus allen Apps aufnehmen oder nur aus den Apps, die Sie ausw�
 no_apps = "Keine Apps gefunden"
 no_matching_apps = "Keine passenden Apps"
 not_running = "Nicht geöffnet"
+web_audio_note = "Ton von Webseiten in Safari und in anderen Apps, die Webseiten wie Safari anzeigen, wird nicht aufgenommen, wenn Sie Apps auswählen."
 
 [main.error]
 camera_only_needs_camera = "Für reine Kameraaufnahmen muss eine Kamera ausgewählt sein."
