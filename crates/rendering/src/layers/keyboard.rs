@@ -412,15 +412,21 @@ impl KeyboardLayer {
         );
 
         if keycap_style {
-            let press_time = latest_press_time(active.segment, current_time);
+            let press_seconds = latest_press_time(active.segment, current_time)
+                .map_or(f64::INFINITY, |press_time| current_time - press_time);
+            let appear_seconds = if active.segment.keys.is_empty() {
+                f64::INFINITY
+            } else {
+                current_time - appear_start
+            };
             self.prepare_keycaps(
                 constants,
                 KeycapFrame {
                     raw_text: &raw_text,
                     uppercase: should_uppercase,
                     repeat_count,
-                    appear_seconds: current_time - appear_start,
-                    press_seconds: current_time - press_time,
+                    appear_seconds,
+                    press_seconds,
                     opacity: fade_opacity.clamp(0.0, 1.0),
                     text_color,
                     face_color: background_color_rgb,
@@ -857,12 +863,12 @@ fn repeat_label(count: usize) -> String {
 fn repeat_chain(segments: &[cap_project::KeyboardTrackSegment], index: usize) -> (usize, f64) {
     let mut current = &segments[index];
     let mut count = 1;
-    if current.keys.len() > 1 {
+    if current.keys.len() != 1 {
         return (count, current.start);
     }
     for previous in segments[..index].iter().rev() {
         if previous.display_text != current.display_text
-            || previous.keys.len() > 1
+            || previous.keys.len() != 1
             || previous.start > current.start
             || previous.end < current.start
         {
@@ -874,16 +880,18 @@ fn repeat_chain(segments: &[cap_project::KeyboardTrackSegment], index: usize) ->
     (count, current.start)
 }
 
-fn latest_press_time(segment: &cap_project::KeyboardTrackSegment, current_time: f64) -> f64 {
+fn latest_press_time(
+    segment: &cap_project::KeyboardTrackSegment,
+    current_time: f64,
+) -> Option<f64> {
     let elapsed_ms = (current_time - segment.start) * 1000.0;
     segment
         .keys
         .iter()
         .map(|key| key.time_offset)
         .filter(|offset| *offset <= elapsed_ms)
-        .fold(0.0, f64::max)
-        / 1000.0
-        + segment.start
+        .reduce(f64::max)
+        .map(|offset| segment.start + offset / 1000.0)
 }
 
 fn overlay_pipeline(
@@ -1066,8 +1074,8 @@ fn calculate_keyboard_bounce(current_time: f64, start: f64, end: f64, fade_durat
 #[cfg(test)]
 mod tests {
     use super::{
-        KeyboardPosition, build_visible_text, find_active_keyboard_segment, resolve_background_top,
-        resolve_keyboard_position,
+        KeyboardPosition, build_visible_text, find_active_keyboard_segment, latest_press_time,
+        repeat_chain, resolve_background_top, resolve_keyboard_position,
     };
     use crate::layers::{CaptionOverlayLayout, CaptionPosition};
 
@@ -1111,6 +1119,49 @@ mod tests {
         };
 
         assert_eq!(build_visible_text(&segment, 1.0), "⌘T");
+    }
+
+    fn single_key(id: &str, start: f64, end: f64, text: &str) -> cap_project::KeyboardTrackSegment {
+        serde_json::from_value(serde_json::json!({
+            "id": id, "start": start, "end": end, "displayText": text,
+            "keys": [{"key": "z", "timeOffset": 0.0}]
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repeats_chain_only_while_the_previous_press_is_on_screen() {
+        let mut segments = vec![
+            single_key("a", 1.0, 1.8, "⌘Z"),
+            single_key("b", 1.3, 2.1, "⌘Z"),
+            single_key("c", 1.6, 2.4, "⌘Z"),
+            single_key("d", 3.0, 3.8, "⌘Z"),
+            single_key("e", 3.2, 4.0, "⌘C"),
+        ];
+        assert_eq!(repeat_chain(&segments, 0), (1, 1.0));
+        assert_eq!(repeat_chain(&segments, 2), (3, 1.0));
+        assert_eq!(repeat_chain(&segments, 3), (1, 3.0));
+        assert_eq!(repeat_chain(&segments, 4), (1, 3.2));
+
+        let (head, tail) = segments[2].split_at(2.0).unwrap();
+        assert!(tail.keys.is_empty());
+        segments.splice(2..3, [head, tail]);
+        assert_eq!(repeat_chain(&segments, 2), (3, 1.0));
+        assert_eq!(repeat_chain(&segments, 3), (1, 2.0));
+    }
+
+    #[test]
+    fn press_time_follows_the_latest_revealed_key() {
+        let mut segment = single_key("a", 2.0, 3.0, "ab");
+        segment.keys.push(cap_project::KeyPressDisplay {
+            key: "b".to_string(),
+            time_offset: 300.0,
+        });
+        assert_eq!(latest_press_time(&segment, 2.1), Some(2.0));
+        assert_eq!(latest_press_time(&segment, 2.5), Some(2.3));
+        assert_eq!(latest_press_time(&segment, 1.9), None);
+        segment.keys.clear();
+        assert_eq!(latest_press_time(&segment, 2.5), None);
     }
 
     #[test]
