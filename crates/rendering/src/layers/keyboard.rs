@@ -1,5 +1,5 @@
 use bytemuck::{Pod, Zeroable};
-use cap_project::XY;
+use cap_project::{KeyboardStyle, XY, keycap_labels};
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
@@ -9,6 +9,13 @@ use wgpu::{Device, Queue, include_wgsl, util::DeviceExt};
 
 use super::captions::{CaptionOverlayLayout, CaptionPosition};
 use crate::{DecodedSegmentFrames, ProjectUniforms, RenderVideoConstants, parse_color_component};
+
+mod keycaps;
+
+use keycaps::{
+    KeycapInstance, KeycapMetrics, KeycapUniforms, MAX_KEYCAPS, appear_scale, keycap_colors,
+    layout_keycaps, press_amount, scale_rect,
+};
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable, Debug)]
@@ -170,6 +177,11 @@ pub struct KeyboardLayer {
     background_bind_group: wgpu::BindGroup,
     background_uniform_buffer: wgpu::Buffer,
     background_scissor: Option<[u32; 4]>,
+    keycap_pipeline: wgpu::RenderPipeline,
+    keycap_bind_group: wgpu::BindGroup,
+    keycap_uniform_buffer: wgpu::Buffer,
+    keycap_buffers: Vec<(ShapedKeyboardText, Buffer)>,
+    draws_keycaps: bool,
     output_size: (u32, u32),
     has_content: bool,
 }
@@ -208,68 +220,24 @@ impl KeyboardLayer {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        let background_bind_group_layout =
-            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("Keyboard Background Bind Group Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                }],
-            });
+        let (background_pipeline, background_bind_group) = overlay_pipeline(
+            device,
+            "Keyboard Background",
+            &device.create_shader_module(include_wgsl!("../shaders/caption_bg.wgsl")),
+            &background_uniform_buffer,
+        );
 
-        let background_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Keyboard Background Bind Group"),
-            layout: &background_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: background_uniform_buffer.as_entire_binding(),
-            }],
+        let keycap_uniform_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Keyboard Keycap Uniform Buffer"),
+            contents: bytemuck::bytes_of(&KeycapUniforms::default()),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
-        let background_shader =
-            device.create_shader_module(include_wgsl!("../shaders/caption_bg.wgsl"));
-
-        let background_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Keyboard Background Pipeline Layout"),
-                bind_group_layouts: &[&background_bind_group_layout],
-                push_constant_ranges: &[],
-            });
-
-        let background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Keyboard Background Pipeline"),
-            layout: Some(&background_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &background_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &background_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: wgpu::TextureFormat::Rgba8Unorm,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            multiview: None,
-            cache: None,
-        });
+        let (keycap_pipeline, keycap_bind_group) = overlay_pipeline(
+            device,
+            "Keyboard Keycap",
+            &device.create_shader_module(include_wgsl!("../shaders/keycap.wgsl")),
+            &keycap_uniform_buffer,
+        );
 
         Self {
             font_system,
@@ -283,6 +251,11 @@ impl KeyboardLayer {
             background_bind_group,
             background_uniform_buffer,
             background_scissor: None,
+            keycap_pipeline,
+            keycap_bind_group,
+            keycap_uniform_buffer,
+            keycap_buffers: Vec::new(),
+            draws_keycaps: false,
             output_size: (0, 0),
             has_content: false,
         }
@@ -298,7 +271,9 @@ impl KeyboardLayer {
     ) {
         self.has_content = false;
         self.background_scissor = None;
+        self.draws_keycaps = false;
         self.output_size = (output_size.x, output_size.y);
+        self.text_atlas.trim();
 
         let Some(keyboard_data) = &uniforms.project.keyboard else {
             return;
@@ -330,6 +305,13 @@ impl KeyboardLayer {
             return;
         };
 
+        let keycap_style = settings.style == KeyboardStyle::Keycaps;
+        let (repeat_count, appear_start) = if keycap_style || settings.shortcuts_only {
+            repeat_chain(&timeline.keyboard_segments, active.index)
+        } else {
+            (1, active.segment.start)
+        };
+
         let segment_fade = active
             .segment
             .fade_duration_override
@@ -345,29 +327,25 @@ impl KeyboardLayer {
             .segment
             .uppercase_override
             .unwrap_or(settings.uppercase);
-        let visible_text = if should_uppercase {
+        let mut visible_text = if should_uppercase {
             raw_text.to_uppercase()
         } else {
-            raw_text
+            raw_text.clone()
         };
+        if repeat_count > 1 {
+            visible_text.push_str(&format!(" {}", repeat_label(repeat_count)));
+        }
 
-        let fade_opacity = calculate_fade(
-            current_time,
-            active.segment.start,
-            active.segment.end,
-            segment_fade,
-        ) * uniforms.takeover_overlay_fade();
+        let fade_opacity =
+            calculate_fade(current_time, appear_start, active.segment.end, segment_fade)
+                * uniforms.takeover_overlay_fade();
 
         if fade_opacity <= 0.0 {
             return;
         }
 
-        let bounce_offset = calculate_keyboard_bounce(
-            current_time,
-            active.segment.start,
-            active.segment.end,
-            segment_fade,
-        );
+        let bounce_offset =
+            calculate_keyboard_bounce(current_time, appear_start, active.segment.end, segment_fade);
 
         let (width, height) = (output_size.x, output_size.y);
         let device = &constants.device;
@@ -433,6 +411,32 @@ impl KeyboardLayer {
             (text_alpha * 255.0) as u8,
         );
 
+        if keycap_style {
+            let press_time = latest_press_time(active.segment, current_time);
+            self.prepare_keycaps(
+                constants,
+                KeycapFrame {
+                    raw_text: &raw_text,
+                    uppercase: should_uppercase,
+                    repeat_count,
+                    appear_seconds: current_time - appear_start,
+                    press_seconds: current_time - press_time,
+                    opacity: fade_opacity.clamp(0.0, 1.0),
+                    text_color,
+                    face_color: background_color_rgb,
+                    face_alpha: (settings.background_opacity as f32 / 100.0).clamp(0.0, 1.0),
+                    font_size,
+                    family: font_family,
+                    weight,
+                    output_size: [width, height],
+                    margin,
+                    position,
+                    caption_layout,
+                },
+            );
+            return;
+        }
+
         let shaped = ShapedKeyboardText {
             text: visible_text,
             font_size: font_size.to_bits(),
@@ -474,23 +478,11 @@ impl KeyboardLayer {
         let box_width = (text_width + padding * 2.0).min(available_width).max(1.0);
         let box_height = (text_height + padding * 2.0).min(height as f32).max(1.0);
 
-        let resolved_position = resolve_keyboard_position(position, caption_layout);
-
-        let background_left = match resolved_position {
-            KeyboardPosition::TopLeft | KeyboardPosition::BottomLeft => margin,
-            KeyboardPosition::TopRight | KeyboardPosition::BottomRight => {
-                (width as f32 - margin - box_width).max(0.0)
-            }
-            _ => ((width as f32 - box_width) / 2.0).max(0.0),
-        };
-
-        let center_y = height as f32 * resolved_position.y_factor();
-        let max_background_top = (height as f32 - box_height).max(0.0);
-        let base_background_top = (center_y - box_height / 2.0).clamp(0.0, max_background_top);
-        let background_top = resolve_background_top(
-            (base_background_top + bounce_offset as f32).clamp(0.0, max_background_top),
-            box_height,
-            height as f32,
+        let [background_left, background_top] = place_overlay(
+            [box_width, box_height],
+            [width as f32, height as f32],
+            margin,
+            bounce_offset as f32,
             position,
             caption_layout,
         );
@@ -594,8 +586,13 @@ impl KeyboardLayer {
 
         if let Some([x, y, width, height]) = self.background_scissor {
             pass.set_scissor_rect(x, y, width, height);
-            pass.set_pipeline(&self.background_pipeline);
-            pass.set_bind_group(0, &self.background_bind_group, &[]);
+            if self.draws_keycaps {
+                pass.set_pipeline(&self.keycap_pipeline);
+                pass.set_bind_group(0, &self.keycap_bind_group, &[]);
+            } else {
+                pass.set_pipeline(&self.background_pipeline);
+                pass.set_bind_group(0, &self.background_bind_group, &[]);
+            }
             pass.draw(0..6, 0..1);
             pass.set_scissor_rect(x, y, width, height);
         } else if self.output_size.0 > 0 && self.output_size.1 > 0 {
@@ -616,8 +613,349 @@ impl KeyboardLayer {
     }
 }
 
+struct KeycapFrame<'a> {
+    raw_text: &'a str,
+    uppercase: bool,
+    repeat_count: usize,
+    appear_seconds: f64,
+    press_seconds: f64,
+    opacity: f32,
+    text_color: [f32; 3],
+    face_color: [f32; 3],
+    face_alpha: f32,
+    font_size: f32,
+    family: Family<'static>,
+    weight: Weight,
+    output_size: [u32; 2],
+    margin: f32,
+    position: KeyboardPosition,
+    caption_layout: Option<CaptionOverlayLayout>,
+}
+
+impl KeyboardLayer {
+    fn prepare_keycaps(&mut self, constants: &RenderVideoConstants, frame: KeycapFrame<'_>) {
+        let [width, height] = frame.output_size;
+        let metrics = KeycapMetrics::new(frame.font_size);
+        let labels = keycap_labels(frame.raw_text);
+        let mut texts: Vec<(String, f32)> = labels
+            .iter()
+            .map(|label| {
+                let text = if frame.uppercase && !label.modifier {
+                    label.text.to_uppercase()
+                } else {
+                    label.text.to_string()
+                };
+                let size = if labels.len() > 1 && label.text.chars().count() > 1 {
+                    metrics.label_size * 0.78
+                } else {
+                    metrics.label_size
+                };
+                (text, size)
+            })
+            .collect();
+        if frame.repeat_count > 1 {
+            texts.push((repeat_label(frame.repeat_count), metrics.label_size * 0.78));
+        }
+        texts.truncate(MAX_KEYCAPS);
+        if texts.is_empty() {
+            return;
+        }
+
+        self.keycap_buffers.truncate(texts.len());
+        for (index, (text, size)) in texts.into_iter().enumerate() {
+            let shaped = ShapedKeyboardText {
+                text,
+                font_size: size.to_bits(),
+                wrap_width: 0,
+                family: frame.family,
+                weight: frame.weight,
+            };
+            if self
+                .keycap_buffers
+                .get(index)
+                .is_some_and(|(cached, _)| *cached == shaped)
+            {
+                continue;
+            }
+            let mut buffer = Buffer::new(&mut self.font_system, Metrics::new(size, size * 1.2));
+            buffer.set_size(&mut self.font_system, None, None);
+            buffer.set_text(
+                &mut self.font_system,
+                &shaped.text,
+                &Attrs::new().family(frame.family).weight(frame.weight),
+                Shaping::Advanced,
+            );
+            if index < self.keycap_buffers.len() {
+                self.keycap_buffers[index] = (shaped, buffer);
+            } else {
+                self.keycap_buffers.push((shaped, buffer));
+            }
+        }
+
+        let text_layouts: Vec<(f32, f32)> = self
+            .keycap_buffers
+            .iter()
+            .map(|(_, buffer)| {
+                glyphon::cosmic_text::LayoutRunIter::new(buffer)
+                    .next()
+                    .map_or((0.0, 0.0), |run| (run.line_w, run.line_y))
+            })
+            .collect();
+        let widths: Vec<f32> = text_layouts.iter().map(|(width, _)| *width).collect();
+        let (rects, group_width) = layout_keycaps(&widths, metrics);
+
+        let available_width = (width as f32 - frame.margin * 2.0).max(1.0);
+        let fit = (available_width / group_width.max(1.0)).min(1.0);
+        let scale = appear_scale(frame.appear_seconds) * fit;
+        let box_size = [group_width * fit, metrics.height() * fit];
+        let [left, top] = place_overlay(
+            box_size,
+            [width as f32, height as f32],
+            frame.margin,
+            0.0,
+            frame.position,
+            frame.caption_layout,
+        );
+        let origin = [left + box_size[0] / 2.0, top + box_size[1] / 2.0];
+        let group_origin = [
+            origin[0] - group_width / 2.0,
+            origin[1] - metrics.height() / 2.0,
+        ];
+
+        let press = press_amount(frame.press_seconds) * metrics.depth * 0.8 * scale;
+        let (face_color, edge_color) = keycap_colors(frame.face_color, frame.face_alpha);
+        let mut keycap_uniforms = KeycapUniforms {
+            face_color,
+            edge_color,
+            globals: [
+                frame.opacity,
+                0.35 * frame.face_alpha,
+                metrics.shadow_blur * scale,
+                rects.len() as f32,
+            ],
+            ..Default::default()
+        };
+        let text_color = Color::rgba(
+            (frame.text_color[0] * 255.0) as u8,
+            (frame.text_color[1] * 255.0) as u8,
+            (frame.text_color[2] * 255.0) as u8,
+            (frame.opacity * 255.0) as u8,
+        );
+
+        let mut bounds = [f32::MAX, f32::MAX, f32::MIN, f32::MIN];
+        let mut text_areas = Vec::with_capacity(rects.len());
+        for (index, rect) in rects.iter().enumerate() {
+            let placed = scale_rect(
+                [
+                    group_origin[0] + rect[0],
+                    group_origin[1] + rect[1],
+                    rect[2],
+                    rect[3],
+                ],
+                origin,
+                scale,
+            );
+            keycap_uniforms.keycaps[index] = KeycapInstance {
+                rect: placed,
+                params: [press, metrics.depth * scale, metrics.radius * scale, 0.0],
+            };
+            let (text_width, baseline) = text_layouts[index];
+            let label_size = f32::from_bits(self.keycap_buffers[index].0.font_size);
+            let text_left = placed[0] + (placed[2] - text_width * scale) / 2.0;
+            let text_top =
+                placed[1] + press + placed[3] / 2.0 + label_size * 0.36 * scale - baseline * scale;
+            text_areas.push(TextArea {
+                buffer: &self.keycap_buffers[index].1,
+                left: text_left,
+                top: text_top,
+                scale,
+                bounds: TextBounds {
+                    left: placed[0].floor() as i32,
+                    top: (placed[1] + press).floor() as i32,
+                    right: (placed[0] + placed[2]).ceil() as i32,
+                    bottom: (placed[1] + press + placed[3]).ceil() as i32,
+                },
+                default_color: text_color,
+                custom_glyphs: &[],
+            });
+            let shadow_reach = metrics.depth * scale + metrics.shadow_blur * scale * 1.5;
+            bounds[0] = bounds[0].min(placed[0] - shadow_reach);
+            bounds[1] = bounds[1].min(placed[1] - shadow_reach);
+            bounds[2] = bounds[2].max(placed[0] + placed[2] + shadow_reach);
+            bounds[3] = bounds[3].max(placed[1] + placed[3] + shadow_reach * 2.0);
+        }
+
+        let queue = &constants.queue;
+        self.viewport.update(queue, Resolution { width, height });
+        if let Err(error) = self.text_renderer.prepare(
+            &constants.device,
+            queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        ) {
+            warn!("Error preparing keyboard keycap text: {error:?}");
+        }
+        queue.write_buffer(
+            &self.keycap_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&keycap_uniforms),
+        );
+
+        let left = bounds[0].max(0.0).floor() as u32;
+        let top = bounds[1].max(0.0).floor() as u32;
+        let right = (bounds[2].ceil().max(0.0) as u32).min(width);
+        let bottom = (bounds[3].ceil().max(0.0) as u32).min(height);
+        if right <= left || bottom <= top {
+            return;
+        }
+        self.background_scissor = Some([left, top, right - left, bottom - top]);
+        self.draws_keycaps = true;
+        self.has_content = true;
+    }
+}
+
+fn place_overlay(
+    box_size: [f32; 2],
+    output_size: [f32; 2],
+    margin: f32,
+    vertical_offset: f32,
+    position: KeyboardPosition,
+    caption_layout: Option<CaptionOverlayLayout>,
+) -> [f32; 2] {
+    let [box_width, box_height] = box_size;
+    let [width, height] = output_size;
+    let resolved_position = resolve_keyboard_position(position, caption_layout);
+
+    let left = match resolved_position {
+        KeyboardPosition::TopLeft | KeyboardPosition::BottomLeft => margin,
+        KeyboardPosition::TopRight | KeyboardPosition::BottomRight => {
+            (width - margin - box_width).max(0.0)
+        }
+        _ => ((width - box_width) / 2.0).max(0.0),
+    };
+
+    let center_y = height * resolved_position.y_factor();
+    let max_top = (height - box_height).max(0.0);
+    let base_top = (center_y - box_height / 2.0).clamp(0.0, max_top);
+    let top = resolve_background_top(
+        (base_top + vertical_offset).clamp(0.0, max_top),
+        box_height,
+        height,
+        position,
+        caption_layout,
+    );
+    [left, top]
+}
+
+fn repeat_label(count: usize) -> String {
+    format!("×{count}")
+}
+
+fn repeat_chain(segments: &[cap_project::KeyboardTrackSegment], index: usize) -> (usize, f64) {
+    let mut current = &segments[index];
+    let mut count = 1;
+    if current.keys.len() > 1 {
+        return (count, current.start);
+    }
+    for previous in segments[..index].iter().rev() {
+        if previous.display_text != current.display_text
+            || previous.keys.len() > 1
+            || previous.start > current.start
+            || previous.end < current.start
+        {
+            break;
+        }
+        count += 1;
+        current = previous;
+    }
+    (count, current.start)
+}
+
+fn latest_press_time(segment: &cap_project::KeyboardTrackSegment, current_time: f64) -> f64 {
+    let elapsed_ms = (current_time - segment.start) * 1000.0;
+    segment
+        .keys
+        .iter()
+        .map(|key| key.time_offset)
+        .filter(|offset| *offset <= elapsed_ms)
+        .fold(0.0, f64::max)
+        / 1000.0
+        + segment.start
+}
+
+fn overlay_pipeline(
+    device: &Device,
+    label: &str,
+    shader: &wgpu::ShaderModule,
+    uniform_buffer: &wgpu::Buffer,
+) -> (wgpu::RenderPipeline, wgpu::BindGroup) {
+    let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some(&format!("{label} Bind Group Layout")),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some(&format!("{label} Bind Group")),
+        layout: &bind_group_layout,
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some(&format!("{label} Pipeline Layout")),
+        bind_group_layouts: &[&bind_group_layout],
+        push_constant_ranges: &[],
+    });
+
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some(&format!("{label} Pipeline")),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                write_mask: wgpu::ColorWrites::ALL,
+            })],
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleList,
+            ..Default::default()
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+        cache: None,
+    });
+
+    (pipeline, bind_group)
+}
+
 struct ActiveKeyboardSegment<'a> {
     segment: &'a cap_project::KeyboardTrackSegment,
+    index: usize,
 }
 
 fn find_active_keyboard_segment<'a>(
@@ -627,20 +965,22 @@ fn find_active_keyboard_segment<'a>(
 ) -> Option<ActiveKeyboardSegment<'a>> {
     segments
         .iter()
-        .filter(|segment| time >= segment.start && time < segment.end)
-        .max_by(|a, b| a.start.total_cmp(&b.start))
+        .enumerate()
+        .filter(|(_, segment)| time >= segment.start && time < segment.end)
+        .max_by(|(_, a), (_, b)| a.start.total_cmp(&b.start))
         .or_else(|| {
             segments
                 .iter()
-                .filter(|segment| {
+                .enumerate()
+                .filter(|(_, segment)| {
                     let fade = segment
                         .fade_duration_override
                         .unwrap_or(default_fade_duration) as f64;
                     time >= segment.end && time < segment.end + fade
                 })
-                .max_by(|a, b| a.end.total_cmp(&b.end))
+                .max_by(|(_, a), (_, b)| a.end.total_cmp(&b.end))
         })
-        .map(|segment| ActiveKeyboardSegment { segment })
+        .map(|(index, segment)| ActiveKeyboardSegment { segment, index })
 }
 
 fn build_visible_text(segment: &cap_project::KeyboardTrackSegment, current_time: f64) -> String {
@@ -1119,6 +1459,121 @@ mod gpu_tests {
         }
     }
 
+    fn shortcut_segment(id: &str, start: f64, text: &str) -> KeyboardTrackSegment {
+        KeyboardTrackSegment {
+            id: id.to_string(),
+            start,
+            end: start + 0.8,
+            display_text: text.to_string(),
+            keys: vec![KeyPressDisplay {
+                key: "t".to_string(),
+                time_offset: 0.0,
+            }],
+            fade_duration_override: None,
+            position_override: None,
+            color_override: None,
+            background_color_override: None,
+            font_size_override: None,
+            uppercase_override: None,
+        }
+    }
+
+    fn set_style(uniforms: &mut ProjectUniforms, edit: impl FnOnce(&mut KeyboardSettings)) {
+        edit(
+            &mut std::sync::Arc::make_mut(&mut uniforms.project)
+                .keyboard
+                .as_mut()
+                .unwrap()
+                .settings,
+        );
+    }
+
+    #[test]
+    #[ignore = "requires a working wgpu adapter"]
+    fn keycap_frames_render_like_a_fresh_layer_and_animate() {
+        let size = XY::new(512, 288);
+        let constants = constants(size);
+        let segments = [
+            shortcut_segment("a", 0.2, "⌘⇧T"),
+            shortcut_segment("b", 0.6, "⌘⇧T"),
+            typed_segment("typed", 1.8, "git push", 60.0),
+        ];
+        let mut uniforms = uniforms(&constants, &segments, size);
+        set_style(&mut uniforms, |settings| {
+            settings.style = cap_project::KeyboardStyle::Keycaps
+        });
+        let frames = frames(size);
+        let mut reused = KeyboardLayer::new(&constants.device, &constants.queue);
+        let mut drawn = Vec::new();
+        for frame in 0..((segments[2].end + 0.2) * FPS as f64) as u32 {
+            uniforms.frame_number = frame;
+            reused.prepare(&uniforms, &frames, size, &constants, None);
+            let mut fresh = KeyboardLayer::new(&constants.device, &constants.queue);
+            fresh.prepare(&uniforms, &frames, size, &constants, None);
+            assert_eq!(reused.has_content(), fresh.has_content(), "frame {frame}");
+            let pixels = render_pixels(&constants, &reused, size);
+            assert_eq!(
+                pixels,
+                render_pixels(&constants, &fresh, size),
+                "frame {frame}"
+            );
+            drawn.push(pixels);
+        }
+        let visible = drawn
+            .iter()
+            .filter(|pixels| pixels.chunks_exact(4).any(|pixel| pixel[3] != 0))
+            .count();
+        assert!(visible > 100, "{visible}");
+        let settled = 30;
+        assert_ne!(drawn[14], drawn[settled], "appear animation");
+        assert_ne!(drawn[settled], drawn[37], "repeat press and badge");
+        assert_eq!(drawn[46], drawn[50], "settled repeat");
+    }
+
+    #[test]
+    #[ignore = "requires a working wgpu adapter"]
+    fn keycap_style_draws_one_cap_per_key_and_text_style_is_untouched_by_it() {
+        let size = XY::new(640, 360);
+        let constants = constants(size);
+        let segments = [shortcut_segment("a", 0.0, "⌃⌥⇧⌘K")];
+        let mut uniforms = uniforms(&constants, &segments, size);
+        uniforms.frame_number = 30;
+        let frames = frames(size);
+        let mut layer = KeyboardLayer::new(&constants.device, &constants.queue);
+        layer.prepare(&uniforms, &frames, size, &constants, None);
+        let text = render_pixels(&constants, &layer, size);
+        set_style(&mut uniforms, |settings| {
+            settings.style = cap_project::KeyboardStyle::Keycaps
+        });
+        layer.prepare(&uniforms, &frames, size, &constants, None);
+        let keycaps = render_pixels(&constants, &layer, size);
+        assert_ne!(text, keycaps);
+
+        let row = (0..size.y)
+            .max_by_key(|y| {
+                (0..size.x)
+                    .filter(|x| keycaps[((y * size.x + x) * 4 + 3) as usize] > 200)
+                    .count()
+            })
+            .unwrap();
+        let mut runs = 0;
+        let mut inside = false;
+        for x in 0..size.x {
+            let opaque = keycaps[((row * size.x + x) * 4 + 3) as usize] > 200;
+            if opaque && !inside {
+                runs += 1;
+            }
+            inside = opaque;
+        }
+        assert_eq!(runs, 5, "row {row}");
+
+        set_style(&mut uniforms, |settings| {
+            settings.style = cap_project::KeyboardStyle::Text
+        });
+        layer.prepare(&uniforms, &frames, size, &constants, None);
+        assert_eq!(render_pixels(&constants, &layer, size), text);
+    }
+
     #[test]
     #[ignore = "benchmark; requires a working wgpu adapter"]
     fn benchmark_keyboard_layer_prepare() {
@@ -1133,32 +1588,46 @@ mod gpu_tests {
             let segment = typed_segment(&format!("typed-{index}"), start, text, 120.0);
             start = segment.end + 0.5;
             segments.push(segment);
+            for repeat in 0..3 {
+                segments.push(shortcut_segment(
+                    &format!("shortcut-{index}-{repeat}"),
+                    start + repeat as f64 * 0.25,
+                    "⌘⇧Z",
+                ));
+            }
+            start += 1.8;
         }
-        let mut uniforms = uniforms(&constants, &segments, size);
         let frames = frames(size);
         let total_frames = (start * FPS as f64) as u32;
-        let mut layer = KeyboardLayer::new(&constants.device, &constants.queue);
 
-        let mut samples = Vec::new();
-        for pass in 0..4 {
-            for frame in 0..total_frames {
-                uniforms.frame_number = frame;
-                let started = std::time::Instant::now();
-                layer.prepare(&uniforms, &frames, size, &constants, None);
-                let elapsed = started.elapsed().as_secs_f64() * 1e6;
-                if pass > 0 && layer.has_content() {
-                    samples.push(elapsed);
+        for style in [
+            cap_project::KeyboardStyle::Text,
+            cap_project::KeyboardStyle::Keycaps,
+        ] {
+            let mut uniforms = uniforms(&constants, &segments, size);
+            set_style(&mut uniforms, |settings| settings.style = style);
+            let mut layer = KeyboardLayer::new(&constants.device, &constants.queue);
+            let mut samples = Vec::new();
+            for pass in 0..4 {
+                for frame in 0..total_frames {
+                    uniforms.frame_number = frame;
+                    let started = std::time::Instant::now();
+                    layer.prepare(&uniforms, &frames, size, &constants, None);
+                    let elapsed = started.elapsed().as_secs_f64() * 1e6;
+                    if pass > 0 && layer.has_content() {
+                        samples.push(elapsed);
+                    }
                 }
             }
+            constants.device.poll(wgpu::PollType::Wait).unwrap();
+            samples.sort_by(f64::total_cmp);
+            println!(
+                "keyboard layer prepare, {style:?} ({} visible frames): p50 {:.1} us, p95 {:.1} us, mean {:.1} us",
+                samples.len(),
+                samples[samples.len() / 2],
+                samples[samples.len() * 95 / 100],
+                samples.iter().sum::<f64>() / samples.len() as f64,
+            );
         }
-        constants.device.poll(wgpu::PollType::Wait).unwrap();
-        samples.sort_by(f64::total_cmp);
-        println!(
-            "keyboard layer prepare ({} visible frames): p50 {:.1} us, p95 {:.1} us, mean {:.1} us",
-            samples.len(),
-            samples[samples.len() / 2],
-            samples[samples.len() * 95 / 100],
-            samples.iter().sum::<f64>() / samples.len() as f64,
-        );
     }
 }
