@@ -3,9 +3,9 @@ use std::sync::Arc;
 use cap_project::{FrameStyle, FrameTheme};
 
 use crate::{
-    ProjectUniforms, RenderVideoConstants,
+    RenderVideoConstants,
     composite_frame::{CompositeVideoFramePipeline, CompositeVideoFrameUniforms},
-    frame_chrome,
+    frame_chrome::{self, ChromePart, FrameChromeUniforms},
 };
 
 /// Inputs that require re-rasterizing the chrome texture. Zoom and card
@@ -14,6 +14,7 @@ use crate::{
 /// animated frames reuse the cached texture.
 #[derive(Clone, PartialEq)]
 struct ChromeCacheKey {
+    part: ChromePart,
     style: FrameStyle,
     theme: FrameTheme,
     url: String,
@@ -21,10 +22,11 @@ struct ChromeCacheKey {
     tex_size: (u32, u32),
 }
 
-/// Draws decorative frame chrome (macOS window bar, browser toolbar, MacBook
-/// body) behind the display layer, using the shared composite pipeline so the
-/// chrome gets the same rounded corners, shadow, border and motion blur
-/// treatment as the video card itself.
+/// Draws one part of the decorative frame chrome (macOS window bar, browser
+/// toolbar, MacBook or device body behind the display layer; the Dynamic
+/// Island over it), using the shared composite pipeline so the chrome gets the
+/// same rounded corners, shadow, border and motion blur treatment as the
+/// video card itself.
 pub struct FrameLayer {
     pipeline: Arc<CompositeVideoFramePipeline>,
     uniforms_buffer: wgpu::Buffer,
@@ -50,9 +52,13 @@ impl FrameLayer {
         }
     }
 
-    pub fn prepare(&mut self, constants: &RenderVideoConstants, uniforms: &ProjectUniforms) {
+    pub fn prepare(
+        &mut self,
+        constants: &RenderVideoConstants,
+        chrome: Option<&FrameChromeUniforms>,
+    ) {
         self.ready = false;
-        let Some(chrome) = uniforms.frame_chrome.as_ref() else {
+        let Some(chrome) = chrome else {
             return;
         };
         if chrome.composite.opacity <= 0.001 {
@@ -62,6 +68,7 @@ impl FrameLayer {
         let (tex_w, tex_h) =
             frame_chrome::chrome_texture_size(chrome.raster_size.x, chrome.raster_size.y);
         let key = ChromeCacheKey {
+            part: chrome.part,
             style: chrome.style,
             theme: chrome.theme,
             url: chrome.url.clone(),
@@ -77,6 +84,7 @@ impl FrameLayer {
             let scale = tex_w as f64 / chrome.raster_size.x.max(1.0);
             let content_h_px = chrome.content_height * scale;
             let Some(rgba) = frame_chrome::rasterize_chrome(
+                chrome.part,
                 chrome.style,
                 chrome.theme,
                 &chrome.url,

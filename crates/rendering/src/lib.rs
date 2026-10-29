@@ -3107,6 +3107,9 @@ pub struct ProjectUniforms {
     /// Decorative frame chrome around the display; `None` when no frame style
     /// is active.
     pub frame_chrome: Option<frame_chrome::FrameChromeUniforms>,
+    /// Frame hardware drawn over the video (the iPhone's Dynamic Island);
+    /// `None` for styles without any.
+    pub frame_chrome_overlay: Option<frame_chrome::FrameChromeUniforms>,
     /// The recording device's physical notch, redrawn over the capture;
     /// `None` when the overlay is off or the recording has no notch.
     pub notch: Option<layers::NotchUniforms>,
@@ -3869,7 +3872,7 @@ impl ProjectUniforms {
         {
             (base, box_size, base, box_size)
         } else {
-            let insets = frame_chrome::chrome_insets(style);
+            let insets = frame_chrome::chrome_insets(style, aspect);
             // Insets are fractions of the content height; solve for the
             // largest content that keeps the outer card inside the box.
             let outer_w_per_h = aspect + insets.left + insets.right;
@@ -4591,6 +4594,7 @@ impl ProjectUniforms {
             display,
             display_motion_parent,
             frame_chrome,
+            frame_chrome_overlay,
             display_outer_bounds,
             notch,
             takeover_morph,
@@ -4751,6 +4755,23 @@ impl ProjectUniforms {
                 }
                 _ => [1.0; 4],
             };
+            let device_metrics = frame_config
+                .as_ref()
+                .and_then(|frame| frame_chrome::device_metrics(frame.style));
+            // A device frame's screen has its own corner radius. The user's
+            // rounding comes back as a split or takeover fades the body out.
+            let card_rounding_px = display_rounding_px;
+            let (display_rounding_px, display_rounding_type) = match device_metrics {
+                Some(metrics) => (
+                    lerp_f32(
+                        (metrics.screen_radius * final_min_axis) as f32,
+                        display_rounding_px,
+                        split_t.max(takeover_t),
+                    ),
+                    CornerStyle::Rounded,
+                ),
+                None => (display_rounding_px, project.background.rounding_type),
+            };
             // The shader draws border and shadow outside the card shape,
             // unscaled by the opacity uniform — fade them explicitly or they
             // outlive a Fullscreen takeover's fade.
@@ -4796,6 +4817,17 @@ impl ProjectUniforms {
                     chrome_bounds[3] - chrome_bounds[1],
                 ];
                 let decorated = frame_chrome::style_uses_card_decoration(frame.style);
+                let (chrome_rounding_px, chrome_rounding_type) = match device_metrics {
+                    // The body radius is a fraction of the screen's short side;
+                    // the card's short side adds a border on each end.
+                    Some(metrics) => (
+                        (metrics.body_radius() / (1.0 + 2.0 * metrics.border)) as f32
+                            * chrome_size[0].min(chrome_size[1]),
+                        CornerStyle::Rounded,
+                    ),
+                    None if decorated => (card_rounding_px, project.background.rounding_type),
+                    None => (0.0, project.background.rounding_type),
+                };
 
                 frame_chrome::FrameChromeUniforms {
                     composite: CompositeVideoFrameUniforms {
@@ -4806,8 +4838,8 @@ impl ProjectUniforms {
                         crop_bounds: [0.0, 0.0, 1.0, 1.0],
                         target_bounds: chrome_bounds,
                         target_size: chrome_size,
-                        rounding_px: if decorated { display_rounding_px } else { 0.0 },
-                        rounding_type: rounding_type_value(project.background.rounding_type),
+                        rounding_px: chrome_rounding_px,
+                        rounding_type: rounding_type_value(chrome_rounding_type),
                         mirror_x: 0.0,
                         motion_blur_vector: descriptor.movement_vector_uv,
                         motion_blur_zoom_center: descriptor.zoom_center_uv,
@@ -4855,6 +4887,7 @@ impl ProjectUniforms {
                         color_adjust_b: [0.0; 4],
                         grain_params: [0.0; 4],
                     },
+                    part: frame_chrome::ChromePart::Body,
                     style: frame.style,
                     theme: frame.theme,
                     url: frame.url,
@@ -4862,6 +4895,41 @@ impl ProjectUniforms {
                     raster_size: layout.outer_size,
                     content_height: layout.content_size.y,
                 }
+            });
+
+            // Glued to the video rect, so it follows zoom and the split /
+            // takeover morphs exactly like the content under it.
+            let frame_chrome_overlay = frame_chrome.as_ref().and_then(|chrome| {
+                let aspect = layout.content_size.x / layout.content_size.y.max(f64::EPSILON);
+                let rect = frame_chrome::overlay_rect(chrome.style, aspect)?;
+                let video = final_target_bounds;
+                let (video_w, video_h) = (video[2] - video[0], video[3] - video[1]);
+                let bounds = [
+                    video[0] + rect.x as f32 * video_w,
+                    video[1] + rect.y as f32 * video_h,
+                    video[0] + (rect.x + rect.width) as f32 * video_w,
+                    video[1] + (rect.y + rect.height) as f32 * video_h,
+                ];
+                let mut composite = chrome.composite;
+                composite.target_bounds = bounds;
+                composite.target_size = [bounds[2] - bounds[0], bounds[3] - bounds[1]];
+                composite.rounding_px = 0.0;
+                composite.shadow = 0.0;
+                composite.shadow_opacity = 0.0;
+                composite.border_enabled = 0.0;
+                Some(frame_chrome::FrameChromeUniforms {
+                    composite,
+                    part: frame_chrome::ChromePart::Overlay,
+                    style: chrome.style,
+                    theme: chrome.theme,
+                    url: String::new(),
+                    title: String::new(),
+                    raster_size: XY::new(
+                        layout.content_size.x * rect.width,
+                        layout.content_size.y * rect.height,
+                    ),
+                    content_height: layout.content_size.y * rect.height,
+                })
             });
 
             let display_outer_bounds = frame_chrome
@@ -4937,7 +5005,7 @@ impl ProjectUniforms {
                     target_bounds: final_target_bounds,
                     target_size: final_target_size,
                     rounding_px: display_rounding_px,
-                    rounding_type: rounding_type_value(project.background.rounding_type),
+                    rounding_type: rounding_type_value(display_rounding_type),
                     mirror_x: 0.0,
                     motion_blur_vector: descriptor.movement_vector_uv,
                     motion_blur_zoom_center: descriptor.zoom_center_uv,
@@ -4986,6 +5054,7 @@ impl ProjectUniforms {
                 },
                 display_parent_motion_px,
                 frame_chrome,
+                frame_chrome_overlay,
                 display_outer_bounds,
                 notch,
                 takeover
@@ -5386,6 +5455,7 @@ impl ProjectUniforms {
             camera,
             camera_only,
             frame_chrome,
+            frame_chrome_overlay,
             notch,
             display_outer_bounds,
             project: styled_project,
@@ -5923,7 +5993,7 @@ mod tests {
             resolution_base,
             options.screen_size,
         );
-        let insets = frame_chrome::chrome_insets(FrameStyle::Browser);
+        let insets = frame_chrome::chrome_insets(FrameStyle::Browser, 1920.0 / 1080.0);
 
         // The video keeps the recording's aspect ratio.
         let content_aspect = layout.content_size.x / layout.content_size.y;
@@ -8168,6 +8238,7 @@ pub struct RendererLayers {
     background_blur: BlurLayer,
     background_color_grade: ColorGradeLayer,
     frame: FrameLayer,
+    frame_overlay: FrameLayer,
     display: DisplayLayer,
     notch: NotchLayer,
     click_ripple: ClickRippleLayer,
@@ -8270,6 +8341,9 @@ impl RendererLayers {
                 background_blur: join_layer(background_blur),
                 background_color_grade: join_layer(background_color_grade),
                 frame: readiness::measure("layers.frame", || {
+                    FrameLayer::new(device, shared_composite_pipeline.clone())
+                }),
+                frame_overlay: readiness::measure("layers.frame_overlay", || {
                     FrameLayer::new(device, shared_composite_pipeline.clone())
                 }),
                 notch: readiness::measure("layers.notch", || {
@@ -8512,7 +8586,10 @@ impl RendererLayers {
             .prepare(&constants.queue, uniforms);
 
         if render_display {
-            self.frame.prepare(constants, uniforms);
+            self.frame
+                .prepare(constants, uniforms.frame_chrome.as_ref());
+            self.frame_overlay
+                .prepare(constants, uniforms.frame_chrome_overlay.as_ref());
             self.notch
                 .prepare(&constants.device, &constants.queue, uniforms.notch);
             self.display.prepare(
@@ -8664,7 +8741,10 @@ impl RendererLayers {
 
         let start = Instant::now();
         if render_display {
-            self.frame.prepare(constants, uniforms);
+            self.frame
+                .prepare(constants, uniforms.frame_chrome.as_ref());
+            self.frame_overlay
+                .prepare(constants, uniforms.frame_chrome_overlay.as_ref());
             self.notch
                 .prepare(&constants.device, &constants.queue, uniforms.notch);
             let display_ready = self.display.prepare_with_encoder(
@@ -8933,6 +9013,13 @@ impl RendererLayers {
             let pass = passes.pass(content_view!(), load);
             self.click_ripple.render(pass);
             self.cursor.render(pass);
+        }
+
+        // Hardware over the screen (the Dynamic Island) covers the cursor the
+        // same way the notch does.
+        if should_render_screen && self.frame_overlay.has_content() {
+            self.frame_overlay
+                .render(passes.pass(content_view!(), load));
         }
 
         // After the cursor, which really does disappear behind the notch on a

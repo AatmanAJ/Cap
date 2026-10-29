@@ -12,7 +12,7 @@ use crate::{i18n::tr, ui};
 
 type Text = fn() -> &'static str;
 
-const FRAME_STYLES: [(FrameStyle, Text, Text, &str); 5] = [
+const FRAME_STYLES: [(FrameStyle, Text, Text, &str); 7] = [
     (
         FrameStyle::None,
         tr::editor::window::frame::none,
@@ -42,6 +42,18 @@ const FRAME_STYLES: [(FrameStyle, Text, Text, &str); 5] = [
         || "MacBook",
         tr::editor::window::frame::macbook_description,
         "icons/laptop.svg",
+    ),
+    (
+        FrameStyle::IPhone,
+        || "iPhone",
+        tr::editor::window::frame::iphone_description,
+        "icons/smartphone.svg",
+    ),
+    (
+        FrameStyle::IPad,
+        || "iPad",
+        tr::editor::window::frame::ipad_description,
+        "icons/tablet.svg",
     ),
 ];
 
@@ -685,7 +697,9 @@ mod tests {
     fn frame_styles_and_button_labels_match_tauri() {
         assert_eq!(
             FRAME_STYLES.map(|option| (option.1)()),
-            ["None", "macOS", "Windows", "Browser", "MacBook"]
+            [
+                "None", "macOS", "Windows", "Browser", "MacBook", "iPhone", "iPad"
+            ]
         );
         assert_eq!(
             button_content(FrameStyle::None),
@@ -736,7 +750,13 @@ mod tests {
     fn frame_text_fields_match_tauri_visibility() {
         assert!(FrameField::for_style(FrameStyle::Browser) == Some(FrameField::Url));
         assert!(FrameField::for_style(FrameStyle::MacOS) == Some(FrameField::Title));
-        for style in [FrameStyle::None, FrameStyle::Windows, FrameStyle::Macbook] {
+        for style in [
+            FrameStyle::None,
+            FrameStyle::Windows,
+            FrameStyle::Macbook,
+            FrameStyle::IPhone,
+            FrameStyle::IPad,
+        ] {
             assert!(FrameField::for_style(style).is_none());
         }
     }

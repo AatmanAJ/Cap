@@ -2817,6 +2817,8 @@ button = { text = "Frame", context = "Toolbar button that opens the frame picker
 dark = "Dark"
 global = "Global frame · Applies wherever Style inherits background."
 heading = { text = "Frame", context = "Heading of the frame picker popover." }
+ipad_description = "Tablet body around the recording"
+iphone_description = "Phone body around the recording"
 light = "Light"
 macbook_description = "Laptop bezel around the recording"
 macos_description = "Window chrome with traffic lights"

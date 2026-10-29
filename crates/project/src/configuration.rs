@@ -259,6 +259,14 @@ pub enum FrameStyle {
     Browser,
     /// A MacBook mockup: black bezel, aluminum body and deck.
     Macbook,
+    /// An iPhone mockup: rounded body, bezel and Dynamic Island. Follows the
+    /// recording's orientation.
+    #[serde(rename = "iPhone")]
+    IPhone,
+    /// An iPad mockup: rounded body, bezel and front camera. Follows the
+    /// recording's orientation.
+    #[serde(rename = "iPad")]
+    IPad,
 }
 
 #[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -3261,6 +3269,19 @@ mod notch_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn device_frame_styles_round_trip_with_apple_spelling() {
+        for (style, name) in [
+            (FrameStyle::IPhone, "\"iPhone\""),
+            (FrameStyle::IPad, "\"iPad\""),
+            (FrameStyle::Macbook, "\"macbook\""),
+            (FrameStyle::MacOS, "\"macOS\""),
+        ] {
+            assert_eq!(serde_json::to_string(&style).unwrap(), name);
+            assert_eq!(serde_json::from_str::<FrameStyle>(name).unwrap(), style);
+        }
+    }
     use serde_json::Value;
 
     #[test]

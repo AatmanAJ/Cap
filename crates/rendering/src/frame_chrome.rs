@@ -1,16 +1,22 @@
 //! Decorative frame ("chrome") rendering for the display layer.
 //!
 //! A frame wraps the screen recording in synthetic window chrome — a macOS
-//! title bar, a browser toolbar or a MacBook body. The chrome is rasterized
-//! on the CPU from a parameterized SVG (same technique as SVG cursors) into
-//! an RGBA texture that the frame layer composites with the shared
-//! composite-video-frame pipeline, so it inherits rounded corners, shadows,
-//! borders and motion blur from the exact same shader as the video itself.
+//! title bar, a browser toolbar, a MacBook body or an iPhone/iPad body. The
+//! chrome is rasterized on the CPU from a parameterized SVG (same technique as
+//! SVG cursors) into an RGBA texture that the frame layer composites with the
+//! shared composite-video-frame pipeline, so it inherits rounded corners,
+//! shadows, borders and motion blur from the exact same shader as the video
+//! itself.
 //!
 //! Geometry model: the *outer card* (video + chrome) is what padding,
 //! `display_position` and zoom apply to; the video sits inside it offset by
 //! [`ChromeInsets`]. Insets are expressed as fractions of the video content
 //! height so the chrome keeps its proportions at any recording size.
+//!
+//! Device styles (iPhone, iPad) are sized from the content's short side
+//! instead, so the same body works in portrait and landscape. Their screen
+//! corners come from rounding the video itself, and the iPhone's Dynamic
+//! Island is a second, small [`ChromePart::Overlay`] drawn over the video.
 
 use crate::composite_frame::CompositeVideoFrameUniforms;
 use cap_project::{FrameStyle, FrameTheme, XY};
@@ -23,6 +29,7 @@ use std::sync::{Arc, OnceLock};
 #[derive(Clone, Debug)]
 pub struct FrameChromeUniforms {
     pub composite: CompositeVideoFrameUniforms,
+    pub part: ChromePart,
     pub style: FrameStyle,
     pub theme: FrameTheme,
     pub url: String,
@@ -31,6 +38,17 @@ pub struct FrameChromeUniforms {
     pub raster_size: XY<f64>,
     /// Unzoomed video content height in output px (chrome proportions basis).
     pub content_height: f64,
+}
+
+/// Which piece of a frame a [`FrameChromeUniforms`] describes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChromePart {
+    /// Everything drawn behind the video: bars, bezels, device bodies.
+    #[default]
+    Body,
+    /// Hardware that sits on top of the screen, i.e. the Dynamic Island. Its
+    /// texture covers only that element.
+    Overlay,
 }
 
 /// Content insets of a frame style, as fractions of the video content height.
@@ -57,13 +75,104 @@ const MACBOOK_OVERHANG_FRAC: f64 = 0.10;
 /// Room reserved under the deck for its baked soft shadow.
 const MACBOOK_SHADOW_ROOM_FRAC: f64 = 0.035;
 
+/// Proportions of a phone or tablet body, as fractions of the screen's short
+/// side, so the body keeps its look in either orientation.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DeviceMetrics {
+    /// Body edge to screen edge (metal band plus black bezel).
+    pub border: f64,
+    /// Width of the metal band that forms the outer edge of the body.
+    pub band: f64,
+    /// Corner radius of the screen.
+    pub screen_radius: f64,
+}
+
+impl DeviceMetrics {
+    /// Corner radius of the body, concentric with the screen's corners.
+    pub fn body_radius(&self) -> f64 {
+        self.screen_radius + self.border
+    }
+}
+
+/// iPhone 15/16 Pro: a 393pt-wide screen with 55pt corners, about 19.6pt of
+/// body around it (71.6mm body over a 65.1mm panel).
+const IPHONE_METRICS: DeviceMetrics = DeviceMetrics {
+    border: 0.05,
+    band: 0.011,
+    screen_radius: 0.14,
+};
+
+/// 11" iPad Pro (M4): an 834pt-wide screen with 18pt corners and about 44pt of
+/// body around it (177.5mm body over a 160.5mm panel).
+const IPAD_METRICS: DeviceMetrics = DeviceMetrics {
+    border: 0.053,
+    band: 0.007,
+    screen_radius: 0.0216,
+};
+
+/// Dynamic Island of an iPhone 15/16 Pro on its 393pt-wide screen: 126x37.33pt,
+/// 11pt below the top edge.
+const ISLAND_LENGTH_FRAC: f64 = 126.0 / 393.0;
+const ISLAND_THICKNESS_FRAC: f64 = 37.33 / 393.0;
+const ISLAND_INSET_FRAC: f64 = 11.0 / 393.0;
+
+pub fn device_metrics(style: FrameStyle) -> Option<DeviceMetrics> {
+    match style {
+        FrameStyle::IPhone => Some(IPHONE_METRICS),
+        FrameStyle::IPad => Some(IPAD_METRICS),
+        _ => None,
+    }
+}
+
+/// A rectangle as fractions of the video content (0..1 on each axis).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ContentRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+/// Where the Dynamic Island sits over content of the given aspect
+/// (width / height). Portrait content puts it centered under the top edge;
+/// landscape content is a phone turned counterclockwise, so it sits centered
+/// on the left edge.
+pub fn dynamic_island_rect(aspect: f64) -> ContentRect {
+    let aspect = aspect.max(f64::EPSILON);
+    if aspect <= 1.0 {
+        ContentRect {
+            x: 0.5 - ISLAND_LENGTH_FRAC * 0.5,
+            y: ISLAND_INSET_FRAC * aspect,
+            width: ISLAND_LENGTH_FRAC,
+            height: ISLAND_THICKNESS_FRAC * aspect,
+        }
+    } else {
+        ContentRect {
+            x: ISLAND_INSET_FRAC / aspect,
+            y: 0.5 - ISLAND_LENGTH_FRAC * 0.5,
+            width: ISLAND_THICKNESS_FRAC / aspect,
+            height: ISLAND_LENGTH_FRAC,
+        }
+    }
+}
+
+/// The overlay rect a style draws on top of the video, if any.
+pub fn overlay_rect(style: FrameStyle, aspect: f64) -> Option<ContentRect> {
+    match style {
+        FrameStyle::IPhone => Some(dynamic_island_rect(aspect)),
+        _ => None,
+    }
+}
+
 /// Supersampling factor for the rasterized chrome texture, so it stays crisp
 /// when zoom segments scale the card up.
 const CHROME_SUPERSAMPLE: f64 = 2.0;
 /// Hard cap on either texture dimension.
 const CHROME_MAX_TEXTURE_DIM: f64 = 4096.0;
 
-pub fn chrome_insets(style: FrameStyle) -> ChromeInsets {
+/// Content insets of `style` around content of the given aspect
+/// (width / height).
+pub fn chrome_insets(style: FrameStyle, aspect: f64) -> ChromeInsets {
     match style {
         FrameStyle::None => ChromeInsets::default(),
         FrameStyle::MacOS => ChromeInsets {
@@ -84,16 +193,31 @@ pub fn chrome_insets(style: FrameStyle) -> ChromeInsets {
             bottom: MACBOOK_BEZEL_FRAC + MACBOOK_DECK_FRAC + MACBOOK_SHADOW_ROOM_FRAC,
             left: MACBOOK_BEZEL_FRAC + MACBOOK_OVERHANG_FRAC,
         },
+        FrameStyle::IPhone | FrameStyle::IPad => {
+            let metrics = device_metrics(style).unwrap_or(IPHONE_METRICS);
+            let border = metrics.border * aspect.clamp(f64::EPSILON, 1.0);
+            ChromeInsets {
+                top: border,
+                right: border,
+                bottom: border,
+                left: border,
+            }
+        }
     }
 }
 
 /// Whether the shader-side shadow/border decoration applies to this style.
 /// The MacBook silhouette is not a rectangle, so it bakes its own shadow into
-/// the SVG instead of using the rect-SDF shadow.
+/// the SVG instead of using the rect-SDF shadow. Device bodies are rounded
+/// rects, which the SDF draws exactly.
 pub fn style_uses_card_decoration(style: FrameStyle) -> bool {
     matches!(
         style,
-        FrameStyle::MacOS | FrameStyle::Windows | FrameStyle::Browser
+        FrameStyle::MacOS
+            | FrameStyle::Windows
+            | FrameStyle::Browser
+            | FrameStyle::IPhone
+            | FrameStyle::IPad
     )
 }
 
@@ -550,6 +674,101 @@ fn macbook_svg(w: f64, h: f64, content_h: f64, theme: FrameTheme) -> String {
     )
 }
 
+/// Phone/tablet body: a metal band around a black glass bezel. The screen
+/// itself is the video, rounded by the display pass, so the bezel only has to
+/// fill the area around it.
+fn device_svg(w: f64, h: f64, content_h: f64, style: FrameStyle, theme: FrameTheme) -> String {
+    let metrics = device_metrics(style).unwrap_or(IPHONE_METRICS);
+    let border = ((h - content_h) * 0.5).max(0.0);
+    let short = (w - border * 2.0).min(content_h).max(1.0);
+    let band = metrics.band * short;
+    let body_radius = metrics.body_radius() * short;
+    let bezel_radius = (body_radius - band).max(0.0);
+
+    let (band_top, band_bottom, band_edge) = match theme {
+        FrameTheme::Light => ("#E4E3DF", "#B4B3AF", "rgba(255,255,255,0.65)"),
+        FrameTheme::Dark => ("#4B4B4E", "#2A2A2D", "rgba(255,255,255,0.14)"),
+    };
+
+    let camera = if style == FrameStyle::IPad {
+        format!(
+            concat!(
+                r##"<circle cx="{cx}" cy="{cy}" r="{r}" fill="#1A1B1F"/>"##,
+                r##"<circle cx="{cx}" cy="{cy}" r="{r_inner}" fill="#2B3440"/>"##,
+            ),
+            cx = w * 0.5,
+            cy = band + (border - band) * 0.5,
+            r = (short * 0.0085).max(1.5),
+            r_inner = (short * 0.004).max(0.8),
+        )
+    } else {
+        String::new()
+    };
+
+    format!(
+        concat!(
+            r##"<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">"##,
+            "<defs>",
+            r##"<linearGradient id="band" x1="0" y1="0" x2="1" y2="1">"##,
+            r##"<stop offset="0" stop-color="{band_top}"/><stop offset="1" stop-color="{band_bottom}"/>"##,
+            "</linearGradient>",
+            "</defs>",
+            r##"<rect width="{w}" height="{h}" rx="{body_radius}" fill="url(#band)"/>"##,
+            r##"<rect x="{edge_inset}" y="{edge_inset}" width="{edge_w}" height="{edge_h}" rx="{edge_radius}" fill="none" stroke="{band_edge}" stroke-width="{edge_stroke}"/>"##,
+            r##"<rect x="{band}" y="{band}" width="{bezel_w}" height="{bezel_h}" rx="{bezel_radius}" fill="#050506"/>"##,
+            "{camera}",
+            "</svg>"
+        ),
+        w = w,
+        h = h,
+        band_top = band_top,
+        band_bottom = band_bottom,
+        band_edge = band_edge,
+        body_radius = body_radius,
+        edge_inset = band * 0.5,
+        edge_w = (w - band).max(0.0),
+        edge_h = (h - band).max(0.0),
+        edge_radius = (body_radius - band * 0.5).max(0.0),
+        edge_stroke = (band * 0.18).max(0.75),
+        band = band,
+        bezel_w = (w - band * 2.0).max(0.0),
+        bezel_h = (h - band * 2.0).max(0.0),
+        bezel_radius = bezel_radius,
+        camera = camera,
+    )
+}
+
+/// The Dynamic Island, filling a `w`×`h` texture. The front camera sits at
+/// the right end of the pill in portrait, so at the top once the phone is
+/// turned counterclockwise.
+fn dynamic_island_svg(w: f64, h: f64) -> String {
+    let portrait = w >= h;
+    let thickness = w.min(h);
+    let radius = thickness * 0.5;
+    let lens_r = thickness * 0.2;
+    let (lens_cx, lens_cy) = if portrait {
+        (w - radius, h * 0.5)
+    } else {
+        (w * 0.5, radius)
+    };
+    format!(
+        concat!(
+            r##"<svg width="{w}" height="{h}" viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">"##,
+            r##"<rect width="{w}" height="{h}" rx="{radius}" fill="#000000"/>"##,
+            r##"<circle cx="{lens_cx}" cy="{lens_cy}" r="{lens_r}" fill="#0B0D12"/>"##,
+            r##"<circle cx="{lens_cx}" cy="{lens_cy}" r="{lens_inner}" fill="#151A26"/>"##,
+            "</svg>"
+        ),
+        w = w,
+        h = h,
+        radius = radius,
+        lens_cx = lens_cx,
+        lens_cy = lens_cy,
+        lens_r = lens_r,
+        lens_inner = lens_r * 0.45,
+    )
+}
+
 /// Build the SVG for a chrome card of `w`×`h` texture pixels wrapping a video
 /// content area of height `content_h` texture pixels.
 pub fn chrome_svg(
@@ -573,6 +792,27 @@ pub fn chrome_svg(
         )),
         FrameStyle::Browser => Some(browser_svg(w, h, content_h * BROWSER_BAR_FRAC, theme, url)),
         FrameStyle::Macbook => Some(macbook_svg(w, h, content_h, theme)),
+        FrameStyle::IPhone | FrameStyle::IPad => Some(device_svg(w, h, content_h, style, theme)),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn chrome_part_svg(
+    part: ChromePart,
+    style: FrameStyle,
+    theme: FrameTheme,
+    url: &str,
+    title: &str,
+    w: f64,
+    h: f64,
+    content_h: f64,
+) -> Option<String> {
+    match part {
+        ChromePart::Body => chrome_svg(style, theme, url, title, w, h, content_h),
+        ChromePart::Overlay => match style {
+            FrameStyle::IPhone => Some(dynamic_island_svg(w, h)),
+            _ => None,
+        },
     }
 }
 
@@ -590,7 +830,9 @@ fn chrome_fontdb() -> Arc<resvg::usvg::fontdb::Database> {
 /// Rasterize a chrome card to RGBA8 (non-premultiplied). Returns `None` for
 /// [`FrameStyle::None`] or if rasterization fails (the frame layer then skips
 /// drawing rather than erroring the whole frame).
+#[allow(clippy::too_many_arguments)]
 pub fn rasterize_chrome(
+    part: ChromePart,
     style: FrameStyle,
     theme: FrameTheme,
     url: &str,
@@ -599,7 +841,8 @@ pub fn rasterize_chrome(
     tex_h: u32,
     content_h_px: f64,
 ) -> Option<Vec<u8>> {
-    let svg = chrome_svg(
+    let svg = chrome_part_svg(
+        part,
         style,
         theme,
         url,
@@ -647,7 +890,10 @@ mod tests {
 
     #[test]
     fn no_frame_has_no_insets() {
-        assert_eq!(chrome_insets(FrameStyle::None), ChromeInsets::default());
+        assert_eq!(
+            chrome_insets(FrameStyle::None, 16.0 / 9.0),
+            ChromeInsets::default()
+        );
     }
 
     #[test]
@@ -667,24 +913,36 @@ mod tests {
             return;
         };
         std::fs::create_dir_all(&dir).unwrap();
-        for style in [
-            FrameStyle::MacOS,
-            FrameStyle::Windows,
-            FrameStyle::Browser,
-            FrameStyle::Macbook,
+        for (style, aspect) in [
+            (FrameStyle::MacOS, 16.0 / 10.0),
+            (FrameStyle::Windows, 16.0 / 10.0),
+            (FrameStyle::Browser, 16.0 / 10.0),
+            (FrameStyle::Macbook, 16.0 / 10.0),
+            (FrameStyle::IPhone, 9.0 / 19.5),
+            (FrameStyle::IPhone, 19.5 / 9.0),
+            (FrameStyle::IPad, 3.0 / 4.0),
+            (FrameStyle::IPad, 4.0 / 3.0),
         ] {
             for theme in [FrameTheme::Light, FrameTheme::Dark] {
-                let insets = chrome_insets(style);
+                let insets = chrome_insets(style, aspect);
                 let content_h = 900.0_f64;
-                let content_w = content_h * 16.0 / 10.0;
+                let content_w = content_h * aspect;
                 let w = (content_w + (insets.left + insets.right) * content_h).round() as u32;
                 let h = (content_h * (1.0 + insets.top + insets.bottom)).round() as u32;
-                let rgba =
-                    rasterize_chrome(style, theme, "cap.so", "Cap Recording", w, h, content_h)
-                        .unwrap();
+                let rgba = rasterize_chrome(
+                    ChromePart::Body,
+                    style,
+                    theme,
+                    "cap.so",
+                    "Cap Recording",
+                    w,
+                    h,
+                    content_h,
+                )
+                .unwrap();
                 image::RgbaImage::from_raw(w, h, rgba)
                     .unwrap()
-                    .save(format!("{dir}/{style:?}-{theme:?}.png"))
+                    .save(format!("{dir}/{style:?}-{aspect:.2}-{theme:?}.png"))
                     .unwrap();
             }
         }
@@ -697,14 +955,140 @@ mod tests {
             FrameStyle::Windows,
             FrameStyle::Browser,
             FrameStyle::Macbook,
+            FrameStyle::IPhone,
+            FrameStyle::IPad,
         ] {
             for theme in [FrameTheme::Light, FrameTheme::Dark] {
-                let rgba = rasterize_chrome(style, theme, "cap.so", "Recording", 640, 420, 360.0);
+                let rgba = rasterize_chrome(
+                    ChromePart::Body,
+                    style,
+                    theme,
+                    "cap.so",
+                    "Recording",
+                    640,
+                    420,
+                    360.0,
+                );
                 let rgba = rgba.expect("chrome should rasterize");
                 assert_eq!(rgba.len(), 640 * 420 * 4);
                 // Something visible must have been drawn.
                 assert!(rgba.chunks_exact(4).any(|px| px[3] > 0));
             }
         }
+    }
+
+    #[test]
+    fn device_insets_follow_the_short_side() {
+        for style in [FrameStyle::IPhone, FrameStyle::IPad] {
+            let border = device_metrics(style).unwrap().border;
+            let portrait = chrome_insets(style, 9.0 / 19.5);
+            let landscape = chrome_insets(style, 19.5 / 9.0);
+            // Insets are in content heights: portrait content is narrower
+            // than tall, so its short side is `aspect` content heights.
+            assert!((portrait.left - border * 9.0 / 19.5).abs() < 1e-12);
+            assert_eq!(portrait.left, portrait.top);
+            assert_eq!(portrait.left, portrait.right);
+            assert_eq!(portrait.left, portrait.bottom);
+            assert!((landscape.top - border).abs() < 1e-12);
+            assert_eq!(landscape.top, landscape.left);
+        }
+    }
+
+    #[test]
+    fn device_body_is_concentric_with_the_screen() {
+        for style in [FrameStyle::IPhone, FrameStyle::IPad] {
+            let metrics = device_metrics(style).unwrap();
+            assert!(metrics.band < metrics.border);
+            assert!(
+                (metrics.body_radius() - (metrics.screen_radius + metrics.border)).abs() < 1e-12
+            );
+        }
+        assert!(device_metrics(FrameStyle::Macbook).is_none());
+    }
+
+    #[test]
+    fn dynamic_island_matches_iphone_proportions() {
+        let aspect = 1179.0 / 2556.0;
+        let island = dynamic_island_rect(aspect);
+        let (screen_w, screen_h) = (393.0, 393.0 / aspect);
+        assert!((island.width * screen_w - 126.0).abs() < 1e-9);
+        assert!((island.height * screen_h - 37.33).abs() < 1e-9);
+        assert!((island.y * screen_h - 11.0).abs() < 1e-9);
+        assert!((island.x + island.width * 0.5 - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn dynamic_island_turns_with_the_phone() {
+        let portrait = dynamic_island_rect(9.0 / 19.5);
+        let landscape = dynamic_island_rect(19.5 / 9.0);
+        // Same physical pill, rotated a quarter turn onto the left edge.
+        let (short, long) = (900.0, 900.0 * 19.5 / 9.0);
+        assert!((portrait.width * short - landscape.height * short).abs() < 1e-9);
+        assert!((portrait.height * long - landscape.width * long).abs() < 1e-9);
+        assert!((portrait.y * long - landscape.x * long).abs() < 1e-9);
+        assert!((landscape.y + landscape.height * 0.5 - 0.5).abs() < 1e-12);
+        assert!(overlay_rect(FrameStyle::IPad, 0.75).is_none());
+        assert!(overlay_rect(FrameStyle::IPhone, 0.75).is_some());
+    }
+
+    #[test]
+    fn device_body_leaves_corners_transparent_and_bezel_black() {
+        let aspect = 9.0 / 19.5;
+        let content_h = 1000.0;
+        let insets = chrome_insets(FrameStyle::IPhone, aspect);
+        let w = (content_h * (aspect + insets.left + insets.right)).round() as u32;
+        let h = (content_h * (1.0 + insets.top + insets.bottom)).round() as u32;
+        let rgba = rasterize_chrome(
+            ChromePart::Body,
+            FrameStyle::IPhone,
+            FrameTheme::Dark,
+            "",
+            "",
+            w,
+            h,
+            content_h,
+        )
+        .unwrap();
+        let px = |x: u32, y: u32| {
+            let i = ((y * w + x) * 4) as usize;
+            [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]]
+        };
+        assert_eq!(px(1, 1)[3], 0, "rounded body corner must be transparent");
+        let border_px = (insets.left * content_h) as u32;
+        let bezel = px(w / 2, border_px / 2 + 2);
+        assert_eq!(bezel[3], 255);
+        assert!(bezel[0] < 16 && bezel[1] < 16 && bezel[2] < 16);
+        assert_eq!(px(w / 2, h / 2)[3], 255);
+    }
+
+    #[test]
+    fn island_overlay_is_an_opaque_pill() {
+        let rgba = rasterize_chrome(
+            ChromePart::Overlay,
+            FrameStyle::IPhone,
+            FrameTheme::Dark,
+            "",
+            "",
+            252,
+            75,
+            0.0,
+        )
+        .unwrap();
+        let alpha = |x: u32, y: u32| rgba[((y * 252 + x) * 4 + 3) as usize];
+        assert_eq!(alpha(0, 0), 0);
+        assert_eq!(alpha(126, 37), 255);
+        assert!(
+            rasterize_chrome(
+                ChromePart::Overlay,
+                FrameStyle::MacOS,
+                FrameTheme::Dark,
+                "",
+                "",
+                64,
+                64,
+                64.0
+            )
+            .is_none()
+        );
     }
 }

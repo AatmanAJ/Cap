@@ -986,6 +986,14 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
             "Global frame · Applies wherever Style inherits background.",
         ),
         (tr::editor::window::frame::heading(), "Frame"),
+        (
+            tr::editor::window::frame::ipad_description(),
+            "Tablet body around the recording",
+        ),
+        (
+            tr::editor::window::frame::iphone_description(),
+            "Phone body around the recording",
+        ),
         (tr::editor::window::frame::light(), "Light"),
         (
             tr::editor::window::frame::macbook_description(),
