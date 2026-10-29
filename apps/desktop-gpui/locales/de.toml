@@ -2841,6 +2841,14 @@ changed = "Dieses Bild hat sich bei der Auswahl eines Ersatzes geändert. Wähle
 filter = "Bilder"
 recording_unavailable = "Die Aufnahme ist für dieses Bild nicht mehr verfügbar. Öffnen Sie das Projekt erneut."
 
+[editor.window.mask_lane]
+auto_blur = "Auto-Unschärfe"
+failed = "Diese Aufnahme konnte nicht durchsucht werden. Versuchen Sie es erneut."
+none_found = "Keine vertraulichen Inhalte auf dem Bildschirm gefunden."
+prompt = "E-Mail-Adressen, Kartennummern, Schlüssel und Gesichter automatisch unscharf machen"
+scanning = "Wird durchsucht… {percent} %"
+timeline_changed = "Die Bearbeitung hat sich während der Suche geändert. Starten Sie sie erneut."
+
 [editor.window.open]
 damaged = "Die Videospuren dieser Aufnahme konnten nicht geöffnet werden. Das Paket scheint beschädigt zu sein."
 failed = "Diese Aufnahme konnte nicht geöffnet werden"

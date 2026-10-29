@@ -1557,6 +1557,7 @@ dependencies = [
  "cap-media-info",
  "cap-project",
  "cap-recording",
+ "cap-redaction",
  "cap-rendering",
  "cap-timestamp",
  "cap-utils",
@@ -1630,6 +1631,7 @@ dependencies = [
  "cap-media",
  "cap-media-info",
  "cap-project",
+ "cap-redaction",
  "cap-rendering",
  "cap-utils",
  "cpal 0.15.3 (git+https://github.com/CapSoftware/cpal?rev=6013cb5f8bd3)",
@@ -1954,6 +1956,15 @@ dependencies = [
  "windows 0.60.0",
  "workspace-hack",
  "x11rb",
+]
+
+[[package]]
+name = "cap-redaction"
+version = "0.1.0"
+dependencies = [
+ "cap-project",
+ "cidre",
+ "workspace-hack",
 ]
 
 [[package]]

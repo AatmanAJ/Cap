@@ -56,6 +56,7 @@ const FORMATTED: &[&str] = &[
     "editor.window.audio_import.unsupported",
     "editor.window.busy.save_before_delete_failed",
     "editor.window.frame.style_only",
+    "editor.window.mask_lane.scanning",
     "editor.window.frame.style_only_override",
     "editor.window.open.media_failed",
     "editor.window.open.meta_failed",
@@ -1124,6 +1125,23 @@ fn editor_shell_surfaces_match_the_literals_they_replaced() {
         (tr::editor::window::transport::zoom_in(), "Zoom in"),
         (tr::editor::window::transport::zoom_out(), "Zoom out"),
         (tr::editor::window::undo(), "Undo"),
+        (tr::editor::window::mask_lane::auto_blur(), "Auto-blur"),
+        (
+            tr::editor::window::mask_lane::failed(),
+            "Could not scan this recording. Try again.",
+        ),
+        (
+            tr::editor::window::mask_lane::none_found(),
+            "Nothing sensitive found on screen.",
+        ),
+        (
+            tr::editor::window::mask_lane::prompt(),
+            "Blur emails, card numbers, keys and faces automatically",
+        ),
+        (
+            tr::editor::window::mask_lane::timeline_changed(),
+            "The edit changed during the scan. Run it again.",
+        ),
         (tr::editor::window::zoom_lane::generate(), "Generate"),
         (tr::editor::window::zoom_lane::generating(), "Generating…"),
         (
@@ -1233,6 +1251,12 @@ fn editor_shell_messages_format_like_the_code_they_replaced() {
     let path = std::path::Path::new("/tmp/Demo.cap");
     let message = "Source Cap project is still recording".to_string();
 
+    for percent in [0_u32, 42, 100] {
+        assert_eq!(
+            tr::editor::window::mask_lane::scanning(percent),
+            format!("Scanning… {percent}%")
+        );
+    }
     for seconds in [0.25, 0.5, 1.0] {
         assert_eq!(
             tr::editor::window::clip_menu::transition_seconds(seconds),

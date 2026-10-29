@@ -2841,6 +2841,14 @@ changed = "选择替换图片时此图片已更改。请选中它后重试。"
 filter = "图片"
 recording_unavailable = "此图片对应的录制已不可用。请重新打开项目。"
 
+[editor.window.mask_lane]
+auto_blur = "自动模糊"
+failed = "无法扫描此录制。请重试。"
+none_found = "屏幕上未发现敏感内容。"
+prompt = "自动模糊邮箱、卡号、密钥和人脸"
+scanning = "正在扫描… {percent}%"
+timeline_changed = "扫描期间编辑内容已更改。请重新运行。"
+
 [editor.window.open]
 damaged = "无法打开此录制的视频轨道。录制包似乎已损坏。"
 failed = "无法打开此录制"

@@ -2841,6 +2841,14 @@ changed = "Cette image a changé pendant le choix d'un remplacement. Sélectionn
 filter = "Images"
 recording_unavailable = "L'enregistrement n'est plus disponible pour cette image. Rouvrez le projet."
 
+[editor.window.mask_lane]
+auto_blur = "Flou automatique"
+failed = "Impossible d'analyser cet enregistrement. Réessayez."
+none_found = "Aucune information sensible trouvée à l'écran."
+prompt = "Floutez automatiquement e-mails, numéros de carte, clés et visages"
+scanning = "Analyse… {percent} %"
+timeline_changed = "Le montage a changé pendant l'analyse. Relancez-la."
+
 [editor.window.open]
 damaged = "Impossible d'ouvrir les pistes vidéo de cet enregistrement. Le dossier semble endommagé."
 failed = "Impossible d'ouvrir cet enregistrement"

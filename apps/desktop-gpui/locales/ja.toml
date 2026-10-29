@@ -2841,6 +2841,14 @@ changed = "置き換えを選んでいる間にこの画像が変更されまし
 filter = "画像"
 recording_unavailable = "この画像の録画は利用できなくなりました。プロジェクトを開き直してください。"
 
+[editor.window.mask_lane]
+auto_blur = "自動ぼかし"
+failed = "この録画をスキャンできませんでした。もう一度お試しください。"
+none_found = "画面上に機密情報は見つかりませんでした。"
+prompt = "メール、カード番号、キー、顔を自動でぼかす"
+scanning = "スキャン中… {percent}%"
+timeline_changed = "スキャン中に編集内容が変わりました。もう一度実行してください。"
+
 [editor.window.open]
 damaged = "この録画の動画トラックを開けませんでした。バンドルが破損しているようです。"
 failed = "この録画を開けませんでした"

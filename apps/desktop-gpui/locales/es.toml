@@ -2841,6 +2841,14 @@ changed = "Esta imagen cambió mientras elegías un reemplazo. Selecciónala e i
 filter = "Imágenes"
 recording_unavailable = "La grabación ya no está disponible para esta imagen. Vuelve a abrir el proyecto."
 
+[editor.window.mask_lane]
+auto_blur = "Desenfoque automático"
+failed = "No se pudo analizar esta grabación. Inténtalo de nuevo."
+none_found = "No se encontró nada sensible en la pantalla."
+prompt = "Desenfoca automáticamente correos, números de tarjeta, claves y caras"
+scanning = "Analizando… {percent} %"
+timeline_changed = "La edición cambió durante el análisis. Vuelve a ejecutarlo."
+
 [editor.window.open]
 damaged = "No se pudieron abrir las pistas de vídeo de esta grabación. El paquete parece dañado."
 failed = "No se pudo abrir esta grabación"

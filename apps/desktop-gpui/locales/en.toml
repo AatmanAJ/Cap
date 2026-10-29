@@ -2843,6 +2843,14 @@ changed = "This image changed while choosing a replacement. Select it and try ag
 filter = { text = "Images", context = "File type filter name in the image file picker." }
 recording_unavailable = "The recording is no longer available for this image. Please reopen the project."
 
+[editor.window.mask_lane]
+auto_blur = "Auto-blur"
+failed = "Could not scan this recording. Try again."
+none_found = "Nothing sensitive found on screen."
+prompt = "Blur emails, card numbers, keys and faces automatically"
+scanning = { text = "Scanning… {percent}%", context = "Button label while the recording is read for private details. {percent} is a whole number from 0 to 100." }
+timeline_changed = "The edit changed during the scan. Run it again."
+
 [editor.window.open]
 damaged = "This recording's video tracks could not be opened. The bundle looks damaged."
 failed = "This recording could not be opened"

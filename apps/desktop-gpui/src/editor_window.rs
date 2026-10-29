@@ -42,7 +42,7 @@ use std::{
     rc::Rc,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -1314,6 +1314,27 @@ struct Drag {
     paused: bool,
 }
 
+struct SensitiveScan {
+    progress: f64,
+    cancel: Arc<AtomicBool>,
+}
+
+/// Whether masks computed for `scanned` still fit `current`: anything but
+/// the masks themselves moving the screen or the timeline invalidates them.
+fn same_edit_apart_from_masks(
+    scanned: &ProjectConfiguration,
+    current: &ProjectConfiguration,
+) -> bool {
+    let without_masks = |project: &ProjectConfiguration| {
+        let mut project = project.clone();
+        if let Some(timeline) = project.timeline.as_mut() {
+            timeline.mask_segments.clear();
+        }
+        serde_json::to_value(project).ok()
+    };
+    without_masks(scanned) == without_masks(current)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct LaneReorder {
     source: TrackRow,
@@ -1452,6 +1473,9 @@ pub struct EditorWindow {
     /// (`TL/ZoomTrack.tsx:60-65`).
     generating_auto_zoom: bool,
     auto_zoom_message: Option<fn() -> &'static str>,
+    /// The auto-blur scan in flight, and the note its last run left.
+    sensitive_scan: Option<SensitiveScan>,
+    sensitive_scan_message: Option<fn() -> &'static str>,
     /// The language the timeline model's placeholder labels were built in.
     timeline_locale: crate::i18n::Locale,
     zoom_prompt_dismissed: bool,
@@ -2112,6 +2136,8 @@ impl EditorWindow {
             playback_tick: 0,
             generating_auto_zoom: false,
             auto_zoom_message: None,
+            sensitive_scan: None,
+            sensitive_scan_message: None,
             timeline_locale: crate::i18n::current(),
             zoom_prompt_dismissed: false,
             hovering_generate_zoom: false,
@@ -5798,6 +5824,152 @@ impl EditorWindow {
             .ok();
         })
         .detach();
+    }
+
+    /// Reads the edited recording for email addresses, card numbers, keys
+    /// and faces off the UI thread, then lands a blur mask that follows each
+    /// one as a single undo step.
+    pub(crate) fn scan_sensitive_info(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.sensitive_scan.is_some() || !cap_editor::sensitive_scan_available() {
+            return;
+        }
+        let Some(instance) = self.instance.clone() else {
+            return;
+        };
+        if !edits::ensure_timeline(&mut self.project, &self.clip_display_durations) {
+            return;
+        }
+        let project = self.project.clone();
+        let recording_meta = instance.render_constants.recording_meta.clone();
+        let constants = instance.render_constants.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let progress = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        self.sensitive_scan = Some(SensitiveScan {
+            progress: 0.0,
+            cancel: cancel.clone(),
+        });
+        self.sensitive_scan_message = None;
+        cx.notify();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let scanned = project.clone();
+            let scan_progress = progress.clone();
+            let scan_finished = finished.clone();
+            let scan_cancel = cancel.clone();
+            let scan = gpui_tokio::Tokio::spawn(cx, async move {
+                let result = cap_editor::scan_for_sensitive_info(
+                    &recording_meta,
+                    constants,
+                    Arc::new(scanned),
+                    edits::default_mask_segment(0.0, 1.0, 0),
+                    cap_editor::SensitiveScanOptions::default(),
+                    move |value| scan_progress.store(value.to_bits(), Ordering::Relaxed),
+                    scan_cancel,
+                )
+                .await;
+                scan_finished.store(true, Ordering::Release);
+                result
+            });
+
+            while !finished.load(Ordering::Acquire) {
+                cx.background_executor()
+                    .timer(Duration::from_millis(100))
+                    .await;
+                let value = f64::from_bits(progress.load(Ordering::Relaxed));
+                let alive = this.update(cx, |this, cx| {
+                    if let Some(scan) = this.sensitive_scan.as_mut()
+                        && (value - scan.progress).abs() >= 0.01
+                    {
+                        scan.progress = value;
+                        cx.notify();
+                    }
+                });
+                if alive.is_err() {
+                    cancel.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+
+            let result = scan.await;
+            this.update_in(cx, |this, window, cx| {
+                this.sensitive_scan = None;
+                let result = match result {
+                    Ok(Ok(result)) => result,
+                    Ok(Err(error)) => {
+                        if !cancel.load(Ordering::Relaxed) {
+                            tracing::warn!(error, "sensitive info scan failed");
+                            this.sensitive_scan_message =
+                                Some(tr::editor::window::mask_lane::failed);
+                        }
+                        cx.notify();
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "sensitive info scan task failed");
+                        this.sensitive_scan_message = Some(tr::editor::window::mask_lane::failed);
+                        cx.notify();
+                        return;
+                    }
+                };
+                tracing::info!(
+                    masks = result.masks.len(),
+                    probed_frames = result.probed_frames,
+                    recognition_passes = result.recognition_passes,
+                    elapsed_ms = result.elapsed.as_millis() as u64,
+                    "sensitive info scan finished"
+                );
+                if !same_edit_apart_from_masks(&project, &this.project) {
+                    this.sensitive_scan_message =
+                        Some(tr::editor::window::mask_lane::timeline_changed);
+                    cx.notify();
+                    return;
+                }
+                let existing = this
+                    .project
+                    .timeline
+                    .as_ref()
+                    .map(|timeline| timeline.mask_segments.clone())
+                    .unwrap_or_default();
+                let masks = cap_redaction::masks::place_masks(&existing, result.masks);
+                if masks.is_empty() {
+                    this.sensitive_scan_message = Some(tr::editor::window::mask_lane::none_found);
+                    cx.notify();
+                    return;
+                }
+                let lanes = masks.iter().map(|mask| mask.track + 1).max().unwrap_or(0);
+                this.tracks.mask = this.tracks.mask.max(lanes);
+                let applied = this.edit(
+                    |timeline| {
+                        for mask in masks {
+                            edits::insert_mask_segment(timeline, mask);
+                        }
+                        true
+                    },
+                    window,
+                    cx,
+                );
+                if applied {
+                    this.note_edit("auto-blur", Some(TrackKind::Mask));
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Stops the scan; the lane stays busy until the scan has wound down,
+    /// so a new one never races the old one's result.
+    fn cancel_sensitive_scan(&mut self, cx: &mut Context<Self>) {
+        if let Some(scan) = self.sensitive_scan.as_ref() {
+            scan.cancel.store(true, Ordering::Relaxed);
+            cx.notify();
+        }
+    }
+
+    fn sensitive_scan_prompt(&self) -> &'static str {
+        self.sensitive_scan_message
+            .unwrap_or(tr::editor::window::mask_lane::prompt)()
     }
 
     fn create_gap_segment(
@@ -11167,6 +11339,9 @@ impl EditorWindow {
         // made from nothing.
         let camera3d_prompt =
             model.segments(TrackKind::ThreeD).is_empty() && self.transport.is_some();
+        let mask_prompt = cap_editor::sensitive_scan_available()
+            && self.transport.is_some()
+            && (model.segments(TrackKind::Mask).is_empty() || self.sensitive_scan.is_some());
         let zoom_prompt = !self.zoom_prompt_dismissed
             && model.segments(TrackKind::Zoom).is_empty()
             && self
@@ -11478,6 +11653,87 @@ impl EditorWindow {
                                     ),
                             )
                     }))
+                    // The first mask lane, while empty, offers to find what
+                    // needs hiding. Only the copy and buttons take the
+                    // press, so the rest of the lane still makes a mask.
+                    .children(
+                        (kind == TrackKind::Mask && lane == 0 && mask_prompt).then(|| {
+                            let progress = self.sensitive_scan.as_ref().map(|scan| scan.progress);
+                            div()
+                                .id("mask-scan-prompt")
+                                .debug_selector(|| "mask-scan-prompt".into())
+                                .absolute()
+                                .left(px(timeline::TRACK_GUTTER))
+                                .right_0()
+                                .top_0()
+                                .bottom_0()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .justify_center()
+                                .px(px(10.))
+                                .text_size(px(12.))
+                                .line_height(px(16.))
+                                .text_color(Hsla::from(if row_hovered {
+                                    theme.editor.text_2
+                                } else {
+                                    theme.editor.text_3
+                                }))
+                                .child(
+                                    div()
+                                        .id("mask-scan-hit")
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(10.))
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|_, _, _, cx| cx.stop_propagation()),
+                                        )
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .truncate()
+                                                .child(self.sensitive_scan_prompt()),
+                                        )
+                                        .child(
+                                            ui::Button::plain(
+                                                &theme,
+                                                "mask-scan-button",
+                                                ui::ButtonVariant::Primary,
+                                                ui::ButtonSize::Sm,
+                                            )
+                                            .label(match progress {
+                                                Some(progress) => {
+                                                    tr::editor::window::mask_lane::scanning(
+                                                        (progress * 100.0).floor() as u32,
+                                                    )
+                                                }
+                                                None => tr::editor::window::mask_lane::auto_blur()
+                                                    .into(),
+                                            })
+                                            .radius(px(7.))
+                                            .disabled(progress.is_some())
+                                            .on_click(
+                                                cx.listener(|this, _, window, cx| {
+                                                    this.scan_sensitive_info(window, cx);
+                                                }),
+                                            ),
+                                        )
+                                        .children(progress.is_some().then(|| {
+                                            ui::IconButton::new("mask-scan-cancel", "icons/x.svg")
+                                                .size(px(20.))
+                                                .icon_size(px(12.))
+                                                .color(Hsla::from(theme.editor.text_3))
+                                                .hover_bg(Hsla::from(theme.editor.ctl_hover))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.cancel_sensitive_scan(cx);
+                                                }))
+                                        })),
+                                )
+                        }),
+                    )
                     .children((kind == TrackKind::ThreeD && camera3d_prompt).then(|| {
                         div()
                             .id("camera3d-empty-prompt")
@@ -13171,6 +13427,25 @@ mod tests {
             "style_controls timeline_segments=2000 samples=31 repaints_per_sample=10 median_us={:.3}",
             samples[samples.len() / 2]
         );
+    }
+
+    #[test]
+    fn auto_blur_results_only_land_on_the_edit_they_were_made_for() {
+        let mut scanned = ProjectConfiguration::default();
+        assert!(edits::ensure_timeline(&mut scanned, &[10.0]));
+        let mut current = scanned.clone();
+        current
+            .timeline
+            .as_mut()
+            .unwrap()
+            .mask_segments
+            .push(edits::default_mask_segment(1.0, 2.0, 0));
+        assert!(same_edit_apart_from_masks(&scanned, &current));
+        current.background.padding = 30.0;
+        assert!(!same_edit_apart_from_masks(&scanned, &current));
+        let mut trimmed = scanned.clone();
+        trimmed.timeline.as_mut().unwrap().segments[0].end = 5.0;
+        assert!(!same_edit_apart_from_masks(&scanned, &trimmed));
     }
 
     #[test]
