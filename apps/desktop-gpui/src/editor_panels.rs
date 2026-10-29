@@ -24,9 +24,10 @@
 
 use cap_project::{
     AudioTrackSegment, Camera3DBlur, Camera3DBlurMode, Camera3DKeyframe, Camera3DProperties,
-    Camera3DSegment, CaptionTrackSegment, KeyboardTrackSegment, MaskKind, MaskSegment, SceneMode,
-    SceneSegment, SplitLayout, TextAlign, TextAnimation, TextBackgroundStyle, TextLayout,
-    TextSegment, TimelineConfiguration, XY, ZoomMode, ZoomSegment, mask_effect_contract,
+    Camera3DSegment, CaptionTrackSegment, KeyboardTrackSegment, MaskKind, MaskSegment,
+    ProjectConfiguration, SceneMode, SceneSegment, SplitLayout, TextAlign, TextAnimation,
+    TextBackgroundStyle, TextLayout, TextSegment, TimelineConfiguration, XY, ZoomMode, ZoomSegment,
+    mask_effect_contract,
 };
 use gpui::{
     AnyElement, AppContext, Context, Entity, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -2728,6 +2729,8 @@ pub enum PanelSlider {
     /// The multi-zoom panel's single Amount slider, which writes every selected
     /// segment at once.
     ZoomAmountAll,
+    /// The project's [`ProjectConfiguration::auto_zoom_lead`], in seconds.
+    AutoZoomLead,
 
     TextLayoutTransition,
     TextFontSize,
@@ -3384,6 +3387,9 @@ impl EditorWindow {
             PanelSlider::StyleCameraOnlyPadding => (0., 40., 1.),
             // `minValue={1} maxValue={4.5} step={0.001}` (`:5601-5603`).
             PanelSlider::ZoomAmount | PanelSlider::ZoomAmountAll => (1., 4.5, 0.001),
+            PanelSlider::AutoZoomLead => {
+                (0., ProjectConfiguration::AUTO_ZOOM_LEAD_MAX as f32, 0.05)
+            }
             PanelSlider::TextLayoutTransition => (0.1, 1.5, 0.05),
             PanelSlider::TextFontSize => (TEXT_FONT_SIZE_MIN, TEXT_FONT_SIZE_MAX, 1.),
             PanelSlider::TextLineHeight => (0.8, 2., 0.05),
@@ -3443,6 +3449,7 @@ impl EditorWindow {
                 .zoom_segments
                 .get(index)
                 .map_or(1., |segment| segment.amount as f32),
+            PanelSlider::AutoZoomLead => self.project.auto_zoom_lead as f32,
             // `sharedAmount() ?? averageAmount()` (`:5919`).
             PanelSlider::ZoomAmountAll => {
                 let indices = self.zoom_selection_indices();
@@ -3607,6 +3614,16 @@ impl EditorWindow {
                         }
                     }
                     changed
+                });
+            }
+            PanelSlider::AutoZoomLead => {
+                let lead = f64::from(value).clamp(0., ProjectConfiguration::AUTO_ZOOM_LEAD_MAX);
+                self.edit_project_without_timeline("auto-zoom-lead", window, cx, move |project| {
+                    if project.auto_zoom_lead == lead {
+                        return false;
+                    }
+                    project.auto_zoom_lead = lead;
+                    true
                 });
             }
             PanelSlider::TextLayoutTransition
@@ -4358,6 +4375,30 @@ impl EditorWindow {
                         .children(manual.then(|| self.render_pad(PadKey::ZoomManual(index), cx))),
                 ),
             )
+            .child(self.auto_zoom_lead_field(cx))
+            .into_any_element()
+    }
+
+    /// The project-wide "start earlier" lead the click-driven zoom generator
+    /// pads in front of each click.
+    fn auto_zoom_lead_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = self.theme;
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(6.))
+            .child(self.slider_field(
+                tr::editor::panel::zoom::lead(),
+                SliderKey::Panel(PanelSlider::AutoZoomLead, 0),
+                "secs",
+                cx,
+            ))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(Hsla::from(theme.gray_10))
+                    .child(tr::editor::panel::zoom::lead_help()),
+            )
             .into_any_element()
     }
 
@@ -4482,6 +4523,7 @@ impl EditorWindow {
                         field
                     }),
             )
+            .child(self.auto_zoom_lead_field(cx))
             // The per-segment preview grid (`:6046-6068`) is a decoded frame per
             // card; see the README's zoom-preview deviation. The remove-from-
             // selection affordance it carries is reproduced as a plain row.

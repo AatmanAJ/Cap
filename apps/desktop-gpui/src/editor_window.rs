@@ -5770,12 +5770,13 @@ impl EditorWindow {
                 this.generating_auto_zoom = false;
                 this.hovering_generate_zoom = false;
                 edits::ensure_timeline(&mut this.project, &this.clip_display_durations);
+                let lead = this.project.auto_zoom_lead;
                 let segments = this
                     .project
                     .timeline
                     .as_ref()
                     .map_or_else(Vec::new, |timeline| {
-                        edits::generate_zoom_segments_for_timeline(&clicks, timeline, amount)
+                        edits::generate_zoom_segments_for_timeline(&clicks, timeline, amount, lead)
                     });
                 if segments.is_empty() {
                     tracing::info!("auto zoom produced no segments");

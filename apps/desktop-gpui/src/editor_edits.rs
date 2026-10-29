@@ -2110,6 +2110,7 @@ pub fn generate_zoom_segments_for_timeline(
     clicks_by_clip: &[Vec<CursorClickEvent>],
     timeline: &TimelineConfiguration,
     zoom_amount: f64,
+    lead_secs: f64,
 ) -> Vec<ZoomSegment> {
     let ordered_clicks: Vec<_> = clicks_by_clip
         .iter()
@@ -2147,13 +2148,15 @@ pub fn generate_zoom_segments_for_timeline(
             mapped.push(click);
         }
     }
-    generate_zoom_segments_from_clicks(mapped, timeline.duration(), zoom_amount)
+    generate_zoom_segments_from_clicks(mapped, timeline.duration(), zoom_amount, lead_secs)
 }
 
 /// `generate_zoom_segments_from_clicks_impl`
 /// (`src-tauri/src/recording.rs:3706-3782`), the algorithm behind the Tauri
 /// command the empty zoom track's generate button invokes: every click grows
-/// into a padded interval (300ms before, 2.5s after), clicks in the last
+/// into a padded interval (`lead_secs` before -- the project's
+/// [`ProjectConfiguration::auto_zoom_lead`], 300ms by default -- and 2.5s
+/// after), clicks in the last
 /// second are ignored, intervals closer than 2.5s merge, and the result is
 /// clamped inside the recording. The Tauri signature also takes the cursor
 /// *moves* and ignores them; this one does not pretend to want them.
@@ -2161,10 +2164,10 @@ pub fn generate_zoom_segments_from_clicks(
     mut clicks: Vec<CursorClickEvent>,
     max_duration: f64,
     zoom_amount: f64,
+    lead_secs: f64,
 ) -> Vec<ZoomSegment> {
     const MS_PER_SECOND: f64 = 1000.0;
     const START_MIN_MS: f64 = 1.0;
-    const CLICK_PRE_PADDING_MS: f64 = 300.0;
     const CLICK_POST_PADDING_MS: f64 = 2500.0;
     const CLICK_END_CLAMP_PADDING_MS: f64 = 800.0;
     const TRAILING_CLICK_IGNORE_MS: f64 = 1000.0;
@@ -2174,6 +2177,12 @@ pub fn generate_zoom_segments_from_clicks(
         return Vec::new();
     }
 
+    let lead_secs = if lead_secs.is_finite() {
+        lead_secs.clamp(0.0, ProjectConfiguration::AUTO_ZOOM_LEAD_MAX)
+    } else {
+        ProjectConfiguration::default_auto_zoom_lead()
+    };
+    let click_pre_padding_ms = lead_secs * MS_PER_SECOND;
     let duration_ms = max_duration * MS_PER_SECOND;
     let click_cutoff_ms = duration_ms - TRAILING_CLICK_IGNORE_MS;
     let end_limit_ms = duration_ms - CLICK_END_CLAMP_PADDING_MS;
@@ -2194,7 +2203,7 @@ pub fn generate_zoom_segments_from_clicks(
             continue;
         }
 
-        let start = (time_ms - CLICK_PRE_PADDING_MS).max(START_MIN_MS);
+        let start = (time_ms - click_pre_padding_ms).max(START_MIN_MS);
         let end = (time_ms + CLICK_POST_PADDING_MS).min(end_limit_ms);
 
         if end > start {
@@ -3592,6 +3601,7 @@ mod tests {
             vec![click(1_000.), click(2_000.), click(10_000.), click(19_500.)],
             20.0,
             2.0,
+            0.3,
         );
         assert_eq!(segments.len(), 2);
         assert_eq!(segments[0].start, 0.7);
@@ -3602,9 +3612,28 @@ mod tests {
     }
 
     #[test]
+    fn auto_zoom_lead_moves_zoom_starts_earlier() {
+        let clicks = || vec![click(1_000.), click(10_000.)];
+        let starts = |lead: f64| {
+            generate_zoom_segments_from_clicks(clicks(), 20.0, 2.0, lead)
+                .into_iter()
+                .map(|segment| (segment.start, segment.end))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(starts(0.3), vec![(0.7, 3.5), (9.7, 12.5)]);
+        assert_eq!(starts(0.0), vec![(1.0, 3.5), (10.0, 12.5)]);
+        assert_eq!(starts(1.0), vec![(0.001, 3.5), (9.0, 12.5)]);
+        // Out-of-range leads clamp to the slider's range; garbage falls back
+        // to the default.
+        assert_eq!(starts(5.0), starts(1.0));
+        assert_eq!(starts(-1.0), starts(0.0));
+        assert_eq!(starts(f64::NAN), starts(0.3));
+    }
+
+    #[test]
     fn no_clicks_or_no_duration_generate_no_zoom_segments() {
-        assert!(generate_zoom_segments_from_clicks(Vec::new(), 20.0, 2.0).is_empty());
-        assert!(generate_zoom_segments_from_clicks(vec![click(1_000.)], 0.0, 2.0).is_empty());
+        assert!(generate_zoom_segments_from_clicks(Vec::new(), 20.0, 2.0, 0.3).is_empty());
+        assert!(generate_zoom_segments_from_clicks(vec![click(1_000.)], 0.0, 2.0, 0.3).is_empty());
     }
 
     #[test]
@@ -3627,6 +3656,7 @@ mod tests {
             ],
             timeline,
             2.0,
+            0.3,
         );
         let bounds: Vec<_> = zooms.iter().map(|zoom| (zoom.start, zoom.end)).collect();
         assert_eq!(bounds, vec![(1.7, 4.5), (13.7, 16.5), (23.7, 26.5)]);
@@ -3639,6 +3669,7 @@ mod tests {
             &[vec![click(2000.0)], vec![click(4000.0)]],
             project.timeline.as_ref().unwrap(),
             2.0,
+            0.3,
         );
         assert_eq!(zooms.len(), 2);
         assert_eq!((zooms[1].start, zooms[1].end), (13.7, 16.5));
@@ -3665,6 +3696,7 @@ mod tests {
             &[vec![click(3000.0)], vec![click(4000.0)]],
             timeline,
             2.0,
+            0.3,
         );
         let bounds: Vec<_> = zooms.iter().map(|zoom| (zoom.start, zoom.end)).collect();
         assert_eq!(bounds, vec![(5.7, 8.5), (16.7, 19.5)]);
@@ -3689,6 +3721,7 @@ mod tests {
             ]],
             project.timeline.as_ref().unwrap(),
             2.0,
+            0.3,
         );
         assert_eq!(zooms.len(), 1);
         assert_eq!((zooms[0].start, zooms[0].end), (7.7, 9.2));
@@ -3700,7 +3733,7 @@ mod tests {
         let timeline = project.timeline.as_mut().unwrap();
         timeline.segments.truncate(1);
         let clicks = vec![click(0.0), click(4000.0), click(5000.0), click(9500.0)];
-        let expected = generate_zoom_segments_from_clicks(clicks.clone(), 10.0, 2.5);
+        let expected = generate_zoom_segments_from_clicks(clicks.clone(), 10.0, 2.5, 0.3);
         let bounds = |zooms: Vec<ZoomSegment>| {
             zooms
                 .into_iter()
@@ -3711,7 +3744,8 @@ mod tests {
             bounds(generate_zoom_segments_for_timeline(
                 std::slice::from_ref(&clicks),
                 timeline,
-                2.5
+                2.5,
+                0.3
             )),
             bounds(expected.clone())
         );
@@ -3720,7 +3754,8 @@ mod tests {
             bounds(generate_zoom_segments_for_timeline(
                 &[clicks],
                 timeline,
-                2.5
+                2.5,
+                0.3
             )),
             bounds(expected)
         );

@@ -26,13 +26,14 @@
 //! export matches playback by construction.
 
 use cap_project::{
-    Crop, CursorEvents, ProjectConfiguration, ScreenMovementSpring, TimelineConfiguration, XY,
-    ZoomMode, ZoomSegment,
+    Crop, CursorEvents, ProjectConfiguration, SceneMode, ScreenMovementSpring,
+    TimelineConfiguration, XY, ZoomMode, ZoomSegment,
 };
 
 use crate::{
+    ProjectUniforms, RenderOptions,
     spring_mass_damper::{SpringMassDamperSimulation, SpringMassDamperSimulationConfig},
-    zoom::{InterpolatedZoom, SegmentBounds},
+    zoom::{CameraZone, InterpolatedZoom, SegmentBounds},
 };
 
 /// Fixed precompute step (125 Hz), matching the sampling density the old
@@ -109,6 +110,106 @@ impl CursorCropMap {
             (y - self.offset.y) / self.scale.y,
         )
     }
+}
+
+/// The render inputs zoom framing depends on: the raw recorded display size
+/// (cursor UV normalization) and, when a camera was recorded, its frame size
+/// (camera-aware framing). A bare display size leaves camera avoidance off.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ZoomLayoutInputs {
+    pub screen_size: XY<u32>,
+    pub camera_size: Option<XY<u32>>,
+}
+
+impl From<XY<u32>> for ZoomLayoutInputs {
+    fn from(screen_size: XY<u32>) -> Self {
+        Self {
+            screen_size,
+            camera_size: None,
+        }
+    }
+}
+
+impl From<&RenderOptions> for ZoomLayoutInputs {
+    fn from(options: &RenderOptions) -> Self {
+        Self {
+            screen_size: options.screen_size,
+            camera_size: options.camera_size,
+        }
+    }
+}
+
+/// Camera zone in effect from `start` (TIMELINE secs) until the next span.
+#[derive(Clone, Debug, PartialEq)]
+struct CameraZoneSpan {
+    start: f64,
+    zone: Option<CameraZone>,
+}
+
+/// Where the camera overlay sits over time, split at every style and scene
+/// boundary since either can move, resize, hide or re-layout the camera.
+/// Empty when no span has a regular camera overlay to avoid.
+fn camera_zone_spans(
+    project: &ProjectConfiguration,
+    inputs: ZoomLayoutInputs,
+) -> Vec<CameraZoneSpan> {
+    let Some(timeline) = project.timeline.as_ref() else {
+        return Vec::new();
+    };
+    if inputs.camera_size.is_none() || timeline.zoom_segments.is_empty() {
+        return Vec::new();
+    }
+    let options = RenderOptions {
+        camera_size: inputs.camera_size,
+        screen_size: inputs.screen_size,
+        preserve_screen_alpha: false,
+    };
+
+    let mut boundaries = vec![0.0];
+    boundaries.extend(
+        timeline
+            .style_segments
+            .iter()
+            .flat_map(|segment| [segment.start, segment.end])
+            .chain(
+                timeline
+                    .scene_segments
+                    .iter()
+                    .flat_map(|segment| [segment.start, segment.end]),
+            )
+            .filter(|time| time.is_finite() && *time > 0.0),
+    );
+    boundaries.sort_by(f64::total_cmp);
+    boundaries.dedup();
+
+    let mut spans: Vec<CameraZoneSpan> = Vec::new();
+    for (index, &start) in boundaries.iter().enumerate() {
+        let probe = boundaries
+            .get(index + 1)
+            .map_or(start + 1.0, |next| (start + next) / 2.0);
+        let camera_is_overlay = timeline
+            .scene_segments
+            .iter()
+            .find(|segment| probe >= segment.start && probe < segment.end)
+            .is_none_or(|segment| matches!(segment.mode, SceneMode::Default));
+        let zone = camera_is_overlay
+            .then(|| ProjectUniforms::camera_zoom_zone(&options, project, &project.style_at(probe)))
+            .flatten();
+        if spans.last().is_none_or(|last| last.zone != zone) {
+            spans.push(CameraZoneSpan { start, zone });
+        }
+    }
+    if spans.iter().all(|span| span.zone.is_none()) {
+        spans.clear();
+    }
+    spans
+}
+
+fn camera_zone_at(spans: &[CameraZoneSpan], timeline_secs: f64) -> Option<&CameraZone> {
+    let through = spans.partition_point(|span| span.start <= timeline_secs);
+    spans
+        .get(through.checked_sub(1)?)
+        .and_then(|span| span.zone.as_ref())
 }
 
 #[derive(PartialEq)]
@@ -810,6 +911,7 @@ pub struct ZoomTransformTimeline {
     time_map_ordered: bool,
     recording_clip: Option<u32>,
     prefer_outgoing: bool,
+    camera_zones: Vec<CameraZoneSpan>,
     /// Total number of samples covering [0, duration] plus one lerp partner.
     total_samples: usize,
 }
@@ -842,9 +944,11 @@ impl ZoomTransformTimeline {
                 recording_clip: None,
                 prefer_outgoing: false,
             },
+            Vec::new(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_for_recording_clip(
         zoom_segments: &[ZoomSegment],
         timeline: Option<&TimelineConfiguration>,
@@ -853,6 +957,7 @@ impl ZoomTransformTimeline {
         duration_secs: f64,
         crops: CursorCropMaps,
         selection: RecordingClipSelection,
+        camera_zones: Vec<CameraZoneSpan>,
     ) -> Self {
         let RecordingClipSelection {
             recording_clip,
@@ -929,6 +1034,7 @@ impl ZoomTransformTimeline {
                 time_map_ordered,
                 recording_clip,
                 prefer_outgoing,
+                camera_zones,
                 total_samples: 1,
             };
         }
@@ -949,6 +1055,7 @@ impl ZoomTransformTimeline {
             time_map_ordered,
             recording_clip,
             prefer_outgoing,
+            camera_zones,
             total_samples,
         };
 
@@ -987,8 +1094,10 @@ impl ZoomTransformTimeline {
     pub fn project_inputs_match(
         before: &ProjectConfiguration,
         after: &ProjectConfiguration,
-        screen_size: XY<u32>,
+        layout: impl Into<ZoomLayoutInputs>,
     ) -> bool {
+        let layout = layout.into();
+        let screen_size = layout.screen_size;
         let before_timeline = before.timeline.as_ref();
         let after_timeline = after.timeline.as_ref();
         let before_zooms = before_timeline
@@ -1013,24 +1122,26 @@ impl ZoomTransformTimeline {
             && build_time_map(before_timeline) == build_time_map(after_timeline)
             && CursorCropMaps::from_project(before, screen_size)
                 == CursorCropMaps::from_project(after, screen_size)
+            && camera_zone_spans(before, layout) == camera_zone_spans(after, layout)
     }
 
     /// Convenience constructor pulling zoom segments, edit mapping, spring
     /// config and crop mapping out of a [`ProjectConfiguration`].
-    /// `screen_size` is the raw recorded display size in px
-    /// (`RenderOptions::screen_size`), needed to normalize the project's
-    /// pixel-space crop into cursor UV space.
+    /// `layout` carries the raw recorded display size in px, needed to
+    /// normalize the project's pixel-space crop into cursor UV space, and the
+    /// camera frame size that camera-aware framing needs; pass the
+    /// [`RenderOptions`] to get both.
     pub fn from_project(
         project: &ProjectConfiguration,
         cursor_events: &CursorEvents,
         duration_secs: f64,
-        screen_size: XY<u32>,
+        layout: impl Into<ZoomLayoutInputs>,
     ) -> Self {
         Self::from_project_for_recording_clip(
             project,
             cursor_events,
             duration_secs,
-            screen_size,
+            layout.into(),
             None,
             false,
         )
@@ -1040,14 +1151,14 @@ impl ZoomTransformTimeline {
         project: &ProjectConfiguration,
         cursor_events: &CursorEvents,
         duration_secs: f64,
-        screen_size: XY<u32>,
+        layout: impl Into<ZoomLayoutInputs>,
         recording_clip: u32,
     ) -> Self {
         Self::from_project_for_recording_clip(
             project,
             cursor_events,
             duration_secs,
-            screen_size,
+            layout.into(),
             Some(recording_clip),
             false,
         )
@@ -1057,14 +1168,14 @@ impl ZoomTransformTimeline {
         project: &ProjectConfiguration,
         cursor_events: &CursorEvents,
         duration_secs: f64,
-        screen_size: XY<u32>,
+        layout: impl Into<ZoomLayoutInputs>,
         recording_clip: u32,
     ) -> Self {
         Self::from_project_for_recording_clip(
             project,
             cursor_events,
             duration_secs,
-            screen_size,
+            layout.into(),
             Some(recording_clip),
             true,
         )
@@ -1074,7 +1185,7 @@ impl ZoomTransformTimeline {
         project: &ProjectConfiguration,
         cursor_events: &CursorEvents,
         duration_secs: f64,
-        screen_size: XY<u32>,
+        layout: ZoomLayoutInputs,
         recording_clip: Option<u32>,
         prefer_outgoing: bool,
     ) -> Self {
@@ -1088,11 +1199,12 @@ impl ZoomTransformTimeline {
             cursor_events,
             project.screen_movement_spring,
             duration_secs,
-            CursorCropMaps::from_project(project, screen_size),
+            CursorCropMaps::from_project(project, layout.screen_size),
             RecordingClipSelection {
                 recording_clip,
                 prefer_outgoing,
             },
+            camera_zone_spans(project, layout),
         )
     }
 
@@ -1255,9 +1367,10 @@ impl ZoomTransformTimeline {
                 } else {
                     1.0
                 };
-                let center = match segment.mode {
+                let (focus, center) = match segment.mode {
                     ZoomMode::Manual { x, y } => {
-                        (f64::from(x).clamp(0.0, 1.0), f64::from(y).clamp(0.0, 1.0))
+                        let point = (f64::from(x).clamp(0.0, 1.0), f64::from(y).clamp(0.0, 1.0));
+                        (point, point)
                     }
                     ZoomMode::Auto => {
                         let recording_ms = map_timeline_to_recording_secs(
@@ -1270,11 +1383,24 @@ impl ZoomTransformTimeline {
                             .as_ref()
                             .and_then(|clusters| clusters.center_at(timeline_secs, recording_ms))
                             .unwrap_or(FALLBACK_FOCUS);
-                        SegmentBounds::calculate_follow_center(
-                            (focus.0.clamp(0.0, 1.0), focus.1.clamp(0.0, 1.0)),
-                            segment.edge_snap_ratio,
+                        let focus = (focus.0.clamp(0.0, 1.0), focus.1.clamp(0.0, 1.0));
+                        (
+                            focus,
+                            SegmentBounds::calculate_follow_center(focus, segment.edge_snap_ratio),
                         )
                     }
+                };
+                let center = match camera_zone_at(&self.camera_zones, timeline_secs) {
+                    Some(zone) => {
+                        let moved = SegmentBounds::center_avoiding_zone(
+                            amount,
+                            XY::new(focus.0, focus.1),
+                            XY::new(center.0, center.1),
+                            zone,
+                        );
+                        (moved.x, moved.y)
+                    }
+                    None => center,
                 };
 
                 StepTargets {
@@ -1613,7 +1739,7 @@ mod tests {
                         project,
                         &cursor,
                         duration,
-                        screen,
+                        screen.into(),
                         Some(recording_clip),
                         outgoing,
                     )
@@ -3442,5 +3568,232 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn camera_layout() -> ZoomLayoutInputs {
+        ZoomLayoutInputs {
+            screen_size: XY::new(1920, 1080),
+            camera_size: Some(XY::new(1280, 720)),
+        }
+    }
+
+    fn project_with_camera(zoom_segments: Vec<ZoomSegment>) -> ProjectConfiguration {
+        let mut project = project_with_crop_styles(zoom_segments, Vec::new());
+        project.camera.zoom_avoids_camera = true;
+        project
+    }
+
+    fn camera_zone(project: &ProjectConfiguration) -> CameraZone {
+        let layout = camera_layout();
+        let options = RenderOptions {
+            camera_size: layout.camera_size,
+            screen_size: layout.screen_size,
+            preserve_screen_alpha: false,
+        };
+        ProjectUniforms::camera_zoom_zone(&options, project, project).expect("camera zone")
+    }
+
+    fn precomputed(
+        project: &ProjectConfiguration,
+        layout: impl Into<ZoomLayoutInputs>,
+        duration: f64,
+    ) -> ZoomTransformTimeline {
+        let mut timeline = ZoomTransformTimeline::from_project(
+            project,
+            &CursorEvents::default(),
+            duration,
+            layout,
+        );
+        timeline.precompute();
+        timeline
+    }
+
+    fn focus_on_screen(zoom: &InterpolatedZoom, focus: XY<f64>) -> XY<f64> {
+        let scale = zoom.bounds.bottom_right - zoom.bounds.top_left;
+        focus * scale + zoom.bounds.top_left
+    }
+
+    fn under(zone: &CameraZone, point: XY<f64>) -> bool {
+        zone.contains(point)
+    }
+
+    #[test]
+    fn camera_zone_tracks_the_default_bottom_right_camera() {
+        let project = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, 0.85, 0.8)]);
+        let zone = camera_zone(&project);
+        assert!(zone.top_left.x > 0.5 && zone.top_left.y > 0.5, "{zone:?}");
+        assert!(
+            zone.bottom_right.x > 0.95 && zone.bottom_right.y > 0.95,
+            "{zone:?}"
+        );
+
+        let mut shrunk = project.clone();
+        shrunk.camera.scale_during_zoom = 0.4;
+        let small = camera_zone(&shrunk);
+        assert!(small.top_left.x > zone.top_left.x && small.top_left.y > zone.top_left.y);
+
+        let mut left = project.clone();
+        left.camera.position.x = cap_project::CameraXPosition::Left;
+        left.camera.position.y = cap_project::CameraYPosition::Top;
+        let top_left = camera_zone(&left);
+        assert!(top_left.top_left.x < 0.05 && top_left.bottom_right.x < 0.5);
+        assert!(top_left.top_left.y < 0.05 && top_left.bottom_right.y < 0.5);
+    }
+
+    #[test]
+    fn zoom_moves_its_focus_out_from_under_the_camera() {
+        let focus = XY::new(0.85, 0.8);
+        let project = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, focus.x, focus.y)]);
+        let zone = camera_zone(&project);
+
+        let plain = precomputed(&project, XY::new(1920, 1080), 6.0);
+        let aware = precomputed(&project, camera_layout(), 6.0);
+        let plain_zoom = plain.sample(4.0);
+        let aware_zoom = aware.sample(4.0);
+        assert!((aware_zoom.display_amount() - 2.0).abs() < 1e-3);
+        assert!(under(&zone, focus_on_screen(&plain_zoom, focus)));
+        let moved = focus_on_screen(&aware_zoom, focus);
+        assert!(!under(&zone, moved), "{moved:?} under {zone:?}");
+        assert!(moved.x >= 0.0 && moved.x <= 1.0 && moved.y >= 0.0 && moved.y <= 1.0);
+        assert!(aware_zoom.bounds.top_left.x <= 1e-6 && aware_zoom.bounds.bottom_right.x >= 1.0);
+        assert!(aware_zoom.bounds.top_left.y <= 1e-6 && aware_zoom.bounds.bottom_right.y >= 1.0);
+
+        // Before the zoom engages nothing moves.
+        assert_eq!(
+            plain.sample(0.5).bounds,
+            aware.sample(0.5).bounds,
+            "framing changed before any zoom"
+        );
+    }
+
+    #[test]
+    fn camera_avoidance_is_off_unless_a_camera_overlay_is_shown() {
+        let base = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, 0.85, 0.8)]);
+        let reference = precomputed(&base, XY::new(1920, 1080), 6.0);
+
+        let mut toggled_off = base.clone();
+        toggled_off.camera.zoom_avoids_camera = false;
+        let mut hidden = base.clone();
+        hidden.camera.hide = true;
+        let mut variants = vec![toggled_off, hidden];
+        for mode in [
+            SceneMode::CameraOnly,
+            SceneMode::HideCamera,
+            SceneMode::SplitScreen,
+            SceneMode::Floating,
+        ] {
+            let mut scene = base.clone();
+            scene
+                .timeline
+                .as_mut()
+                .unwrap()
+                .scene_segments
+                .push(cap_project::SceneSegment {
+                    start: 0.0,
+                    end: 6.0,
+                    mode,
+                    split_layout: None,
+                    transition_in: 0.0,
+                    transition_out: 0.0,
+                });
+            variants.push(scene);
+        }
+        for project in &variants {
+            let spans = camera_zone_spans(project, camera_layout());
+            assert!((0..60).all(|tenth| camera_zone_at(&spans, f64::from(tenth) / 10.0).is_none()));
+            assert_samples_identical(&reference, &precomputed(project, camera_layout(), 6.0));
+        }
+    }
+
+    #[test]
+    fn camera_zone_spans_follow_scene_and_style_changes() {
+        let mut project = project_with_camera(vec![manual_segment(1.0, 9.0, 2.0, 0.85, 0.8)]);
+        let mut top_left = project.camera.clone();
+        top_left.position.x = cap_project::CameraXPosition::Left;
+        top_left.position.y = cap_project::CameraYPosition::Top;
+        let timeline = project.timeline.as_mut().unwrap();
+        timeline.scene_segments.push(cap_project::SceneSegment {
+            start: 2.0,
+            end: 4.0,
+            mode: SceneMode::CameraOnly,
+            split_layout: None,
+            transition_in: 0.0,
+            transition_out: 0.0,
+        });
+        timeline.style_segments.push(StyleSegment {
+            start: 6.0,
+            end: 8.0,
+            overrides: StyleOverrides {
+                camera: Some(top_left),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let spans = camera_zone_spans(&project, camera_layout());
+        let bottom_right = camera_zone(&project);
+        let zone_at = |time| camera_zone_at(&spans, time).copied();
+        assert_eq!(zone_at(1.0), Some(bottom_right));
+        assert_eq!(zone_at(3.0), None);
+        assert_eq!(zone_at(5.0), Some(bottom_right));
+        let styled = zone_at(7.0).expect("styled camera zone");
+        assert!(styled.bottom_right.x < 0.5 && styled.bottom_right.y < 0.5);
+        assert_eq!(zone_at(8.5), Some(bottom_right));
+    }
+
+    #[test]
+    fn crossing_into_the_camera_keeps_framing_continuous() {
+        // Back-to-back zooms whose focus steps from clear of the camera to
+        // under it: the avoidance re-aim must ride the spring, not snap, and
+        // move no faster than the same re-aims without a camera.
+        let project = project_with_camera(vec![
+            manual_segment(0.5, 2.5, 2.0, 0.78, 0.8),
+            manual_segment(2.5, 4.5, 2.0, 0.86, 0.8),
+            manual_segment(4.5, 6.5, 2.0, 0.70, 0.86),
+        ]);
+        let largest_step = |layout: ZoomLayoutInputs| {
+            let timeline = precomputed(&project, layout, 7.0);
+            let at = |frame: u32| timeline.sample(frame as f32 / 60.0).bounds.top_left;
+            (120..384)
+                .map(|frame| {
+                    let delta = at(frame) - at(frame - 1);
+                    delta.x.abs().max(delta.y.abs())
+                })
+                .fold(0.0_f64, f64::max)
+        };
+        let plain = largest_step(XY::new(1920, 1080).into());
+        let aware = largest_step(camera_layout());
+        assert!(aware > 0.0 && plain > 0.0);
+        assert!(aware < 0.02, "framing jumped by {aware} in one frame");
+        assert!(aware <= plain * 1.5, "aware {aware} vs plain {plain}");
+    }
+
+    #[test]
+    fn camera_layout_changes_invalidate_zoom_samples() {
+        let before = project_with_camera(vec![manual_segment(1.0, 5.0, 2.0, 0.85, 0.8)]);
+        let mut moved = before.clone();
+        moved.camera.position.x = cap_project::CameraXPosition::Left;
+        let mut off = before.clone();
+        off.camera.zoom_avoids_camera = false;
+        let mut restyled = before.clone();
+        restyled.camera.shadow = 10.0;
+
+        for after in [&moved, &off] {
+            assert!(!ZoomTransformTimeline::project_inputs_match(
+                &before,
+                after,
+                camera_layout()
+            ));
+            assert!(ZoomTransformTimeline::project_inputs_match(
+                &before,
+                after,
+                XY::new(1920, 1080)
+            ));
+        }
+        assert!(ZoomTransformTimeline::project_inputs_match(
+            &before,
+            &restyled,
+            camera_layout()
+        ));
     }
 }

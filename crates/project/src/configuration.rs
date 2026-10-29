@@ -565,6 +565,12 @@ pub struct Camera {
     pub scale_during_zoom: f32,
     #[serde(default)]
     pub background_blur: BackgroundBlurConfig,
+    /// Shift zoomed framing so the zoom focus does not sit under the camera.
+    /// The field-level default keeps old projects (and old style overrides
+    /// and presets) framed as before, while `Default::default()` turns it on
+    /// for new recordings.
+    #[serde(default)]
+    pub zoom_avoids_camera: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Type, Default)]
@@ -609,6 +615,7 @@ impl Default for Camera {
             rounding_type: CornerStyle::default(),
             scale_during_zoom: Self::default_scale_during_zoom(),
             background_blur: BackgroundBlurConfig::default(),
+            zoom_avoids_camera: true,
         }
     }
 }
@@ -2707,6 +2714,9 @@ pub struct ProjectConfiguration {
     /// durations from `fade_duration`.
     #[serde(default)]
     pub text_anim_version: u32,
+    /// Seconds an auto-generated zoom starts before the click it frames.
+    #[serde(default = "ProjectConfiguration::default_auto_zoom_lead")]
+    pub auto_zoom_lead: f64,
 }
 
 pub const TEXT_SIZE_VERSION: u32 = 1;
@@ -2758,6 +2768,7 @@ impl Default for ProjectConfiguration {
             color_correction: Default::default(),
             text_size_version: TEXT_SIZE_VERSION,
             text_anim_version: TEXT_ANIM_VERSION,
+            auto_zoom_lead: Self::default_auto_zoom_lead(),
         }
     }
 }
@@ -3012,6 +3023,12 @@ impl ProjectConfiguration {
                             .is_some_and(|camera| !camera.hide)
                 })
             })
+    }
+
+    pub const AUTO_ZOOM_LEAD_MAX: f64 = 1.0;
+
+    pub fn default_auto_zoom_lead() -> f64 {
+        0.3
     }
 
     fn default_screen_motion_blur() -> f32 {
@@ -3306,6 +3323,31 @@ mod tests {
             round_trip.background_blur.is_active(),
             cfg!(target_os = "macos")
         );
+    }
+
+    #[test]
+    fn camera_aware_zoom_is_on_for_new_projects_only() {
+        assert!(Camera::default().zoom_avoids_camera);
+        assert!(ProjectConfiguration::default().camera.zoom_avoids_camera);
+
+        let legacy: ProjectConfiguration = serde_json::from_value(serde_json::json!({
+            "camera": { "size": 30.0 }
+        }))
+        .unwrap();
+        assert!(!legacy.camera.zoom_avoids_camera);
+        assert_eq!(
+            legacy.auto_zoom_lead,
+            ProjectConfiguration::default_auto_zoom_lead()
+        );
+
+        let current = ProjectConfiguration {
+            auto_zoom_lead: 0.75,
+            ..Default::default()
+        };
+        let round_trip: ProjectConfiguration =
+            serde_json::from_slice(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert!(round_trip.camera.zoom_avoids_camera);
+        assert_eq!(round_trip.auto_zoom_lead, 0.75);
     }
 
     fn timeline_with_transitions(transitions: Vec<ClipTransition>) -> TimelineConfiguration {

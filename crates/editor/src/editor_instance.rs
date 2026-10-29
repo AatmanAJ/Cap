@@ -1074,7 +1074,7 @@ impl EditorInstance {
                         && !ZoomTransformTimeline::project_inputs_match(
                             &previous,
                             &project,
-                            self.render_constants.options.screen_size,
+                            &self.render_constants.options,
                         )
                     {
                         zoom_timelines.clear();
@@ -1170,7 +1170,7 @@ impl EditorInstance {
                                         &project,
                                         &segment_medias.cursor,
                                         total_duration,
-                                        self.render_constants.options.screen_size,
+                                        &self.render_constants.options,
                                         segment.recording_clip,
                                     )
                                 });
@@ -1223,7 +1223,7 @@ impl EditorInstance {
                                                 &project,
                                                 &outgoing_media.cursor,
                                                 total_duration,
-                                                self.render_constants.options.screen_size,
+                                                &self.render_constants.options,
                                                 outgoing.segment.recording_clip,
                                             )
                                         });

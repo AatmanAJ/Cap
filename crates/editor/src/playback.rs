@@ -1203,7 +1203,7 @@ impl Playback {
                                 project,
                                 &seg.cursor,
                                 duration,
-                                self.render_constants.options.screen_size,
+                                &self.render_constants.options,
                                 recording_clip as u32,
                             )
                         })
@@ -1226,7 +1226,7 @@ impl Playback {
                                 project,
                                 &segment.cursor,
                                 duration,
-                                self.render_constants.options.screen_size,
+                                &self.render_constants.options,
                                 recording_clip as u32,
                             )
                         })
@@ -1545,7 +1545,7 @@ impl Playback {
                     let zoom_changed = !ZoomTransformTimeline::project_inputs_match(
                         &cached_project,
                         &next_project,
-                        self.render_constants.options.screen_size,
+                        &self.render_constants.options,
                     );
                     cached_project = Arc::new(next_project);
                     if adopted.is_none()

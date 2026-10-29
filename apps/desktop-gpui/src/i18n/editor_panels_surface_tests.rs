@@ -49,6 +49,11 @@ fn editor_panels_match_the_literals_they_replaced() {
         (tr::editor::panel::zoom::mode(), "Zoom Mode"),
         (tr::editor::panel::zoom::amount(), "Zoom Amount"),
         (tr::editor::panel::zoom::mixed(), "Mixed"),
+        (tr::editor::panel::zoom::lead(), "Start Zooms Earlier"),
+        (
+            tr::editor::panel::zoom::lead_help(),
+            "How long before each click a zoom starts when zooms are generated from clicks.",
+        ),
         (
             tr::editor::panel::zoom::positions_mixed(),
             "Segments zoom into different spots. Drag to move them all to the same one.",

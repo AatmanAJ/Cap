@@ -223,7 +223,7 @@ use takeover::InterpolatedTakeover;
 pub use takeover::TakeoverDisplayMorph;
 use text::{PreparedText, prepare_texts};
 use zoom::*;
-pub use zoom_spring::{CursorCropMap, ZoomTransformTimeline};
+pub use zoom_spring::{CursorCropMap, ZoomLayoutInputs, ZoomTransformTimeline};
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct Nv12RenderStartupBreakdownMs {
@@ -952,7 +952,7 @@ pub async fn render_video_to_channel(
                 project,
                 &segment.cursor,
                 duration,
-                constants.options.screen_size,
+                &constants.options,
                 recording_clip as u32,
             )
         })
@@ -970,7 +970,7 @@ pub async fn render_video_to_channel(
                         project,
                         &segment.cursor,
                         duration,
-                        constants.options.screen_size,
+                        &constants.options,
                         recording_clip as u32,
                     )
                 })
@@ -1526,7 +1526,7 @@ pub async fn render_video_to_channel_nv12(
                 project,
                 &segment.cursor,
                 duration,
-                constants.options.screen_size,
+                &constants.options,
                 recording_clip as u32,
             )
         })
@@ -1544,7 +1544,7 @@ pub async fn render_video_to_channel_nv12(
                         project,
                         &segment.cursor,
                         duration,
-                        constants.options.screen_size,
+                        &constants.options,
                         recording_clip as u32,
                     )
                 })
@@ -3023,6 +3023,19 @@ fn inset_crop_bounds(bounds: [f32; 4], frame_size: [f32; 2], inset: f32) -> [f32
 
 /// Top-left of the camera rect in output px. `manual_position` (normalized
 /// center, clamped fully in-frame) overrides the corner/edge `position` enum.
+fn camera_subject_size(shape: CameraShape, aspect: f32, short_side: f32) -> [f32; 2] {
+    match shape {
+        CameraShape::Source => {
+            if aspect >= 1.0 {
+                [short_side * aspect, short_side]
+            } else {
+                [short_side, short_side / aspect]
+            }
+        }
+        CameraShape::Square => [short_side, short_side],
+    }
+}
+
 fn compute_camera_position(
     camera: &Camera,
     output_size: [f32; 2],
@@ -3458,6 +3471,9 @@ fn normalized_motion_amount(user_motion_blur: f32, fps: f32) -> f32 {
 }
 
 const CAMERA_PADDING: f32 = 50.0;
+/// Clearance kept between a zoom's focus and the camera overlay, as a
+/// fraction of the output's short side.
+const CAMERA_ZOOM_AVOID_MARGIN: f64 = 0.03;
 const CAMERA_EDGE_CROP_INSET_PX: f32 = 2.0;
 
 /// Output aspect ratio at/above which split-screen lays the screen and camera
@@ -4055,6 +4071,79 @@ impl ProjectUniforms {
             descriptor,
             parent_movement_px: parent_vector,
         }
+    }
+
+    /// The regular camera overlay's rect once a zoom has fully engaged
+    /// (scaled by "size during zoom"), grown by
+    /// [`CAMERA_ZOOM_AVOID_MARGIN`], in content-normalized output space.
+    /// `base` sizes the output and `project` is the style-resolved
+    /// configuration, mirroring [`Self::new`]. Normalized geometry does not
+    /// depend on the output resolution, so the base size stands in for it.
+    pub(crate) fn camera_zoom_zone(
+        options: &RenderOptions,
+        base: &ProjectConfiguration,
+        project: &ProjectConfiguration,
+    ) -> Option<CameraZone> {
+        let camera_frame = options.camera_size?;
+        if project.camera.hide
+            || !project.camera.zoom_avoids_camera
+            || camera_frame.x == 0
+            || camera_frame.y == 0
+        {
+            return None;
+        }
+
+        let (base_w, base_h) = Self::get_base_size(options, base);
+        let resolution_base = XY::new(base_w, base_h);
+        let output_size = Self::get_output_size(options, base, resolution_base);
+        let base_crop = Self::get_crop(options, base);
+        let styled_crop = Self::get_crop(options, project);
+        let layout = if base_crop.size != styled_crop.size
+            || base.background.padding != project.background.padding
+        {
+            Self::styled_display_layout(
+                options,
+                project,
+                output_size,
+                resolution_base,
+                options.screen_size,
+            )
+        } else {
+            Self::display_layout(options, project, resolution_base, options.screen_size)
+        };
+        if layout.content_size.x <= 0.0 || layout.content_size.y <= 0.0 {
+            return None;
+        }
+
+        let output = [output_size.0 as f32, output_size.1 as f32];
+        let min_axis = output[0].min(output[1]);
+        let camera_padding = CAMERA_PADDING * output[1] / 1080.0;
+        let scale = project.camera.size / 100.0 * project.camera.scale_during_zoom;
+        let size = camera_subject_size(
+            project.camera.shape,
+            camera_frame.x as f32 / camera_frame.y as f32,
+            min_axis * scale + camera_padding,
+        );
+        let position = compute_camera_position(&project.camera, output, size, camera_padding);
+
+        let margin = f64::from(min_axis) * CAMERA_ZOOM_AVOID_MARGIN;
+        let to_content = |point: XY<f64>| (point - layout.content_offset) / layout.content_size;
+        let top_left = to_content(XY::new(
+            f64::from(position[0]) - margin,
+            f64::from(position[1]) - margin,
+        ));
+        let bottom_right = to_content(XY::new(
+            f64::from(position[0] + size[0]) + margin,
+            f64::from(position[1] + size[1]) + margin,
+        ));
+        [top_left.x, top_left.y, bottom_right.x, bottom_right.y]
+            .iter()
+            .all(|value| value.is_finite())
+            .then_some(CameraZone {
+                top_left,
+                bottom_right,
+                content_aspect: layout.content_size.x / layout.content_size.y,
+            })
     }
 
     fn camera_zoom_factor(
@@ -5026,24 +5115,12 @@ impl ProjectUniforms {
                     Self::camera_zoom_factor(&prev_zoom, &prev_scene, base_size, scale_during_zoom);
 
                 let aspect = frame_size[0] / frame_size[1];
-                let camera_size_for = |scale: f32| match project.camera.shape {
-                    CameraShape::Source => {
-                        if aspect >= 1.0 {
-                            [
-                                (min_axis * scale + camera_padding) * aspect,
-                                min_axis * scale + camera_padding,
-                            ]
-                        } else {
-                            [
-                                min_axis * scale + camera_padding,
-                                (min_axis * scale + camera_padding) / aspect,
-                            ]
-                        }
-                    }
-                    CameraShape::Square => [
+                let camera_size_for = |scale: f32| {
+                    camera_subject_size(
+                        project.camera.shape,
+                        aspect,
                         min_axis * scale + camera_padding,
-                        min_axis * scale + camera_padding,
-                    ],
+                    )
                 };
 
                 let size = camera_size_for(zoomed_size);
