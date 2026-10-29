@@ -4410,17 +4410,19 @@ impl ProjectUniforms {
                 0.0
             };
 
-        let silence_scene_segments = constants
+        let timeline_scene_segments = project
+            .timeline
+            .as_ref()
+            .map(|t| t.scene_segments.as_slice())
+            .unwrap_or(&[]);
+        let merged_scene_segments = constants
             .camera_analysis
-            .scene_segments(shared_project, total_duration);
-        let scene_segments = match &silence_scene_segments {
-            Some(segments) => segments.as_slice(),
-            None => project
-                .timeline
-                .as_ref()
-                .map(|t| t.scene_segments.as_slice())
-                .unwrap_or(&[]),
-        };
+            .silence_scene_segments(shared_project, total_duration)
+            .filter(|silence| !silence.is_empty())
+            .map(|silence| merge_scene_segments(timeline_scene_segments, &silence));
+        let scene_segments = merged_scene_segments
+            .as_deref()
+            .unwrap_or(timeline_scene_segments);
 
         // All zoom transforms come from the precomputed spring timeline
         // (TIMELINE-time domain). The old easing construction — and the
@@ -5147,14 +5149,15 @@ impl ProjectUniforms {
                         }
                     }
                 };
+                let shape_crop_bounds = crop_bounds;
                 let crop_bounds = match face_center {
                     Some(center) => face_crop(
-                        crop_bounds,
+                        shape_crop_bounds,
                         frame_size,
                         center,
                         project.camera.face_zoom_clamped(),
                     ),
-                    None => crop_bounds,
+                    None => shape_crop_bounds,
                 };
 
                 // Morph the camera from its PiP overlay toward its split-screen
@@ -5180,7 +5183,18 @@ impl ProjectUniforms {
                 );
                 let final_crop_bounds = inset_crop_bounds(
                     split_layout.as_ref().map_or(crop_bounds, |s| {
-                        s.camera.crop_for(final_target_bounds, split_t)
+                        let pane = s.camera.crop_for(final_target_bounds, split_t);
+                        if face_center.is_some() {
+                            blend_from_face_crop(
+                                pane,
+                                crop_bounds,
+                                shape_crop_bounds,
+                                frame_size,
+                                split_t,
+                            )
+                        } else {
+                            pane
+                        }
                     }),
                     frame_size,
                     CAMERA_EDGE_CROP_INSET_PX,

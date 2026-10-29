@@ -2,7 +2,6 @@ use cidre::{arc, cv, ns, objc, vn};
 
 use crate::vision::{create_input, write_bgra};
 
-/// A face as fractions of the frame, origin at the top-left.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DetectedFace {
     pub x: f32,
@@ -11,8 +10,6 @@ pub struct DetectedFace {
     pub height: f32,
 }
 
-/// Apple Vision face rectangles (`VNDetectFaceRectanglesRequest`) over BGRA
-/// frames. Keeps the largest face, which is the presenter in a webcam shot.
 #[derive(Default)]
 pub struct FaceDetector {
     input: Option<arc::R<cv::PixelBuf>>,

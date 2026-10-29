@@ -814,10 +814,6 @@ impl EditorInstance {
         self.dispose_inner(true).await
     }
 
-    /// Starts the speech/face analysis the camera settings need when the
-    /// render constants do not have it yet. Cheap when nothing is missing, so
-    /// it is called on every project change; the result is cached on disk
-    /// and the preview re-renders once it lands.
     pub fn ensure_camera_analysis(self: &Arc<Self>, project: &ProjectConfiguration) {
         let Some(meta) = self.meta.studio_meta() else {
             return;

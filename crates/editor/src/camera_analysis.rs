@@ -3,8 +3,12 @@ use cap_rendering::{
     CameraAnalysis, SegmentSources, SourceFingerprint, SpeechTrack, segment_sources,
 };
 use std::{
-    path::Path,
-    sync::atomic::{AtomicBool, Ordering},
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -33,21 +37,51 @@ impl CameraAnalysisRequest {
     }
 }
 
-/// Runs the speech and face passes a project's camera settings need, reusing
-/// whatever `camera-analysis.json` already holds for unchanged sources, and
-/// writes the result back next to the project.
+fn project_lock(project_path: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: LazyLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> =
+        LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
+    Arc::clone(locks.entry(project_path.to_path_buf()).or_default())
+}
+
+// The editor and an export can ask for the same analysis at once. The second
+// caller waits for the first, then reloads the file and finds the work done.
 pub fn analyze_camera(
     project_path: &Path,
     meta: &StudioRecordingMeta,
     request: CameraAnalysisRequest,
     cancelled: &AtomicBool,
 ) -> Result<CameraAnalysis, String> {
+    let lock = project_lock(project_path);
+    let _guard = loop {
+        match lock.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(poisoned)) => break poisoned.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err("cancelled".into());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        }
+    };
+
     let sources = segment_sources(project_path, meta);
     let mut analysis = CameraAnalysis::load(project_path, &sources);
-    let missing = request.missing_from(&analysis, &sources);
-    if missing.is_empty() {
-        return Ok(analysis);
+    let legacy_log = std::fs::read_to_string(project_path.join("recording-logs.log")).ok();
+    let repairs = crate::segment_audio_timing_repairs(meta, legacy_log.as_deref());
+    let mut changed = false;
+    for (segment, repair) in analysis.segments.iter_mut().zip(&repairs) {
+        if let Some(speech) = &mut segment.speech {
+            let offset = f64::from(repair.mic_offset_secs);
+            if offset.is_finite() && speech.timing_offset != offset {
+                speech.timing_offset = offset;
+                changed = true;
+            }
+        }
     }
+
+    let missing = request.missing_from(&analysis, &sources);
     for (index, (segment, source)) in analysis.segments.iter_mut().zip(&sources).enumerate() {
         if missing.speech
             && segment.speech.is_none()
@@ -55,25 +89,31 @@ pub fn analyze_camera(
             && let Some(fingerprint) = SourceFingerprint::of(mic)
         {
             let started = std::time::Instant::now();
-            let spans =
-                match cap_audio::detect_speech_in_file(mic, || cancelled.load(Ordering::Relaxed)) {
-                    Ok(spans) => spans,
-                    Err(_) if cancelled.load(Ordering::Relaxed) => return Err("cancelled".into()),
-                    Err(error) => {
-                        tracing::warn!(%error, segment = index, "Speech analysis failed");
-                        Vec::new()
-                    }
-                };
-            tracing::info!(
-                segment = index,
-                spans = spans.len(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Analysed camera-silence speech"
-            );
-            segment.speech = Some(SpeechTrack {
-                source: fingerprint,
-                spans,
-            });
+            match cap_audio::detect_speech_in_file(mic, || cancelled.load(Ordering::Relaxed)) {
+                Ok(spans) => {
+                    tracing::info!(
+                        segment = index,
+                        spans = spans.len(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Analysed camera-silence speech"
+                    );
+                    let timing_offset = repairs
+                        .get(index)
+                        .map(|repair| f64::from(repair.mic_offset_secs))
+                        .filter(|offset| offset.is_finite())
+                        .unwrap_or(0.0);
+                    segment.speech = Some(SpeechTrack {
+                        source: fingerprint,
+                        spans,
+                        timing_offset,
+                    });
+                    changed = true;
+                }
+                Err(_) if cancelled.load(Ordering::Relaxed) => return Err("cancelled".into()),
+                Err(error) => {
+                    tracing::warn!(%error, segment = index, "Speech analysis failed");
+                }
+            }
         }
         #[cfg(target_os = "macos")]
         if missing.faces
@@ -82,32 +122,134 @@ pub fn analyze_camera(
             && let Some(fingerprint) = SourceFingerprint::of(camera)
         {
             let started = std::time::Instant::now();
-            let samples = match faces::track(camera, cancelled) {
-                Ok(samples) => samples,
+            match faces::track(camera, cancelled) {
+                Ok(samples) => {
+                    tracing::info!(
+                        segment = index,
+                        samples = samples.len(),
+                        faces = samples.iter().flatten().count(),
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "Analysed camera face track"
+                    );
+                    segment.faces = Some(cap_rendering::FaceTrack {
+                        source: fingerprint,
+                        interval: cap_rendering::FACE_SAMPLE_INTERVAL_SECS,
+                        samples,
+                    });
+                    changed = true;
+                }
                 Err(_) if cancelled.load(Ordering::Relaxed) => return Err("cancelled".into()),
                 Err(error) => {
                     tracing::warn!(%error, segment = index, "Face analysis failed");
-                    Vec::new()
                 }
-            };
-            tracing::info!(
-                segment = index,
-                samples = samples.len(),
-                faces = samples.iter().flatten().count(),
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                "Analysed camera face track"
-            );
-            segment.faces = Some(cap_rendering::FaceTrack {
-                source: fingerprint,
-                interval: cap_rendering::FACE_SAMPLE_INTERVAL_SECS,
-                samples,
-            });
+            }
         }
     }
-    if let Err(error) = analysis.save(project_path) {
+    if changed && let Err(error) = analysis.save(project_path) {
         tracing::warn!(%error, "Could not save camera analysis");
     }
     Ok(analysis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn project_with_mic(mic: &[u8]) -> (tempfile::TempDir, StudioRecordingMeta) {
+        let dir = tempfile::tempdir().unwrap();
+        let segment = dir.path().join("content/segments/segment-0");
+        std::fs::create_dir_all(&segment).unwrap();
+        std::fs::write(segment.join("audio-input.m4a"), mic).unwrap();
+        let meta: StudioRecordingMeta = serde_json::from_value(serde_json::json!({
+            "segments": [{
+                "display": { "path": "content/segments/segment-0/display.mp4", "fps": 30 },
+                "mic": { "path": "content/segments/segment-0/audio-input.m4a" }
+            }]
+        }))
+        .unwrap();
+        (dir, meta)
+    }
+
+    #[test]
+    fn a_mic_that_cannot_be_read_is_never_saved_as_silence() {
+        let (dir, meta) = project_with_mic(b"definitely not an m4a file");
+        let request = CameraAnalysisRequest {
+            speech: true,
+            faces: false,
+        };
+        let analysis = analyze_camera(dir.path(), &meta, request, &AtomicBool::new(false)).unwrap();
+        assert!(analysis.segments[0].speech.is_none());
+        assert!(!CameraAnalysis::path(dir.path()).exists());
+
+        let project = cap_project::ProjectConfiguration {
+            camera: cap_project::Camera {
+                hide_when_silent: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let store = cap_rendering::CameraAnalysisStore::default();
+        store.set(analysis);
+        assert!(store.silence_scene_segments(&project, 30.0).is_none());
+    }
+
+    #[test]
+    fn a_second_caller_waits_and_reuses_the_first_callers_result() {
+        let (dir, meta) = project_with_mic(b"x");
+        let path = dir.path().to_path_buf();
+        let lock = project_lock(&path);
+        let guard = lock.lock().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter = {
+            let (path, meta, cancelled) = (path.clone(), meta.clone(), Arc::clone(&cancelled));
+            std::thread::spawn(move || {
+                analyze_camera(
+                    &path,
+                    &meta,
+                    CameraAnalysisRequest {
+                        speech: true,
+                        faces: false,
+                    },
+                    &cancelled,
+                )
+            })
+        };
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        assert!(!waiter.is_finished());
+
+        let sources = segment_sources(&path, &meta);
+        let mut done = CameraAnalysis::empty(1);
+        done.segments[0].speech = Some(SpeechTrack {
+            source: SourceFingerprint::of(sources[0].mic.as_ref().unwrap()).unwrap(),
+            spans: vec![(1.0, 2.0)],
+            timing_offset: 0.0,
+        });
+        done.save(&path).unwrap();
+        drop(guard);
+
+        let reused = waiter.join().unwrap().unwrap();
+        assert_eq!(
+            reused.segments[0].speech.as_ref().unwrap().spans,
+            vec![(1.0, 2.0)]
+        );
+    }
+
+    #[test]
+    fn a_cancelled_waiter_stops_waiting() {
+        let (dir, meta) = project_with_mic(b"x");
+        let lock = project_lock(dir.path());
+        let _guard = lock.lock().unwrap();
+        let result = analyze_camera(
+            dir.path(),
+            &meta,
+            CameraAnalysisRequest {
+                speech: true,
+                faces: false,
+            },
+            &AtomicBool::new(true),
+        );
+        assert!(result.is_err());
+    }
 }
 
 #[cfg(target_os = "macos")]

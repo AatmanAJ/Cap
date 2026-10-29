@@ -57,7 +57,7 @@ fn main() {
     let store = CameraAnalysisStore::default();
     store.set(analysis);
     let started = Instant::now();
-    let scenes = store.scene_segments(&project, duration);
+    let scenes = store.silence_scene_segments(&project, duration);
     println!(
         "silence windows for {duration:.1}s of timeline computed in {:?}",
         started.elapsed()

@@ -1,4 +1,6 @@
-use cap_project::{ProjectConfiguration, SceneMode, SceneSegment, StudioRecordingMeta};
+use cap_project::{
+    ClipSourceWindow, ProjectConfiguration, SceneMode, SceneSegment, StudioRecordingMeta,
+};
 use serde::{Deserialize, Serialize};
 use std::{
     hash::{Hash, Hasher},
@@ -10,13 +12,12 @@ use std::{
 use crate::scene::MIN_GAP_FOR_TRANSITION;
 
 pub const CAMERA_ANALYSIS_FILE: &str = "camera-analysis.json";
-const CAMERA_ANALYSIS_VERSION: u32 = 1;
+const CAMERA_ANALYSIS_VERSION: u32 = 2;
 
 pub const SILENCE_SHOW_LEAD_SECS: f64 = 0.3;
 pub const SILENCE_MIN_SPEECH_SECS: f64 = 0.2;
 pub const SILENCE_TRANSITION_SECS: f64 = 0.3;
 const SILENCE_MIN_HIDDEN_SECS: f64 = 1.0;
-const SILENCE_GRID_SECS: f64 = 0.02;
 
 pub const FACE_SAMPLE_INTERVAL_SECS: f64 = 0.1;
 const FACE_SMOOTHING_SECS: f64 = 0.45;
@@ -47,6 +48,8 @@ impl SourceFingerprint {
 pub struct SpeechTrack {
     pub source: SourceFingerprint,
     pub spans: Vec<(f64, f64)>,
+    #[serde(default)]
+    pub timing_offset: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
@@ -156,10 +159,19 @@ impl CameraAnalysis {
     }
 
     pub fn save(&self, project_path: &Path) -> std::io::Result<()> {
+        static WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = Self::path(project_path);
-        let temporary = path.with_extension("json.tmp");
-        std::fs::write(&temporary, serde_json::to_vec(self)?)?;
-        std::fs::rename(temporary, path)
+        let temporary = project_path.join(format!(
+            ".{CAMERA_ANALYSIS_FILE}.{}.{}.tmp",
+            std::process::id(),
+            WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let result = std::fs::write(&temporary, serde_json::to_vec(self)?)
+            .and_then(|()| std::fs::rename(&temporary, path));
+        if result.is_err() {
+            std::fs::remove_file(&temporary).ok();
+        }
+        result
     }
 
     pub fn has_speech(&self, sources: &[SegmentSources]) -> bool {
@@ -196,10 +208,6 @@ impl SilenceSettings {
     }
 }
 
-/// Timeline windows where the camera should be hidden, from speech runs
-/// already on the timeline clock. Speech shorter than `min_speech` is
-/// ignored, a silence must outlast `hide_after` before the camera leaves, and
-/// the camera is back `show_lead` before the next speech.
 pub fn silence_windows(
     speech: &[(f64, f64)],
     duration: f64,
@@ -232,47 +240,91 @@ pub fn silence_windows(
     windows
 }
 
-/// Speech runs on the timeline clock, sampled through the timeline's own
-/// frame mapping so clip speed, transitions and holds map exactly as the
-/// renderer does. A clip whose recording has no speech analysis counts as
-/// speaking throughout, so it never hides the camera.
 pub fn timeline_speech(
     project: &ProjectConfiguration,
     analysis: &CameraAnalysis,
     duration: f64,
 ) -> Vec<(f64, f64)> {
-    let steps = (duration / SILENCE_GRID_SECS).ceil().max(0.0) as usize;
+    let windows = match &project.timeline {
+        Some(timeline) => timeline.clip_source_windows(),
+        None => vec![ClipSourceWindow {
+            recording_clip: 0,
+            output_start: 0.0,
+            output_end: duration,
+            source_start: 0.0,
+            timescale: 1.0,
+        }],
+    };
     let mut runs: Vec<(f64, f64)> = Vec::new();
-    for step in 0..steps {
-        let time = step as f64 * SILENCE_GRID_SECS;
-        let speaking = match source_at(project, time) {
-            Some((source_time, clip)) => {
-                let offset = project
-                    .clips
-                    .iter()
-                    .find(|config| config.index == clip)
-                    .map_or(0.0, |config| f64::from(config.offsets.mic));
-                match analysis
-                    .segments
-                    .get(clip as usize)
-                    .and_then(|segment| segment.speech.as_ref())
-                {
-                    Some(speech) => contains(&speech.spans, source_time + offset),
-                    None => true,
-                }
-            }
-            None => true,
-        };
-        if !speaking {
+    for window in windows {
+        if !(window.timescale.is_finite() && window.timescale > 0.0) {
             continue;
         }
-        let end = (time + SILENCE_GRID_SECS).min(duration);
-        match runs.last_mut() {
-            Some(last) if (last.1 - time).abs() < SILENCE_GRID_SECS / 2.0 => last.1 = end,
-            _ => runs.push((time, end)),
+        let speech = analysis
+            .segments
+            .get(window.recording_clip as usize)
+            .and_then(|segment| segment.speech.as_ref());
+        let Some(speech) = speech else {
+            runs.push((window.output_start, window.output_end));
+            continue;
+        };
+        let offset = project
+            .clips
+            .iter()
+            .find(|config| config.index == window.recording_clip)
+            .map_or(0.0, |config| f64::from(config.offsets.mic))
+            + speech.timing_offset;
+        let source_end =
+            window.source_start + (window.output_end - window.output_start) * window.timescale;
+        let first = speech
+            .spans
+            .partition_point(|(_, end)| end - offset <= window.source_start);
+        for &(start, end) in &speech.spans[first..] {
+            let (start, end) = (start - offset, end - offset);
+            if start >= source_end {
+                break;
+            }
+            let start = start.max(window.source_start);
+            let end = end.min(source_end);
+            if end > start {
+                runs.push((
+                    window.output_start + (start - window.source_start) / window.timescale,
+                    window.output_start + (end - window.source_start) / window.timescale,
+                ));
+            }
         }
     }
-    runs
+    merge_spans(runs)
+}
+
+fn merge_spans(mut spans: Vec<(f64, f64)>) -> Vec<(f64, f64)> {
+    spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut merged: Vec<(f64, f64)> = Vec::with_capacity(spans.len());
+    for (start, end) in spans {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1e-6 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+fn intersect_spans(a: &[(f64, f64)], b: &[(f64, f64)]) -> Vec<(f64, f64)> {
+    let mut result = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let start = a[i].0.max(b[j].0);
+        let end = a[i].1.min(b[j].1);
+        if end > start {
+            result.push((start, end));
+        }
+        if a[i].1 < b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    result
 }
 
 fn source_at(project: &ProjectConfiguration, time: f64) -> Option<(f64, u32)> {
@@ -284,14 +336,57 @@ fn source_at(project: &ProjectConfiguration, time: f64) -> Option<(f64, u32)> {
         .map(|(source_time, segment)| (source_time, segment.recording_clip))
 }
 
-fn contains(spans: &[(f64, f64)], time: f64) -> bool {
-    let index = spans.partition_point(|(start, _)| *start <= time);
-    index > 0 && time < spans[index - 1].1
+// Style segments can replace the whole camera config, so the silence setting
+// is resolved per range the same way the renderer resolves it per frame.
+fn silence_regimes(project: &ProjectConfiguration, duration: f64) -> Vec<(f64, f64, Option<f64>)> {
+    let mut cuts = vec![0.0, duration];
+    if let Some(timeline) = &project.timeline {
+        for segment in &timeline.style_segments {
+            if segment.overrides.camera.is_some() {
+                cuts.extend([segment.start, segment.end]);
+            }
+        }
+    }
+    cuts.retain(|cut| cut.is_finite() && (0.0..=duration).contains(cut));
+    cuts.sort_by(f64::total_cmp);
+    cuts.dedup();
+    cuts.windows(2)
+        .filter(|pair| pair[1] > pair[0])
+        .map(|pair| {
+            let camera = project.camera_at((pair[0] + pair[1]) / 2.0);
+            let delay = (!camera.hide && camera.hide_when_silent)
+                .then(|| f64::from(camera.hide_when_silent_delay_clamped()));
+            (pair[0], pair[1], delay)
+        })
+        .collect()
 }
 
-/// Hidden-camera scene segments for the silent windows, kept clear of the
-/// user's own scene segments (and their transitions) so a manual layout
-/// always wins and the two never blend into each other.
+pub fn silence_windows_for_project(
+    project: &ProjectConfiguration,
+    analysis: &CameraAnalysis,
+    duration: f64,
+) -> Vec<(f64, f64)> {
+    let regimes = silence_regimes(project, duration);
+    if regimes.iter().all(|(_, _, delay)| delay.is_none()) {
+        return Vec::new();
+    }
+    let speech = timeline_speech(project, analysis, duration);
+    let mut delays: Vec<f64> = regimes.iter().filter_map(|(_, _, delay)| *delay).collect();
+    delays.sort_by(f64::total_cmp);
+    delays.dedup();
+    let mut windows = Vec::new();
+    for delay in delays {
+        let ranges: Vec<(f64, f64)> = regimes
+            .iter()
+            .filter(|(_, _, regime)| *regime == Some(delay))
+            .map(|(start, end, _)| (*start, *end))
+            .collect();
+        let all = silence_windows(&speech, duration, SilenceSettings::new(delay));
+        windows.extend(intersect_spans(&all, &merge_spans(ranges)));
+    }
+    merge_spans(windows)
+}
+
 pub fn silence_scene_segments(
     windows: &[(f64, f64)],
     explicit: &[SceneSegment],
@@ -344,18 +439,15 @@ pub fn silence_scene_segments(
     segments
 }
 
-fn merge_scene_segments(
+pub fn merge_scene_segments(
     explicit: &[SceneSegment],
-    silence: Vec<SceneSegment>,
+    silence: &[SceneSegment],
 ) -> Vec<SceneSegment> {
-    let mut segments: Vec<SceneSegment> = explicit.iter().cloned().chain(silence).collect();
+    let mut segments: Vec<SceneSegment> = explicit.iter().chain(silence).cloned().collect();
     segments.sort_by(|a, b| a.start.total_cmp(&b.start));
     segments
 }
 
-/// A face track smoothed offline: gaps hold the last face, a 3-tap median
-/// drops single-sample detector outliers, and a critically damped spring run
-/// forward then backward settles jitter without lagging behind the motion.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SmoothedFaceTrack {
     interval: f64,
@@ -451,8 +543,6 @@ fn critically_damped_step(
     (next, speed)
 }
 
-/// The camera crop zoomed by `zoom` and panned so the face sits centred
-/// horizontally and a little above centre, clamped to stay inside the frame.
 pub fn face_crop(base: [f32; 4], frame: [f32; 2], center: [f32; 2], zoom: f32) -> [f32; 4] {
     let zoom = if zoom.is_finite() { zoom.max(1.0) } else { 1.0 };
     let width = (base[2] - base[0]) / zoom;
@@ -460,6 +550,31 @@ pub fn face_crop(base: [f32; 4], frame: [f32; 2], center: [f32; 2], zoom: f32) -
     let face = [center[0] * frame[0], center[1] * frame[1]];
     let x = (face[0] - width / 2.0).clamp(0.0, (frame[0] - width).max(0.0));
     let y = (face[1] - height * FACE_HEADROOM).clamp(0.0, (frame[1] - height).max(0.0));
+    [x, y, x + width, y + height]
+}
+
+// Starting a split morph from the face crop (not the centred shape crop) keeps
+// the first transition frame from jumping; scaling the pane crop instead of
+// lerping corners keeps its aspect, so the morph never stretches.
+pub fn blend_from_face_crop(
+    pane: [f32; 4],
+    face: [f32; 4],
+    shape: [f32; 4],
+    frame: [f32; 2],
+    t: f32,
+) -> [f32; 4] {
+    let t = t.clamp(0.0, 1.0);
+    let lerp = |a: f32, b: f32| a + (b - a) * t;
+    let zoomed = (face[2] - face[0]) / (shape[2] - shape[0]).max(f32::EPSILON);
+    let scale = lerp(zoomed, 1.0);
+    let width = (pane[2] - pane[0]) * scale;
+    let height = (pane[3] - pane[1]) * scale;
+    let center = [
+        lerp((face[0] + face[2]) / 2.0, (pane[0] + pane[2]) / 2.0),
+        lerp((face[1] + face[3]) / 2.0, (pane[1] + pane[3]) / 2.0),
+    ];
+    let x = (center[0] - width / 2.0).clamp(0.0, (frame[0] - width).max(0.0));
+    let y = (center[1] - height / 2.0).clamp(0.0, (frame[1] - height).max(0.0));
     [x, y, x + width, y + height]
 }
 
@@ -515,17 +630,12 @@ impl CameraAnalysisStore {
         Arc::clone(&self.analysis.read().unwrap_or_else(|e| e.into_inner()))
     }
 
-    /// The scene segments the renderer should use: the timeline's own, plus
-    /// hidden-camera segments over silences when the camera is set to hide
-    /// while the speaker is silent. Cached until the timeline, the setting or
-    /// the analysis changes.
-    pub fn scene_segments(
+    pub fn silence_scene_segments(
         &self,
         project: &ProjectConfiguration,
-        duration: f64,
+        fallback_duration: f64,
     ) -> Option<Arc<Vec<SceneSegment>>> {
-        let camera = &project.camera;
-        if camera.hide || !camera.hide_when_silent {
+        if !project.wants_speech_analysis() {
             return None;
         }
         let loaded = self.loaded();
@@ -537,6 +647,10 @@ impl CameraAnalysisStore {
         {
             return None;
         }
+        let duration = project
+            .timeline
+            .as_ref()
+            .map_or(fallback_duration, |timeline| timeline.duration());
         let key = silence_key(project, duration, loaded.generation);
         let mut cached = self.scenes.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = cached.as_ref().filter(|cached| cached.key == key) {
@@ -546,11 +660,12 @@ impl CameraAnalysisStore {
             .timeline
             .as_ref()
             .map_or(&[][..], |timeline| timeline.scene_segments.as_slice());
-        let settings = SilenceSettings::new(f64::from(camera.hide_when_silent_delay_clamped()));
-        let speech = timeline_speech(project, &loaded.analysis, duration);
-        let windows = silence_windows(&speech, duration, settings);
-        let silence = silence_scene_segments(&windows, explicit, settings.transition);
-        let segments = Arc::new(merge_scene_segments(explicit, silence));
+        let windows = silence_windows_for_project(project, &loaded.analysis, duration);
+        let segments = Arc::new(silence_scene_segments(
+            &windows,
+            explicit,
+            SILENCE_TRANSITION_SECS,
+        ));
         *cached = Some(CachedScenes {
             key,
             segments: Arc::clone(&segments),
@@ -558,7 +673,6 @@ impl CameraAnalysisStore {
         Some(segments)
     }
 
-    /// Normalized face centre in the camera frame shown at `timeline_time`.
     pub fn face_center(
         &self,
         project: &ProjectConfiguration,
@@ -585,15 +699,17 @@ impl CameraAnalysisStore {
     }
 }
 
+fn hash_camera(camera: &cap_project::Camera, hasher: &mut impl Hasher) {
+    camera.hide.hash(hasher);
+    camera.hide_when_silent.hash(hasher);
+    camera.hide_when_silent_delay.to_bits().hash(hasher);
+}
+
 fn silence_key(project: &ProjectConfiguration, duration: f64, generation: u64) -> u64 {
     let mut hasher = std::hash::DefaultHasher::new();
     generation.hash(&mut hasher);
     duration.to_bits().hash(&mut hasher);
-    project
-        .camera
-        .hide_when_silent_delay
-        .to_bits()
-        .hash(&mut hasher);
+    hash_camera(&project.camera, &mut hasher);
     for clip in &project.clips {
         clip.index.hash(&mut hasher);
         clip.offsets.mic.to_bits().hash(&mut hasher);
@@ -609,16 +725,26 @@ fn silence_key(project: &ProjectConfiguration, duration: f64, generation: u64) -
             transition.segment_index.hash(&mut hasher);
             transition.duration.to_bits().hash(&mut hasher);
         }
-        for (start, end) in timeline.hold_windows() {
-            start.to_bits().hash(&mut hasher);
-            end.to_bits().hash(&mut hasher);
+        for segment in &timeline.text_segments {
+            segment.start.to_bits().hash(&mut hasher);
+            segment.end.to_bits().hash(&mut hasher);
+            segment.enabled.hash(&mut hasher);
+            std::mem::discriminant(&segment.layout).hash(&mut hasher);
+        }
+        for segment in &timeline.style_segments {
+            segment.start.to_bits().hash(&mut hasher);
+            segment.end.to_bits().hash(&mut hasher);
+            segment.enabled.hash(&mut hasher);
+            segment.track.hash(&mut hasher);
+            if let Some(camera) = &segment.overrides.camera {
+                hash_camera(camera, &mut hasher);
+            }
         }
         for segment in &timeline.scene_segments {
             segment.start.to_bits().hash(&mut hasher);
             segment.end.to_bits().hash(&mut hasher);
             segment.transition_in.to_bits().hash(&mut hasher);
             segment.transition_out.to_bits().hash(&mut hasher);
-            std::mem::discriminant(&segment.mode).hash(&mut hasher);
         }
     }
     hasher.finish()
@@ -722,6 +848,7 @@ mod tests {
                             modified_ms: 0,
                         },
                         spans,
+                        timing_offset: 0.0,
                     }),
                     faces: None,
                 })
@@ -748,6 +875,11 @@ mod tests {
         });
         let runs = timeline_speech(&project, &analysis, 15.0);
         assert!((runs[0].0 - 1.0).abs() < 0.03 && (runs[0].1 - 3.0).abs() < 0.03);
+
+        let mut repaired = analysis.clone();
+        repaired.segments[0].speech.as_mut().unwrap().timing_offset = -0.5;
+        let runs = timeline_speech(&project, &repaired, 15.0);
+        assert!((runs[0].0 - 1.5).abs() < 1e-9 && (runs[0].1 - 3.5).abs() < 1e-9);
     }
 
     #[test]
@@ -794,7 +926,7 @@ mod tests {
         assert_eq!(segments.len(), 2);
         assert!(segments[0].end <= 10.0 - 0.3 - 0.3 - MIN_GAP_FOR_TRANSITION + 1e-9);
         assert!(segments[1].start - 0.3 >= 14.0 + 0.3 + 0.3 + MIN_GAP_FOR_TRANSITION - 1e-9);
-        let merged = merge_scene_segments(&explicit, segments);
+        let merged = merge_scene_segments(&explicit, &segments);
         let at = |time: f64| InterpolatedScene::new(SceneSegmentsCursor::new(time, &merged));
         assert!(approx(at(12.0).regular_camera_transition_opacity(), 1.0));
         assert!(at(6.0).regular_camera_transition_opacity() < 0.01);
@@ -809,19 +941,244 @@ mod tests {
         let store = CameraAnalysisStore::default();
         let mut project = project_with(vec![clip(0, 0.0, 20.0, 1.0)]);
         store.set(analysis_with(vec![vec![(0.0, 2.0), (15.0, 18.0)]]));
-        assert!(store.scene_segments(&project, 20.0).is_none());
+        assert!(store.silence_scene_segments(&project, 20.0).is_none());
         project.camera.hide_when_silent = true;
-        let first = store.scene_segments(&project, 20.0).unwrap();
-        let again = store.scene_segments(&project, 20.0).unwrap();
+        let first = store.silence_scene_segments(&project, 20.0).unwrap();
+        let again = store.silence_scene_segments(&project, 20.0).unwrap();
         assert!(Arc::ptr_eq(&first, &again));
         assert_eq!(first.len(), 1);
         assert!(matches!(first[0].mode, SceneMode::HideCamera));
         project.camera.hide_when_silent_delay = 5.0;
-        let changed = store.scene_segments(&project, 20.0).unwrap();
+        let changed = store.silence_scene_segments(&project, 20.0).unwrap();
         assert!(!Arc::ptr_eq(&first, &changed));
         assert!(approx(changed[0].start, 2.0 + 5.0 + 0.3));
         project.camera.hide = true;
-        assert!(store.scene_segments(&project, 20.0).is_none());
+        assert!(store.silence_scene_segments(&project, 20.0).is_none());
+    }
+
+    #[test]
+    fn editing_a_manual_split_layout_reaches_the_merged_segments() {
+        let store = CameraAnalysisStore::default();
+        let mut project = project_with(vec![clip(0, 0.0, 40.0, 1.0)]);
+        project.camera.hide_when_silent = true;
+        store.set(analysis_with(vec![vec![(0.0, 2.0), (35.0, 38.0)]]));
+        let mut split = scene(20.0, 24.0, SceneMode::SplitScreen);
+        split.split_layout = Some(cap_project::SplitLayout::default());
+        project.timeline.as_mut().unwrap().scene_segments = vec![split];
+
+        let silence = store.silence_scene_segments(&project, 40.0).unwrap();
+        assert!(
+            silence
+                .iter()
+                .all(|segment| matches!(segment.mode, SceneMode::HideCamera))
+        );
+
+        project.timeline.as_mut().unwrap().scene_segments[0]
+            .split_layout
+            .as_mut()
+            .unwrap()
+            .camera_zoom = 2.5;
+        let silence = store.silence_scene_segments(&project, 40.0).unwrap();
+        let merged =
+            merge_scene_segments(&project.timeline.as_ref().unwrap().scene_segments, &silence);
+        let manual = merged
+            .iter()
+            .find(|segment| matches!(segment.mode, SceneMode::SplitScreen))
+            .unwrap();
+        assert_eq!(manual.split_layout.unwrap().camera_zoom, 2.5);
+    }
+
+    #[test]
+    fn style_segments_switch_hide_when_silent_on_and_off() {
+        let store = CameraAnalysisStore::default();
+        let mut project = project_with(vec![clip(0, 0.0, 60.0, 1.0)]);
+        store.set(analysis_with(vec![vec![
+            (0.0, 1.0),
+            (10.0, 11.0),
+            (20.0, 21.0),
+            (30.0, 31.0),
+            (40.0, 41.0),
+            (59.0, 60.0),
+        ]]));
+        let enabled = cap_project::Camera {
+            hide_when_silent: true,
+            hide_when_silent_delay: 3.0,
+            ..Default::default()
+        };
+        project.timeline.as_mut().unwrap().style_segments = vec![cap_project::StyleSegment {
+            start: 20.0,
+            end: 41.0,
+            overrides: cap_project::StyleOverrides {
+                camera: Some(enabled),
+                ..Default::default()
+            },
+            ..Default::default()
+        }];
+        assert!(project.wants_speech_analysis());
+        let windows = silence_windows_for_project(&project, &store.analysis(), 60.0);
+        assert_eq!(windows.len(), 2, "{windows:?}");
+        assert!(approx(windows[0].0, 24.0) && approx(windows[0].1, 29.7));
+        assert!(approx(windows[1].0, 34.0) && approx(windows[1].1, 39.7));
+
+        project.camera.hide_when_silent = true;
+        let windows = silence_windows_for_project(&project, &store.analysis(), 60.0);
+        assert_eq!(windows.len(), 5, "{windows:?}");
+        assert!(approx(windows[0].0, 3.0) && approx(windows[0].1, 9.7));
+        assert!(approx(windows[2].0, 24.0));
+
+        project.timeline.as_mut().unwrap().style_segments[0]
+            .overrides
+            .camera
+            .as_mut()
+            .unwrap()
+            .hide = true;
+        let windows = silence_windows_for_project(&project, &store.analysis(), 60.0);
+        assert!(
+            windows
+                .iter()
+                .all(|(start, end)| *end <= 20.0 || *start >= 41.0)
+        );
+    }
+
+    #[test]
+    fn duration_comes_from_the_timeline_so_preview_and_export_agree() {
+        let store = CameraAnalysisStore::default();
+        let mut project = project_with(vec![clip(0, 0.0, 20.0, 1.0)]);
+        project.camera.hide_when_silent = true;
+        store.set(analysis_with(vec![vec![(0.0, 2.0)]]));
+        let preview = store.silence_scene_segments(&project, 0.0).unwrap();
+        let export = store.silence_scene_segments(&project, 20.0).unwrap();
+        let bounds = |segments: &[SceneSegment]| -> Vec<(f64, f64)> {
+            segments
+                .iter()
+                .map(|segment| (segment.start, segment.end))
+                .collect()
+        };
+        assert_eq!(bounds(&preview), bounds(&export));
+        assert_eq!(preview.len(), 1);
+        assert!(approx(preview[0].end, 20.0));
+    }
+
+    #[test]
+    fn interval_mapping_matches_the_frame_mapping() {
+        let mut project = project_with(vec![
+            clip(0, 1.0, 9.0, 1.0),
+            clip(1, 3.0, 13.0, 2.0),
+            clip(0, 20.0, 26.0, 0.5),
+        ]);
+        let timeline = project.timeline.as_mut().unwrap();
+        timeline.transitions = serde_json::from_value(serde_json::json!([
+            { "segmentIndex": 1, "type": "cross-fade", "duration": 0.8 }
+        ]))
+        .unwrap();
+        timeline.text_segments = serde_json::from_value(serde_json::json!([
+            { "start": 6.0, "end": 8.5, "layout": "fullscreen", "content": "Title" }
+        ]))
+        .unwrap();
+        let timeline = project.timeline.as_ref().unwrap();
+        assert!(!timeline.hold_windows().is_empty());
+        let windows = timeline.clip_source_windows();
+        let duration = timeline.duration();
+        let mut step = 0.0;
+        while step < duration {
+            let expected = project
+                .get_segment_time(step)
+                .map(|(time, segment)| (time, segment.recording_clip));
+            let in_hold = timeline
+                .hold_windows()
+                .iter()
+                .any(|(start, end)| step >= *start && step < *end);
+            let mapped = windows
+                .iter()
+                .find(|w| step >= w.output_start && step < w.output_end)
+                .map(|w| {
+                    (
+                        w.source_start + (step - w.output_start) * w.timescale,
+                        w.recording_clip,
+                    )
+                });
+            if in_hold {
+                assert!(mapped.is_none(), "{step}");
+            } else {
+                let (expected, mapped) = (expected.unwrap(), mapped.unwrap());
+                assert_eq!(expected.1, mapped.1, "{step}");
+                assert!(
+                    (expected.0 - mapped.0).abs() < 1e-6,
+                    "{step}: {expected:?} {mapped:?}"
+                );
+            }
+            step += 0.013;
+        }
+    }
+
+    #[test]
+    fn mapping_a_long_cut_up_timeline_is_fast() {
+        let segments: Vec<_> = (0..200)
+            .map(|index| clip(0, index as f64 * 40.0, index as f64 * 40.0 + 36.0, 1.0))
+            .collect();
+        let mut project = project_with(segments);
+        project.camera.hide_when_silent = true;
+        let spans: Vec<(f64, f64)> = (0..4000)
+            .map(|index| (index as f64 * 2.0, index as f64 * 2.0 + 1.2))
+            .collect();
+        let store = CameraAnalysisStore::default();
+        store.set(analysis_with(vec![spans]));
+        let started = std::time::Instant::now();
+        let segments = store.silence_scene_segments(&project, 0.0).unwrap();
+        let elapsed = started.elapsed();
+        assert!(segments.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_millis(50),
+            "{elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn concurrent_saves_never_leave_a_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..8)
+            .map(|index| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    let mut analysis = analysis_with(vec![vec![(0.0, index as f64 + 1.0)]]);
+                    analysis.segments[0].speech.as_mut().unwrap().spans = (0..2000)
+                        .map(|span| (span as f64, span as f64 + 0.5))
+                        .collect();
+                    for _ in 0..5 {
+                        analysis.save(&path).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let bytes = std::fs::read(CameraAnalysis::path(&path)).unwrap();
+        serde_json::from_slice::<CameraAnalysis>(&bytes).unwrap();
+        let leftovers = std::fs::read_dir(&path)
+            .unwrap()
+            .filter(|entry| entry.as_ref().unwrap().file_name() != CAMERA_ANALYSIS_FILE)
+            .count();
+        assert_eq!(leftovers, 0);
+    }
+
+    #[test]
+    fn split_morph_starts_from_the_face_crop_without_a_jump() {
+        let frame = [1920.0, 1080.0];
+        let shape = [420.0, 0.0, 1500.0, 1080.0];
+        let face = face_crop(shape, frame, [0.3, 0.4], 1.3);
+        let pane_at_start = shape;
+        assert_eq!(
+            blend_from_face_crop(pane_at_start, face, shape, frame, 0.0),
+            face
+        );
+        let pane = [0.0, 100.0, 960.0, 1000.0];
+        assert_eq!(blend_from_face_crop(pane, face, shape, frame, 1.0), pane);
+        let mid = blend_from_face_crop(pane, face, shape, frame, 0.5);
+        let aspect = (mid[2] - mid[0]) / (mid[3] - mid[1]);
+        assert!((aspect - 960.0 / 900.0).abs() < 1e-3);
+        assert!(mid[0] >= 0.0 && mid[2] <= 1920.0 && mid[1] >= 0.0 && mid[3] <= 1080.0);
     }
 
     fn face(x: f32, y: f32) -> Option<FaceBox> {
@@ -931,6 +1288,7 @@ mod tests {
         analysis.segments[0].speech = Some(SpeechTrack {
             source: SourceFingerprint::of(&mic).unwrap(),
             spans: vec![(1.0, 2.0)],
+            timing_offset: 0.0,
         });
         analysis.save(dir.path()).unwrap();
         let loaded = CameraAnalysis::load(dir.path(), &sources);

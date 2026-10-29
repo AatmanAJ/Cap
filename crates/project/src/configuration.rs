@@ -1918,6 +1918,15 @@ pub struct TimelineSource<'a> {
     pub segment: &'a TimelineSegment,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ClipSourceWindow {
+    pub recording_clip: u32,
+    pub output_start: f64,
+    pub output_end: f64,
+    pub source_start: f64,
+    pub timescale: f64,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub enum TimelineFrameMapping<'a> {
     Single {
@@ -2199,6 +2208,48 @@ impl TimelineConfiguration {
         }
 
         None
+    }
+
+    /// The output windows each clip is the frame source for, as
+    /// `get_segment_time` resolves them (a transition belongs to the incoming
+    /// clip), split around fullscreen text holds so every window maps output
+    /// time to source time linearly. Holds themselves are left out.
+    pub fn clip_source_windows(&self) -> Vec<ClipSourceWindow> {
+        let holds = self.hold_windows();
+        let effective_hold_starts: Vec<f64> = holds
+            .iter()
+            .map(|(start, _)| start - held_time_before(&holds, *start))
+            .collect();
+        let mut windows = Vec::new();
+        let mut segment_start = 0.0;
+        for (index, segment) in self.segments.iter().enumerate() {
+            let next = self
+                .effective_transition(index + 1)
+                .map_or(0.0, |transition| transition.duration);
+            let segment_end = segment_start + segment.duration() - next;
+            let mut piece_start = segment_start;
+            let cuts = effective_hold_starts
+                .iter()
+                .copied()
+                .filter(|cut| *cut > segment_start && *cut < segment_end)
+                .chain(std::iter::once(segment_end));
+            for piece_end in cuts {
+                if piece_end > piece_start {
+                    let output_start = effective_to_output(&holds, piece_start);
+                    windows.push(ClipSourceWindow {
+                        recording_clip: segment.recording_clip,
+                        output_start,
+                        output_end: output_start + (piece_end - piece_start),
+                        source_start: segment.start
+                            + (piece_start - segment_start) * segment.timescale,
+                        timescale: segment.timescale,
+                    });
+                }
+                piece_start = piece_end;
+            }
+            segment_start = segment_end;
+        }
+        windows
     }
 
     pub fn get_segment_time(&self, frame_time: f64) -> Option<(f64, &TimelineSegment)> {
@@ -2975,6 +3026,11 @@ impl ProjectConfiguration {
     pub fn cursor_at(&self, time: f64) -> &CursorConfiguration {
         self.style_override_at(time, |overrides| overrides.cursor.as_ref())
             .unwrap_or(&self.cursor)
+    }
+
+    pub fn camera_at(&self, time: f64) -> &Camera {
+        self.style_override_at(time, |overrides| overrides.camera.as_ref())
+            .unwrap_or(&self.camera)
     }
 
     fn style_indices_at(&self, time: f64) -> [Option<usize>; 3] {
