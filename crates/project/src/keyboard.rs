@@ -259,7 +259,22 @@ impl KeyboardTrackSegment {
         }
         let chars: Vec<char> = self.display_text.chars().collect();
         if chars.len() != self.keys.len() {
-            return None;
+            let (before, after): (Vec<_>, Vec<_>) = self
+                .keys
+                .iter()
+                .partition(|key| self.start + key.time_offset / 1000.0 < at);
+            if !before.is_empty() && !after.is_empty() {
+                return None;
+            }
+            left.keys = before.into_iter().cloned().collect();
+            right.keys = after
+                .into_iter()
+                .map(|key| KeyPressDisplay {
+                    key: key.key.clone(),
+                    time_offset: (self.start + key.time_offset / 1000.0 - at) * 1000.0,
+                })
+                .collect();
+            return Some((left, right));
         }
         left.keys.clear();
         right.keys.clear();
@@ -519,11 +534,15 @@ pub fn synchronize_legacy_keyboard(
     {
         return;
     }
-    let settings = project
+    let mut settings = project
         .keyboard
         .as_ref()
         .map(|keyboard| keyboard.settings.clone())
         .unwrap_or_default();
+    // Legacy tracks were always built with the full grouping. Migrating one
+    // must not quietly apply Shortcuts Only, which the editor applies only on
+    // an explicit regenerate.
+    settings.shortcuts_only = false;
     let takes = load_project_keyboard_events(meta).ok();
     let mut events = KeyboardEvents {
         presses: takes
@@ -1760,6 +1779,43 @@ mod timing_tests {
     }
 
     #[test]
+    fn legacy_migration_keeps_the_full_grouping_when_shortcuts_only_is_set() {
+        let directory = tempfile::tempdir().unwrap();
+        let captured = events(&[("h", 1.0), ("i", 1.1), ("Escape", 3.0)]);
+        captured
+            .write_to_file(&directory.path().join("keyboard.bin"))
+            .unwrap();
+        let mut meta: crate::RecordingMeta = serde_json::from_value(serde_json::json!({
+            "pretty_name":"legacy", "segments":[{"display":{"path":"display.mp4","fps":30},"keyboard":"keyboard.bin"}],"cursors":{}
+        })).unwrap();
+        meta.project_path = directory.path().to_path_buf();
+        let mut project = crate::ProjectConfiguration {
+            keyboard: Some(crate::KeyboardData {
+                settings: KeyboardSettings {
+                    shortcuts_only: true,
+                    ..Default::default()
+                },
+            }),
+            timeline: Some(timeline(
+                serde_json::json!([{"start":0.0,"end":10.0,"timescale":1.0}]),
+            )),
+            ..Default::default()
+        };
+        project.timeline.as_mut().unwrap().keyboard_segments =
+            group_key_events(&captured, 500.0, 800.0, true, true);
+        synchronize_legacy_keyboard(&meta, &mut project);
+        let texts: Vec<_> = project
+            .timeline
+            .as_ref()
+            .unwrap()
+            .keyboard_segments
+            .iter()
+            .map(|segment| (segment.id.as_str(), segment.display_text.as_str()))
+            .collect();
+        assert_eq!(texts, [("kb-edit-0-kb-1", "hi"), ("kb-edit-0-kb-2", "⎋")]);
+    }
+
+    #[test]
     fn legacy_generated_tracks_already_rippled_by_a_cut_are_not_shifted_twice() {
         let directory = tempfile::tempdir().unwrap();
         let captured = events(&[("a", 8.2)]);
@@ -2197,5 +2253,41 @@ mod timing_tests {
         segment.display_text = "⌘W".into();
         assert!(segment.split_at(11.0).is_none());
         assert!(!segment.ripple_delete(10.5, 11.5, 1.0));
+    }
+
+    #[test]
+    fn single_press_shortcuts_split_with_the_label_on_both_sides() {
+        let shortcut = |press_offset_ms: f64| KeyboardTrackSegment {
+            id: "kb-edit-0-kb-1".into(),
+            start: 10.0,
+            end: 12.0,
+            display_text: "⌘⇧T".into(),
+            keys: vec![KeyPressDisplay {
+                key: "t".into(),
+                time_offset: press_offset_ms,
+            }],
+            fade_duration_override: None,
+            position_override: None,
+            color_override: None,
+            background_color_override: None,
+            font_size_override: None,
+            uppercase_override: None,
+        };
+
+        let (left, right) = shortcut(0.0).split_at(11.0).unwrap();
+        assert_eq!(
+            (left.start, left.end, right.start, right.end),
+            (10.0, 11.0, 11.0, 12.0)
+        );
+        assert_eq!(left.display_text, "⌘⇧T");
+        assert_eq!(right.display_text, "⌘⇧T");
+        assert_eq!(left.keys.len(), 1);
+        assert!(right.keys.is_empty());
+
+        let (left, right) = shortcut(1500.0).split_at(11.0).unwrap();
+        assert!(left.keys.is_empty());
+        assert_eq!(right.keys.len(), 1);
+        assert!((right.keys[0].time_offset - 500.0).abs() < 1e-9);
+        assert_eq!(right.keys[0].key, "t");
     }
 }

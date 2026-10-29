@@ -24,11 +24,14 @@ pub enum KeyLabelPlatform {
 }
 
 impl KeyLabelPlatform {
+    /// Recordings made before `platform` was saved fall back to the symbols
+    /// the overlay has always drawn, so a preview and a render on another OS
+    /// label them the same way.
     pub fn from_recording(platform: Option<&crate::Platform>) -> Self {
-        match platform.cloned().unwrap_or_default() {
-            crate::Platform::MacOS => Self::Mac,
-            crate::Platform::Windows => Self::Windows,
-            crate::Platform::Linux => Self::Linux,
+        match platform {
+            None | Some(crate::Platform::MacOS) => Self::Mac,
+            Some(crate::Platform::Windows) => Self::Windows,
+            Some(crate::Platform::Linux) => Self::Linux,
         }
     }
 }
@@ -39,13 +42,33 @@ fn is_function_key(key: &str) -> bool {
         .is_some_and(|number| (1..=24).contains(&number))
 }
 
+fn canonical_key(key: &str) -> &str {
+    match key {
+        "NumpadEnter" => "Enter",
+        "NumpadEquals" => "=",
+        "NumpadDecimal" => ".",
+        _ => key,
+    }
+}
+
 fn is_standalone_shortcut_key(key: &str) -> bool {
     STANDALONE_KEYS.contains(&key) || is_function_key(key)
 }
 
+fn types_text(key: &str) -> bool {
+    key == "Space" || key.chars().count() == 1
+}
+
 fn key_label(key: &str, platform: KeyLabelPlatform) -> String {
-    if is_function_key(key) || key == "Space" {
+    if is_function_key(key) || key == "Space" || key == "Insert" {
         return key.to_string();
+    }
+    if key == "CapsLock" {
+        return if platform == KeyLabelPlatform::Mac {
+            "⇪".to_string()
+        } else {
+            "Caps Lock".to_string()
+        };
     }
     if platform != KeyLabelPlatform::Mac {
         let word = match key {
@@ -67,7 +90,12 @@ fn key_label(key: &str, platform: KeyLabelPlatform) -> String {
     if let Some(symbol) = special_key_symbol(key) {
         return symbol.to_string();
     }
-    key.to_uppercase()
+    let mut chars = key.chars();
+    match chars.next() {
+        Some(first) if chars.as_str().is_empty() => first.to_uppercase().collect(),
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 fn shortcut_label(
@@ -76,15 +104,38 @@ fn shortcut_label(
     show_special_keys: bool,
     platform: KeyLabelPlatform,
 ) -> Option<String> {
-    let has = |names: &[&str]| held.iter().any(|held| names.contains(held));
-    // Windows and most Linux layouts type characters such as @ or € with
-    // AltGr, which reports as RAlt (plus a synthetic LControl on Windows), so
-    // treating it as a shortcut would leak typed text.
-    let alt_graph = platform != KeyLabelPlatform::Mac && held.contains(&"RAlt");
-    let control = !alt_graph && has(CONTROL_KEYS);
-    let alt = !alt_graph && has(ALT_KEYS);
+    let key = canonical_key(key);
+    let held_key = |name: &str| held.contains(&name);
+    let has = |names: &[&str]| names.iter().any(|name| held_key(name));
     let shift = has(SHIFT_KEYS);
     let meta = has(META_KEYS);
+    let mut control = has(CONTROL_KEYS);
+    let alt = has(ALT_KEYS);
+    let typing = types_text(key);
+
+    let alt_typing = match platform {
+        // Option, alone or with Shift, types characters such as @, € or ü on
+        // macOS layouts.
+        KeyLabelPlatform::Mac => alt && !control && !meta && typing,
+        // AltGr reports as RAlt, and Windows also holds a synthetic LControl
+        // with it and accepts LControl+LAlt as AltGr, so those combinations
+        // with a printable key are typing too. On Windows a held LControl
+        // next to RAlt is that synthetic key, so only RControl counts.
+        KeyLabelPlatform::Windows => {
+            let right_alt = held_key("RAlt");
+            if right_alt {
+                control = held_key("RControl");
+            }
+            typing
+                && !meta
+                && ((right_alt && !control)
+                    || (held_key("LControl") && held_key("LAlt") && !right_alt))
+        }
+        KeyLabelPlatform::Linux => typing && !meta && held_key("RAlt") && !control,
+    };
+    if alt_typing {
+        return None;
+    }
 
     let shown_alone = show_special_keys && is_standalone_shortcut_key(key);
     if !(control || alt || meta || shown_alone) {
@@ -409,13 +460,117 @@ mod tests {
         ];
         assert_eq!(
             labels(presses.clone(), KeyLabelPlatform::Windows),
-            ["Win+E"]
+            ["Win+Alt+E"]
         );
         assert_eq!(
             labels(presses.clone(), KeyLabelPlatform::Linux),
-            ["Super+E"]
+            ["Ctrl+Alt+Q", "Super+Alt+E"]
         );
         assert_eq!(labels(presses, KeyLabelPlatform::Mac), ["⌃⌥Q", "⌥⌘E"]);
+    }
+
+    fn chord(modifiers: &[&str], key: &str, platform: KeyLabelPlatform) -> Option<String> {
+        let mut presses: Vec<_> = modifiers
+            .iter()
+            .map(|modifier| event(modifier, 0.0, true))
+            .collect();
+        tap(&mut presses, key, 10.0);
+        labels(presses, platform).pop()
+    }
+
+    #[test]
+    fn option_typed_characters_are_hidden_on_mac() {
+        let mac = KeyLabelPlatform::Mac;
+        assert_eq!(chord(&["LOption"], "l", mac), None);
+        assert_eq!(chord(&["LAlt"], "l", mac), None);
+        assert_eq!(chord(&["ROption", "LShift"], "2", mac), None);
+        assert_eq!(chord(&["LAlt"], "Space", mac), None);
+        assert_eq!(chord(&["LAlt"], "NumpadDecimal", mac), None);
+        assert_eq!(chord(&["LAlt"], "Backspace", mac).as_deref(), Some("⌥⌫"));
+        assert_eq!(chord(&["LAlt"], "Up", mac).as_deref(), Some("⌥↑"));
+        assert_eq!(
+            chord(&["LAlt", "LShift"], "Left", mac).as_deref(),
+            Some("⌥⇧←")
+        );
+        assert_eq!(chord(&["LAlt"], "F5", mac).as_deref(), Some("⌥F5"));
+        assert_eq!(chord(&["LAlt"], "Tab", mac).as_deref(), Some("⌥⇥"));
+        assert_eq!(
+            chord(&["LControl", "LAlt"], "l", mac).as_deref(),
+            Some("⌃⌥L")
+        );
+        assert_eq!(chord(&["LAlt", "Meta"], "l", mac).as_deref(), Some("⌥⌘L"));
+    }
+
+    #[test]
+    fn right_alt_keeps_navigation_shortcuts_and_hides_typing_off_mac() {
+        let windows = KeyLabelPlatform::Windows;
+        assert_eq!(chord(&["RAlt"], "Tab", windows).as_deref(), Some("Alt+Tab"));
+        assert_eq!(chord(&["RAlt"], "F4", windows).as_deref(), Some("Alt+F4"));
+        assert_eq!(
+            chord(&["LControl", "RAlt"], "Tab", windows).as_deref(),
+            Some("Alt+Tab")
+        );
+        assert_eq!(chord(&["LControl", "RAlt"], "q", windows), None);
+        assert_eq!(chord(&["RAlt"], "q", windows), None);
+        assert_eq!(
+            chord(&["RControl", "RAlt"], "x", windows).as_deref(),
+            Some("Ctrl+Alt+X")
+        );
+        assert_eq!(chord(&["LControl", "LAlt"], "q", windows), None);
+        assert_eq!(
+            chord(&["LControl", "LAlt"], "Delete", windows).as_deref(),
+            Some("Ctrl+Alt+Del")
+        );
+        assert_eq!(chord(&["LAlt"], "q", windows).as_deref(), Some("Alt+Q"));
+        assert_eq!(
+            chord(&["LControl"], "c", windows).as_deref(),
+            Some("Ctrl+C")
+        );
+
+        let linux = KeyLabelPlatform::Linux;
+        assert_eq!(chord(&["RAlt"], "q", linux), None);
+        assert_eq!(chord(&["RAlt"], "Tab", linux).as_deref(), Some("Alt+Tab"));
+        assert_eq!(
+            chord(&["LControl", "LAlt"], "t", linux).as_deref(),
+            Some("Ctrl+Alt+T")
+        );
+        assert_eq!(chord(&["LAlt"], "q", linux).as_deref(), Some("Alt+Q"));
+    }
+
+    #[test]
+    fn remaining_key_names_get_readable_labels() {
+        let windows = KeyLabelPlatform::Windows;
+        let mac = KeyLabelPlatform::Mac;
+        assert_eq!(
+            chord(&["LControl"], "Insert", windows).as_deref(),
+            Some("Ctrl+Insert")
+        );
+        assert_eq!(chord(&["Meta"], "NumpadEnter", mac).as_deref(), Some("⌘⏎"));
+        assert_eq!(chord(&[], "NumpadEnter", mac).as_deref(), Some("⏎"));
+        assert_eq!(chord(&[], "NumpadEnter", windows).as_deref(), Some("Enter"));
+        assert_eq!(
+            chord(&["LControl"], "CapsLock", windows).as_deref(),
+            Some("Ctrl+Caps Lock")
+        );
+        assert_eq!(chord(&["LControl"], "CapsLock", mac).as_deref(), Some("⌃⇪"));
+        assert_eq!(
+            chord(&["LControl"], "NumpadDecimal", windows).as_deref(),
+            Some("Ctrl+.")
+        );
+        assert_eq!(
+            chord(&["LControl"], "NumpadEquals", windows).as_deref(),
+            Some("Ctrl+=")
+        );
+        assert_eq!(
+            chord(&["LControl"], "pause", windows).as_deref(),
+            Some("Ctrl+Pause")
+        );
+        assert_eq!(
+            chord(&["LControl"], "ü", windows).as_deref(),
+            Some("Ctrl+Ü")
+        );
+        assert_eq!(chord(&[], "Insert", windows), None);
+        assert_eq!(chord(&[], "CapsLock", windows), None);
     }
 
     #[test]
@@ -541,6 +696,10 @@ mod tests {
         );
         assert_eq!(
             KeyLabelPlatform::from_recording(Some(&crate::Platform::MacOS)),
+            KeyLabelPlatform::Mac
+        );
+        assert_eq!(
+            KeyLabelPlatform::from_recording(None),
             KeyLabelPlatform::Mac
         );
     }
