@@ -31,17 +31,42 @@ fn device_frame(index: i64, width: usize, height: usize) -> NativeCameraFrame {
     }
 }
 
+fn device_target() -> ScreenCaptureTarget {
+    ScreenCaptureTarget::MobileDevice {
+        id: "00008110-000A1C2E3F40001E".to_string(),
+        name: "Test iPhone".to_string(),
+        kind: cap_camera::ScreenDeviceKind::IPhone,
+    }
+}
+
+fn video_size(path: &std::path::Path) -> (usize, usize) {
+    let input = ffmpeg::format::input(path).unwrap();
+    let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
+    let decoder = ffmpeg::codec::Context::from_parameters(stream.parameters())
+        .unwrap()
+        .decoder()
+        .video()
+        .unwrap();
+    assert!(input.duration() > 0);
+    (decoder.width() as usize, decoder.height() as usize)
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn mobile_device_feed_is_recorded_as_the_screen_track() {
-    record_device(false).await;
+    record_device(false, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
 async fn webcam_still_records_its_own_track_next_to_a_device_screen() {
-    record_device(true).await;
+    record_device(true, false).await;
 }
 
-async fn record_device(with_webcam: bool) {
+#[tokio::test(flavor = "multi_thread")]
+async fn rotating_the_device_starts_a_segment_at_the_new_size() {
+    record_device(false, true).await;
+}
+
+async fn record_device(with_webcam: bool, rotate: bool) {
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("device.cap");
 
@@ -57,15 +82,10 @@ async fn record_device(with_webcam: bool) {
         )
     });
 
-    let mut builder = studio_recording::Actor::builder(
-        project.clone(),
-        ScreenCaptureTarget::MobileDevice {
-            id: "00008110-000A1C2E3F40001E".to_string(),
-        },
-    )
-    .with_mobile_device_feed(lock)
-    .with_custom_cursor(true)
-    .with_keyboard_capture(true);
+    let mut builder = studio_recording::Actor::builder(project.clone(), device_target())
+        .with_mobile_device_feed(lock)
+        .with_custom_cursor(true)
+        .with_keyboard_capture(true);
     if let Some(webcam) = &webcam {
         builder = builder.with_camera_feed(Arc::new(webcam.lock().await.unwrap()));
     }
@@ -74,8 +94,14 @@ async fn record_device(with_webcam: bool) {
         .await
         .expect("a device target needs no ScreenCaptureKit content");
 
-    for index in 0..(FPS as i64) {
-        device.push_native(device_frame(index, WIDTH, HEIGHT)).await;
+    let frames = FPS as i64 * if rotate { 3 } else { 1 };
+    for index in 0..frames {
+        let (width, height) = if rotate && index >= FPS as i64 {
+            (HEIGHT, WIDTH)
+        } else {
+            (WIDTH, HEIGHT)
+        };
+        device.push_native(device_frame(index, width, height)).await;
         if let Some(webcam) = &webcam {
             webcam.push_native(device_frame(index, 320, 240)).await;
         }
@@ -83,32 +109,38 @@ async fn record_device(with_webcam: bool) {
     }
 
     let completed = handle.stop().await.unwrap();
-    let meta = RecordingMeta::load_for_project(&completed.project_path).unwrap();
+    let project_path = completed.project_path.clone();
+    tokio::task::spawn_blocking({
+        let project_path = project_path.clone();
+        move || cap_recording::recovery::RecoveryManager::remux_if_needed(&project_path)
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    let meta = RecordingMeta::load_for_project(&project_path).unwrap();
     let Some(StudioRecordingMeta::MultipleSegments { inner }) = meta.studio_meta() else {
         panic!("expected a multi-segment Studio recording");
     };
-    let segment = &inner.segments[0];
-    assert!(
-        segment.cursor.is_none(),
-        "a device screen has no cursor data"
-    );
-    assert!(
-        segment.keyboard.is_none(),
-        "a device screen has no key presses"
-    );
-    assert_eq!(segment.camera.is_some(), with_webcam);
+    for segment in &inner.segments {
+        assert!(
+            segment.cursor.is_none(),
+            "a device screen has no cursor data"
+        );
+        assert!(
+            segment.keyboard.is_none(),
+            "a device screen has no key presses"
+        );
+        assert_eq!(segment.camera.is_some(), with_webcam);
+    }
 
-    let display = segment.display.path.to_path(&completed.project_path);
-    let input = ffmpeg::format::input(&display).unwrap();
-    let stream = input.streams().best(ffmpeg::media::Type::Video).unwrap();
-    let decoder = ffmpeg::codec::Context::from_parameters(stream.parameters())
-        .unwrap()
-        .decoder()
-        .video()
-        .unwrap();
-    assert_eq!(
-        (decoder.width() as usize, decoder.height() as usize),
-        (WIDTH, HEIGHT)
-    );
-    assert!(input.duration() > 0);
+    let sizes = inner
+        .segments
+        .iter()
+        .map(|segment| video_size(&segment.display.path.to_path(&project_path)))
+        .collect::<Vec<_>>();
+    if rotate {
+        assert_eq!(sizes, [(WIDTH, HEIGHT), (HEIGHT, WIDTH)]);
+    } else {
+        assert_eq!(sizes, [(WIDTH, HEIGHT)]);
+    }
 }

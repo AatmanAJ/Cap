@@ -259,12 +259,10 @@ pub enum FrameStyle {
     Browser,
     /// A MacBook mockup: black bezel, aluminum body and deck.
     Macbook,
-    /// An iPhone mockup: rounded body, bezel and Dynamic Island. Follows the
-    /// recording's orientation.
+    /// An iPhone mockup: body, bezel and Dynamic Island.
     #[serde(rename = "iPhone")]
     IPhone,
-    /// An iPad mockup: rounded body, bezel and front camera. Follows the
-    /// recording's orientation.
+    /// An iPad mockup: body, bezel and front camera.
     #[serde(rename = "iPad")]
     IPad,
 }

@@ -74,11 +74,14 @@ pub enum ScreenCaptureTarget {
         bounds: LogicalBounds,
     },
     CameraOnly,
-    /// The screen of an iPhone or iPad connected over USB, captured through
-    /// AVFoundation like a camera (macOS only). `id` is the device's
-    /// `AVCaptureDevice.uniqueID`.
+    /// Name and kind are kept from when it was picked: the device may be
+    /// unplugged by the time the recording is finalized.
     MobileDevice {
         id: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        kind: cap_camera::ScreenDeviceKind,
     },
 }
 
@@ -113,15 +116,20 @@ impl ScreenCaptureTarget {
         }
     }
 
-    /// Whether the screen track comes from a camera-style feed instead of
-    /// screen capture: no display, no cursor, no system audio tap.
     pub fn is_feed_backed(&self) -> bool {
         matches!(self, Self::CameraOnly | Self::MobileDevice { .. })
     }
 
     pub fn mobile_device_id(&self) -> Option<&str> {
         match self {
-            Self::MobileDevice { id } => Some(id),
+            Self::MobileDevice { id, .. } => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn mobile_device_kind(&self) -> Option<cap_camera::ScreenDeviceKind> {
+        match self {
+            Self::MobileDevice { kind, .. } => Some(*kind),
             _ => None,
         }
     }
@@ -298,13 +306,14 @@ impl ScreenCaptureTarget {
             Self::Window { id } => Window::from_id(id).and_then(|w| w.name()),
             Self::Area { screen, .. } => Display::from_id(screen).and_then(|d| d.name()),
             Self::CameraOnly => Some("Camera".to_string()),
-            Self::MobileDevice { id } => Some(
-                cap_camera::list_screen_devices()
-                    .into_iter()
-                    .find(|device| device.camera.device_id() == id)
-                    .map(|device| device.camera.display_name().to_string())
-                    .unwrap_or_else(|| "iPhone".to_string()),
-            ),
+            Self::MobileDevice { name, kind, .. } => Some(if name.is_empty() {
+                match kind {
+                    cap_camera::ScreenDeviceKind::IPhone => "iPhone".to_string(),
+                    cap_camera::ScreenDeviceKind::IPad => "iPad".to_string(),
+                }
+            } else {
+                name.clone()
+            }),
         }
     }
 

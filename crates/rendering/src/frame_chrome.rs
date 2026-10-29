@@ -14,9 +14,7 @@
 //! height so the chrome keeps its proportions at any recording size.
 //!
 //! Device styles (iPhone, iPad) are sized from the content's short side
-//! instead, so the same body works in portrait and landscape. Their screen
-//! corners come from rounding the video itself, and the iPhone's Dynamic
-//! Island is a second, small [`ChromePart::Overlay`] drawn over the video.
+//! instead, so the same body works in portrait and landscape.
 
 use crate::composite_frame::CompositeVideoFrameUniforms;
 use cap_project::{FrameStyle, FrameTheme, XY};
@@ -40,14 +38,12 @@ pub struct FrameChromeUniforms {
     pub content_height: f64,
 }
 
-/// Which piece of a frame a [`FrameChromeUniforms`] describes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ChromePart {
-    /// Everything drawn behind the video: bars, bezels, device bodies.
     #[default]
     Body,
-    /// Hardware that sits on top of the screen, i.e. the Dynamic Island. Its
-    /// texture covers only that element.
+    /// The Dynamic Island covers the screen, so unlike the rest of the chrome
+    /// it is drawn after the video and cursor, as its own small texture.
     Overlay,
 }
 
@@ -75,20 +71,15 @@ const MACBOOK_OVERHANG_FRAC: f64 = 0.10;
 /// Room reserved under the deck for its baked soft shadow.
 const MACBOOK_SHADOW_ROOM_FRAC: f64 = 0.035;
 
-/// Proportions of a phone or tablet body, as fractions of the screen's short
-/// side, so the body keeps its look in either orientation.
+/// Fractions of the screen's short side.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DeviceMetrics {
-    /// Body edge to screen edge (metal band plus black bezel).
     pub border: f64,
-    /// Width of the metal band that forms the outer edge of the body.
     pub band: f64,
-    /// Corner radius of the screen.
     pub screen_radius: f64,
 }
 
 impl DeviceMetrics {
-    /// Corner radius of the body, concentric with the screen's corners.
     pub fn body_radius(&self) -> f64 {
         self.screen_radius + self.border
     }
@@ -124,7 +115,6 @@ pub fn device_metrics(style: FrameStyle) -> Option<DeviceMetrics> {
     }
 }
 
-/// A rectangle as fractions of the video content (0..1 on each axis).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ContentRect {
     pub x: f64,
@@ -133,10 +123,9 @@ pub struct ContentRect {
     pub height: f64,
 }
 
-/// Where the Dynamic Island sits over content of the given aspect
-/// (width / height). Portrait content puts it centered under the top edge;
-/// landscape content is a phone turned counterclockwise, so it sits centered
-/// on the left edge.
+/// Landscape content is drawn as a phone turned counterclockwise (island on
+/// the left): a recording carries no orientation, so which way the phone was
+/// turned is unknown.
 pub fn dynamic_island_rect(aspect: f64) -> ContentRect {
     let aspect = aspect.max(f64::EPSILON);
     if aspect <= 1.0 {
@@ -156,7 +145,6 @@ pub fn dynamic_island_rect(aspect: f64) -> ContentRect {
     }
 }
 
-/// The overlay rect a style draws on top of the video, if any.
 pub fn overlay_rect(style: FrameStyle, aspect: f64) -> Option<ContentRect> {
     match style {
         FrameStyle::IPhone => Some(dynamic_island_rect(aspect)),
@@ -170,8 +158,6 @@ const CHROME_SUPERSAMPLE: f64 = 2.0;
 /// Hard cap on either texture dimension.
 const CHROME_MAX_TEXTURE_DIM: f64 = 4096.0;
 
-/// Content insets of `style` around content of the given aspect
-/// (width / height).
 pub fn chrome_insets(style: FrameStyle, aspect: f64) -> ChromeInsets {
     match style {
         FrameStyle::None => ChromeInsets::default(),
@@ -674,9 +660,6 @@ fn macbook_svg(w: f64, h: f64, content_h: f64, theme: FrameTheme) -> String {
     )
 }
 
-/// Phone/tablet body: a metal band around a black glass bezel. The screen
-/// itself is the video, rounded by the display pass, so the bezel only has to
-/// fill the area around it.
 fn device_svg(w: f64, h: f64, content_h: f64, style: FrameStyle, theme: FrameTheme) -> String {
     let metrics = device_metrics(style).unwrap_or(IPHONE_METRICS);
     let border = ((h - content_h) * 0.5).max(0.0);
@@ -738,9 +721,6 @@ fn device_svg(w: f64, h: f64, content_h: f64, style: FrameStyle, theme: FrameThe
     )
 }
 
-/// The Dynamic Island, filling a `w`×`h` texture. The front camera sits at
-/// the right end of the pill in portrait, so at the top once the phone is
-/// turned counterclockwise.
 fn dynamic_island_svg(w: f64, h: f64) -> String {
     let portrait = w >= h;
     let thickness = w.min(h);
@@ -983,8 +963,6 @@ mod tests {
             let border = device_metrics(style).unwrap().border;
             let portrait = chrome_insets(style, 9.0 / 19.5);
             let landscape = chrome_insets(style, 19.5 / 9.0);
-            // Insets are in content heights: portrait content is narrower
-            // than tall, so its short side is `aspect` content heights.
             assert!((portrait.left - border * 9.0 / 19.5).abs() < 1e-12);
             assert_eq!(portrait.left, portrait.top);
             assert_eq!(portrait.left, portrait.right);
@@ -1021,7 +999,6 @@ mod tests {
     fn dynamic_island_turns_with_the_phone() {
         let portrait = dynamic_island_rect(9.0 / 19.5);
         let landscape = dynamic_island_rect(19.5 / 9.0);
-        // Same physical pill, rotated a quarter turn onto the left edge.
         let (short, long) = (900.0, 900.0 * 19.5 / 9.0);
         assert!((portrait.width * short - landscape.height * short).abs() < 1e-9);
         assert!((portrait.height * long - landscape.width * long).abs() < 1e-9);

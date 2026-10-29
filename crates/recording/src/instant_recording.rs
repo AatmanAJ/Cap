@@ -1002,6 +1002,8 @@ impl ActorBuilder {
                 mic_feed: self.mic_feed,
                 camera_feed: self.camera_feed,
                 mobile_device_feed: None,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: self.start_gate,
                 #[cfg(target_os = "macos")]
                 shareable_content,

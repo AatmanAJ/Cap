@@ -1488,6 +1488,7 @@ microphone_turn_on = "設定でマイクへのアクセスをオンにする…"
 [overlay.mobile_device]
 connect = "iPhoneまたはiPadをケーブルで接続し、ロックを解除して「信頼」をタップしてください。表示されるまで数秒かかることがあります。"
 description = "ケーブルで接続したiPhoneまたはiPadの画面を録画します"
+no_audio = "デバイスの音声とシステムオーディオは録音されません。マイクとカメラは録画されます。"
 
 [overlay.start]
 instant = "Instantモード：共有リンクを録画"

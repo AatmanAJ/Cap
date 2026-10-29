@@ -3107,8 +3107,6 @@ pub struct ProjectUniforms {
     /// Decorative frame chrome around the display; `None` when no frame style
     /// is active.
     pub frame_chrome: Option<frame_chrome::FrameChromeUniforms>,
-    /// Frame hardware drawn over the video (the iPhone's Dynamic Island);
-    /// `None` for styles without any.
     pub frame_chrome_overlay: Option<frame_chrome::FrameChromeUniforms>,
     /// The recording device's physical notch, redrawn over the capture;
     /// `None` when the overlay is off or the recording has no notch.
@@ -4758,8 +4756,6 @@ impl ProjectUniforms {
             let device_metrics = frame_config
                 .as_ref()
                 .and_then(|frame| frame_chrome::device_metrics(frame.style));
-            // A device frame's screen has its own corner radius. The user's
-            // rounding comes back as a split or takeover fades the body out.
             let card_rounding_px = display_rounding_px;
             let (display_rounding_px, display_rounding_type) = match device_metrics {
                 Some(metrics) => (
@@ -4818,8 +4814,6 @@ impl ProjectUniforms {
                 ];
                 let decorated = frame_chrome::style_uses_card_decoration(frame.style);
                 let (chrome_rounding_px, chrome_rounding_type) = match device_metrics {
-                    // The body radius is a fraction of the screen's short side;
-                    // the card's short side adds a border on each end.
                     Some(metrics) => (
                         (metrics.body_radius() / (1.0 + 2.0 * metrics.border)) as f32
                             * chrome_size[0].min(chrome_size[1]),
@@ -4897,8 +4891,6 @@ impl ProjectUniforms {
                 }
             });
 
-            // Glued to the video rect, so it follows zoom and the split /
-            // takeover morphs exactly like the content under it.
             let frame_chrome_overlay = frame_chrome.as_ref().and_then(|chrome| {
                 let aspect = layout.content_size.x / layout.content_size.y.max(f64::EPSILON);
                 let rect = frame_chrome::overlay_rect(chrome.style, aspect)?;
@@ -9015,8 +9007,6 @@ impl RendererLayers {
             self.cursor.render(pass);
         }
 
-        // Hardware over the screen (the Dynamic Island) covers the cursor the
-        // same way the notch does.
         if should_render_screen && self.frame_overlay.has_content() {
             self.frame_overlay
                 .render(passes.pass(content_view!(), load));

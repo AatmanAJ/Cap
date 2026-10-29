@@ -46,12 +46,14 @@ pub fn list_cameras() -> impl Iterator<Item = CameraInfo> {
     list_cameras_impl()
 }
 
-/// What kind of Apple device a USB screen-capture device is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum ScreenDeviceKind {
+    #[default]
+    #[cfg_attr(feature = "serde", serde(rename = "iPhone"))]
     IPhone,
+    #[cfg_attr(feature = "serde", serde(rename = "iPad"))]
     IPad,
 }
 
@@ -81,19 +83,24 @@ impl ScreenDeviceKind {
     }
 }
 
-/// An iPhone or iPad connected over USB whose screen can be captured like a
-/// camera. Only ever non-empty on macOS.
 #[derive(Debug, Clone)]
 pub struct ScreenDeviceInfo {
     pub camera: CameraInfo,
     pub kind: ScreenDeviceKind,
-    /// Largest format the device offers, i.e. its screen in pixels.
     pub screen_size: Option<(u32, u32)>,
 }
 
-/// Connected iPhone/iPad screens. On macOS the first call opts the process
-/// into CoreMediaIO screen-capture devices; devices then take a second or
-/// three to appear, so poll this rather than calling it once.
+pub fn enable_screen_devices() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        cap_camera_avfoundation::enable_screen_capture_devices()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 pub fn list_screen_devices() -> Vec<ScreenDeviceInfo> {
     #[cfg(target_os = "macos")]
     {
@@ -105,8 +112,6 @@ pub fn list_screen_devices() -> Vec<ScreenDeviceInfo> {
     }
 }
 
-/// The format to capture a device screen with: the full screen at the
-/// highest rate up to 60fps.
 pub fn preferred_screen_format<F: Deref<Target = FormatInfo>>(formats: &[F]) -> Option<&F> {
     formats.iter().max_by(|a, b| {
         let area = |f: &F| u64::from(f.width()) * u64::from(f.height());

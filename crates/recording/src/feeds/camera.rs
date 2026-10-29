@@ -984,6 +984,9 @@ async fn setup_camera(
 ) -> Result<SetupCameraResult, SetInputError> {
     let camera = find_camera(id).ok_or(SetInputError::DeviceNotFound)?;
     let format = select_camera_format(&camera, settings)?;
+    let screen_device = cap_camera::list_screen_devices()
+        .iter()
+        .any(|device| device.camera.device_id() == camera.device_id());
 
     {
         let mut fourcc = format.native().format_desc().media_sub_type().to_be_bytes();
@@ -993,6 +996,7 @@ async fn setup_camera(
             height = format.height(),
             frame_rate = format.frame_rate(),
             pixel_format = cidre::four_cc_to_str(&mut fourcc),
+            screen_device,
             "Starting camera capture"
         );
     }
@@ -1000,6 +1004,7 @@ async fn setup_camera(
     let first_attempt = start_camera_capture_attempt(
         &camera,
         format.clone(),
+        screen_device,
         cap_camera::CaptureMode::Native,
         recipient.clone(),
         native_recipient.clone(),
@@ -1028,6 +1033,7 @@ async fn setup_camera(
             start_camera_capture_attempt(
                 &camera,
                 format,
+                screen_device,
                 cap_camera::CaptureMode::Compatibility,
                 recipient,
                 native_recipient,
@@ -1059,9 +1065,11 @@ fn hand_native_frame_to_feed(
 }
 
 #[cfg(target_os = "macos")]
+#[allow(clippy::too_many_arguments)]
 async fn start_camera_capture_attempt(
     camera: &cap_camera::CameraInfo,
     format: cap_camera::Format,
+    screen_device: bool,
     mode: cap_camera::CaptureMode,
     recipient: Recipient<NewFrame>,
     native_recipient: Recipient<NewNativeFrame>,
@@ -1072,15 +1080,21 @@ async fn start_camera_capture_attempt(
 
     let (ready_tx, ready_rx) = oneshot::channel();
     let mut ready_signal = Some(ready_tx);
+    let mut screen_clock = screen_device.then(ScreenDeviceClock::default);
 
     let capture_handle = camera
         .start_capturing_with_mode(format.clone(), mode, move |frame| {
             let callback_num =
                 CAMERA_CALLBACK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
-            let timestamp = Timestamp::MachAbsoluteTime(cap_timestamp::MachAbsoluteTimestamp::new(
+            let pts = cap_timestamp::MachAbsoluteTimestamp::new(
                 cidre::cm::Clock::convert_host_time_to_sys_units(frame.native().sample_buf().pts()),
-            ));
+            );
+            let pts = match screen_clock.as_mut() {
+                Some(clock) => clock.stamp(pts, cap_timestamp::MachAbsoluteTimestamp::now()),
+                None => pts,
+            };
+            let timestamp = Timestamp::MachAbsoluteTime(pts);
 
             if native_ingress
                 .senders
@@ -1139,6 +1153,22 @@ async fn start_camera_capture_attempt(
         })
         .map_err(|e| SetInputError::StartCapturing(e.to_string()))?;
 
+    // An iPhone/iPad only sends a frame when its screen changes, so an idle
+    // device would never become ready. Its size comes from the format instead.
+    if screen_device {
+        drop(ready_rx);
+        return Ok(SetupCameraResult {
+            handle: capture_handle,
+            camera_info: camera.clone(),
+            video_info: VideoInfo::from_raw(
+                cap_media_info::RawVideoFormat::Nv12,
+                format.width(),
+                format.height(),
+                frame_rate,
+            ),
+        });
+    }
+
     let video_info = tokio::time::timeout(CAMERA_INIT_TIMEOUT, ready_rx)
         .await
         .map_err(|e| SetInputError::Timeout(e.to_string()))?
@@ -1149,6 +1179,116 @@ async fn start_camera_capture_attempt(
         camera_info: camera.clone(),
         video_info,
     })
+}
+
+/// Muxed iOS devices may stamp sample buffers on their own clock instead of
+/// the host clock the rest of the recording uses. A PTS that is not within a
+/// plausible capture latency of the frame's arrival means the device clock,
+/// and from then on frames are stamped with their arrival time.
+#[cfg(target_os = "macos")]
+#[derive(Default)]
+struct ScreenDeviceClock {
+    use_arrival: Option<bool>,
+    frames: u64,
+}
+
+#[cfg(target_os = "macos")]
+const SCREEN_DEVICE_MAX_LATENCY_SECS: f64 = 1.0;
+#[cfg(target_os = "macos")]
+const SCREEN_DEVICE_MAX_LEAD_SECS: f64 = 0.05;
+
+#[cfg(target_os = "macos")]
+impl ScreenDeviceClock {
+    fn on_host_clock(skew_secs: f64) -> bool {
+        (-SCREEN_DEVICE_MAX_LEAD_SECS..=SCREEN_DEVICE_MAX_LATENCY_SECS).contains(&skew_secs)
+    }
+
+    fn stamp(
+        &mut self,
+        pts: cap_timestamp::MachAbsoluteTimestamp,
+        arrival: cap_timestamp::MachAbsoluteTimestamp,
+    ) -> cap_timestamp::MachAbsoluteTimestamp {
+        let skew_secs = arrival.signed_duration_since_secs(pts);
+        self.frames += 1;
+        let use_arrival = match self.use_arrival {
+            None => {
+                let use_arrival = !Self::on_host_clock(skew_secs);
+                tracing::info!(
+                    skew_secs,
+                    use_arrival,
+                    "Device screen first frame: arrival minus PTS"
+                );
+                use_arrival
+            }
+            Some(false) if !Self::on_host_clock(skew_secs) => {
+                tracing::warn!(
+                    skew_secs,
+                    frame = self.frames,
+                    "Device screen PTS drifted off the host clock, using arrival time"
+                );
+                true
+            }
+            Some(use_arrival) => use_arrival,
+        };
+        if self.frames.is_multiple_of(600) {
+            tracing::info!(
+                skew_secs,
+                use_arrival,
+                frames = self.frames,
+                "Device screen clock"
+            );
+        }
+        self.use_arrival = Some(use_arrival);
+        if use_arrival { arrival } else { pts }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod screen_device_clock_tests {
+    use super::ScreenDeviceClock;
+    use cap_timestamp::MachAbsoluteTimestamp;
+
+    fn ticks(secs: f64) -> MachAbsoluteTimestamp {
+        let info = cidre::mach::TimeBaseInfo::new();
+        MachAbsoluteTimestamp::new((secs * 1e9 * info.denom as f64 / info.numer as f64) as u64)
+    }
+
+    fn same(a: MachAbsoluteTimestamp, b: MachAbsoluteTimestamp) -> bool {
+        a.signed_duration_since_secs(b) == 0.0
+    }
+
+    #[test]
+    fn host_clock_pts_is_kept() {
+        let mut clock = ScreenDeviceClock::default();
+        let pts = ticks(100.0);
+        assert!(same(clock.stamp(pts, ticks(100.03)), pts));
+        let pts = ticks(100.5);
+        assert!(same(clock.stamp(pts, ticks(100.52)), pts));
+    }
+
+    #[test]
+    fn device_clock_pts_falls_back_to_arrival() {
+        for pts in [ticks(5.0), ticks(5000.0)] {
+            let mut clock = ScreenDeviceClock::default();
+            let arrival = ticks(1000.0);
+            assert!(same(clock.stamp(pts, arrival), arrival));
+            let arrival = ticks(1000.1);
+            assert!(
+                same(clock.stamp(ticks(1000.09), arrival), arrival),
+                "stays on arrival time once chosen"
+            );
+        }
+    }
+
+    #[test]
+    fn drifting_off_the_host_clock_switches_for_good() {
+        let mut clock = ScreenDeviceClock::default();
+        clock.stamp(ticks(10.0), ticks(10.02));
+        let arrival = ticks(20.0);
+        assert!(same(clock.stamp(ticks(12.0), arrival), arrival));
+        let arrival = ticks(20.1);
+        assert!(same(clock.stamp(ticks(20.09), arrival), arrival));
+    }
 }
 
 #[cfg(windows)]

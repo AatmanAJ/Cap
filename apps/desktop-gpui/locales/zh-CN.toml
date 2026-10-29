@@ -1488,6 +1488,7 @@ microphone_turn_on = "在设置中开启麦克风访问…"
 [overlay.mobile_device]
 connect = "用数据线连接 iPhone 或 iPad，解锁后轻点“信任”。可能需要几秒钟才会出现。"
 description = "录制通过数据线连接的 iPhone 或 iPad 的屏幕"
+no_audio = "不会录制设备声音和系统音频。麦克风和摄像头仍会录制。"
 
 [overlay.start]
 instant = "Instant 模式：录制分享链接"

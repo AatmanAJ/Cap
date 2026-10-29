@@ -95,7 +95,6 @@ fn avfoundation_session_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> 
 }
 
 pub(super) fn list_screen_devices_impl() -> Vec<ScreenDeviceInfo> {
-    cap_camera_avfoundation::enable_screen_capture_devices();
     objc::ar_pool(|| {
         cap_camera_avfoundation::list_screen_capture_devices()
             .iter()

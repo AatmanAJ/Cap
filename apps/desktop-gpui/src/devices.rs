@@ -72,9 +72,6 @@ impl MicrophoneOption {
     }
 }
 
-/// An iPhone or iPad connected over USB whose screen can be recorded. The
-/// `device_id` is the `AVCaptureDevice.uniqueID` that
-/// `ScreenCaptureTarget::MobileDevice` carries.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MobileDeviceOption {
     pub device_id: String,
@@ -98,7 +95,6 @@ impl MobileDeviceOption {
         }
     }
 
-    /// The format to open it with: its whole screen, up to 60fps.
     pub fn capture_settings(&self) -> Option<cap_recording::feeds::camera::CameraDeviceSettings> {
         let camera = cap_camera::list_screen_devices()
             .into_iter()
@@ -114,9 +110,6 @@ impl MobileDeviceOption {
     }
 }
 
-/// Connected iPhones and iPads. Blocking AVFoundation discovery, so run it off
-/// the main thread. The first call opts the process into screen-capture
-/// devices, after which a connected device takes a second or three to appear.
 pub fn list_mobile_devices() -> Vec<MobileDeviceOption> {
     cap_camera::list_screen_devices()
         .into_iter()
@@ -129,9 +122,6 @@ pub fn list_mobile_devices() -> Vec<MobileDeviceOption> {
         .collect()
 }
 
-/// Which device a Start should record: the one picked, while it is still
-/// connected, else the only connected one. Several connected and none picked
-/// means the user has to choose.
 pub fn resolve_mobile_device<'a>(
     devices: &'a [MobileDeviceOption],
     picked: Option<&str>,

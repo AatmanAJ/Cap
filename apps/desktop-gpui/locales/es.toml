@@ -1488,6 +1488,7 @@ microphone_turn_on = "Activar el acceso al micrófono en Ajustes…"
 [overlay.mobile_device]
 connect = "Conecta un iPhone o iPad con un cable, desbloquéalo y toca «Confiar». Puede tardar unos segundos en aparecer."
 description = "Graba la pantalla de un iPhone o iPad conectado con un cable"
+no_audio = "No se graba el sonido del dispositivo ni el audio del sistema. El micrófono y la cámara sí."
 
 [overlay.start]
 instant = "Modo Instant: graba un enlace para compartir"

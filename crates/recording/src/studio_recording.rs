@@ -703,6 +703,22 @@ impl Message<StopWithIntent> for Actor {
 
 struct Pause;
 
+#[cfg(target_os = "macos")]
+struct CutSegment;
+
+#[cfg(target_os = "macos")]
+impl Message<CutSegment> for Actor {
+    type Reply = anyhow::Result<()>;
+
+    async fn handle(&mut self, _: CutSegment, ctx: &mut Context<Self, Self::Reply>) -> Self::Reply {
+        if !matches!(self.state, Some(ActorState::Recording { .. })) {
+            return Ok(());
+        }
+        <Self as Message<Pause>>::handle(self, Pause, ctx).await?;
+        <Self as Message<Resume>>::handle(self, Resume, ctx).await
+    }
+}
+
 impl Message<Pause> for Actor {
     type Reply = anyhow::Result<()>;
 
@@ -2216,8 +2232,6 @@ impl ActorBuilder {
         self
     }
 
-    /// The iPhone/iPad screen for a [`screen_capture::ScreenCaptureTarget::MobileDevice`]
-    /// target, opened like a camera.
     pub fn with_mobile_device_feed(mut self, feed: Arc<CameraFeedLock>) -> Self {
         self.mobile_device_feed = Some(feed);
         self
@@ -2287,6 +2301,8 @@ impl ActorBuilder {
                 mic_feed: self.mic_feed,
                 camera_feed: self.camera_feed,
                 mobile_device_feed: self.mobile_device_feed,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: self.start_gate,
                 #[cfg(target_os = "macos")]
                 shareable_content,
@@ -2341,7 +2357,7 @@ impl ActorBuilder {
 async fn spawn_studio_recording_actor(
     #[cfg(target_os = "linux")] lifetime: StudioLifetimeOwner,
     recording_dir: PathBuf,
-    base_inputs: RecordingBaseInputs,
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))] mut base_inputs: RecordingBaseInputs,
     custom_cursor_capture: bool,
     keyboard_capture: bool,
     fragmented: bool,
@@ -2350,6 +2366,13 @@ async fn spawn_studio_recording_actor(
     quality: crate::StudioQuality,
 ) -> anyhow::Result<ActorHandle> {
     use cap_utils::operation_diagnostics::{Field, Operation};
+    #[cfg(target_os = "macos")]
+    let mobile_device_cuts = base_inputs.mobile_device_feed.as_ref().map(|feed| {
+        let info = feed.video_info();
+        let (state, cuts) = crate::sources::MobileDeviceScreenState::new((info.width, info.height));
+        base_inputs.mobile_device_state = Some(state);
+        cuts
+    });
     let mut diagnostic = Operation::start(
         "studio_recording",
         &[
@@ -2475,6 +2498,21 @@ async fn spawn_studio_recording_actor(
         completion_tx: completion_tx.clone(),
         display_notch: crate::capture_pipeline::resolve_display_notch(&base_inputs.capture_target),
     });
+
+    #[cfg(target_os = "macos")]
+    if let Some(cuts) = mobile_device_cuts {
+        let actor = actor_ref.downgrade();
+        drop(tokio::spawn(async move {
+            while cuts.recv_async().await.is_ok() {
+                let Some(actor) = actor.upgrade() else {
+                    return;
+                };
+                if let Err(error) = actor.ask(CutSegment).await {
+                    warn!(%error, "Could not start a new segment for the rotated device screen");
+                }
+            }
+        }));
+    }
 
     Ok(ActorHandle {
         #[cfg(target_os = "linux")]
@@ -3311,7 +3349,7 @@ async fn create_segment_pipeline(
         screen_capture::ScreenCaptureTarget::MobileDevice { .. }
     );
     #[cfg(target_os = "macos")]
-    let segment_fragmented = fragmented && !camera_active && !mobile_device;
+    let segment_fragmented = fragmented && !camera_active;
     #[cfg(not(target_os = "macos"))]
     let segment_fragmented = fragmented;
 
@@ -3335,21 +3373,50 @@ async fn create_segment_pipeline(
     let (screen, system_audio, cursor_display) = if mobile_device {
         #[cfg(target_os = "macos")]
         {
-            let device_feed = base_inputs.mobile_device_feed.clone().ok_or_else(|| {
+            let unavailable = || {
                 anyhow!(
                     "The iPhone or iPad is not available. Connect it with a cable, unlock it, \
                     trust this Mac and choose it again."
                 )
-            })?;
+            };
+            let device = sources::MobileDeviceScreenConfig {
+                feed: base_inputs
+                    .mobile_device_feed
+                    .clone()
+                    .ok_or_else(unavailable)?,
+                state: base_inputs
+                    .mobile_device_state
+                    .clone()
+                    .ok_or_else(unavailable)?,
+            };
 
-            let screen = OutputPipeline::builder(screen_output_path.clone())
-                .with_video::<sources::NativeCamera>(device_feed)
-                .with_timestamps(start_time)
-                .with_start_gate(start_gate.clone())
-                .build::<AVFoundationCameraMuxer>(AVFoundationCameraMuxerConfig::default())
-                .instrument(error_span!("screen-out"))
-                .await
-                .context("device screen pipeline setup")?;
+            let screen = if segment_fragmented {
+                OutputPipeline::builder(dir.join("display"))
+                    .with_video::<sources::MobileDeviceScreen>(device)
+                    .with_timestamps(start_time)
+                    .with_start_gate(start_gate.clone())
+                    .build::<MacOSFragmentedM4SCameraMuxer>(MacOSFragmentedM4SCameraMuxerConfig {
+                        shared_pause_state: shared_pause_state.clone(),
+                        ..Default::default()
+                    })
+                    .instrument(error_span!("screen-out"))
+                    .await
+            } else {
+                OutputPipeline::builder(screen_output_path.clone())
+                    .with_video::<sources::MobileDeviceScreen>(device)
+                    .with_timestamps(start_time)
+                    .with_start_gate(start_gate.clone())
+                    .build::<AVFoundationCameraMuxer>(AVFoundationCameraMuxerConfig {
+                        compatibility_quality: matches!(
+                            quality,
+                            crate::StudioQuality::Compatibility
+                        ),
+                        ..Default::default()
+                    })
+                    .instrument(error_span!("screen-out"))
+                    .await
+            }
+            .context("device screen pipeline setup")?;
 
             (screen, None, None)
         }
@@ -4050,6 +4117,8 @@ mod tests {
                         mic_feed: None,
                         camera_feed: None,
                         mobile_device_feed: None,
+                        #[cfg(target_os = "macos")]
+                        mobile_device_state: None,
                         start_gate: None,
                         #[cfg(target_os = "macos")]
                         shareable_content: None,
@@ -4162,6 +4231,8 @@ mod tests {
                 mic_feed: None,
                 camera_feed: None,
                 mobile_device_feed: None,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: None,
                 #[cfg(target_os = "macos")]
                 shareable_content: None,
@@ -4262,6 +4333,8 @@ mod tests {
                 mic_feed: None,
                 camera_feed: None,
                 mobile_device_feed: None,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: None,
                 shareable_content: None,
                 excluded_windows: Vec::new(),
@@ -4401,6 +4474,8 @@ mod tests {
                     mic_feed: None,
                     camera_feed: None,
                     mobile_device_feed: None,
+                    #[cfg(target_os = "macos")]
+                    mobile_device_state: None,
                     start_gate: None,
                     #[cfg(target_os = "macos")]
                     shareable_content: None,
@@ -4647,6 +4722,8 @@ mod tests {
                     mic_feed: None,
                     camera_feed: None,
                     mobile_device_feed: None,
+                    #[cfg(target_os = "macos")]
+                    mobile_device_state: None,
                     start_gate: None,
                     #[cfg(target_os = "macos")]
                     shareable_content: None,
@@ -6328,6 +6405,8 @@ mod tests {
                 mic_feed: None,
                 camera_feed: None,
                 mobile_device_feed: None,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: None,
             },
             false,
@@ -6577,6 +6656,8 @@ mod windows_cancel_tests {
                 mic_feed: None,
                 camera_feed: None,
                 mobile_device_feed: None,
+                #[cfg(target_os = "macos")]
+                mobile_device_state: None,
                 start_gate: None,
             },
             false,

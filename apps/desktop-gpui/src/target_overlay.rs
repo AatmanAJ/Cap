@@ -454,11 +454,7 @@ pub struct TargetSelect {
     /// the one setting it mirrors.
     pub focus_window: bool,
     pub focus_center: bool,
-    /// Connected iPhones and iPads, re-listed while the device picker is up
-    /// so plugging one in (or unlocking it) shows up without reopening it.
     pub mobile_devices: Vec<crate::devices::MobileDeviceOption>,
-    /// The device clicked in the picker; kept across picker sessions so the
-    /// same phone stays chosen.
     pub picked_mobile_device: Option<String>,
     _poll: Option<gpui::Task<()>>,
     _device_poll: Option<gpui::Task<()>>,
@@ -552,7 +548,6 @@ impl TargetSelect {
         cx.notify();
     }
 
-    /// The device a Start would record right now, if any.
     pub fn mobile_device(&self) -> Option<&crate::devices::MobileDeviceOption> {
         crate::devices::resolve_mobile_device(
             &self.mobile_devices,
@@ -567,16 +562,18 @@ impl TargetSelect {
         }
     }
 
-    /// Re-lists devices every second while the device picker is up. Enabling
-    /// screen-capture devices happens on the first list, and a device only
-    /// appears a second or three later (and only once it is unlocked and
-    /// trusts this Mac), so a one-shot list would miss it.
+    /// Opening the picker is what opts the process into screen-capture
+    /// devices. They appear a second or three later, and only once unlocked
+    /// and trusting this Mac, so the list is polled while the picker is up.
     fn start_device_polling(&mut self, cx: &mut Context<Self>) {
         self._device_poll = Some(cx.spawn(async move |this, cx| {
             loop {
                 let devices = cx
                     .background_executor()
-                    .spawn(async { crate::devices::list_mobile_devices() })
+                    .spawn(async {
+                        cap_camera::enable_screen_devices();
+                        crate::devices::list_mobile_devices()
+                    })
                     .await;
                 let Ok(()) = this.update(cx, |this, cx| {
                     if this.mobile_devices != devices {
@@ -1537,6 +1534,8 @@ impl OverlayWindow {
                     .mobile_device()
                     .map(|device| ScreenCaptureTarget::MobileDevice {
                         id: device.device_id.clone(),
+                        name: device.label.clone(),
+                        kind: device.kind,
                     })
             }
         }
@@ -3106,8 +3105,6 @@ impl OverlayWindow {
             .child(self.render_controls_cluster(self.target(cx), false, cx))
     }
 
-    /// The device picker: the connected iPhones and iPads to choose from, or
-    /// how to connect one, above the usual start cluster.
     fn render_mobile_device_variant(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let select = self.select.read(cx);
@@ -3236,6 +3233,13 @@ impl OverlayWindow {
                             .text_size(px(12.))
                             .text_color(theme.gray_11)
                             .child(tr::overlay::mobile_device::description()),
+                    )
+                    .child(
+                        div()
+                            .mt(px(4.))
+                            .text_size(px(11.))
+                            .text_color(theme.gray_10)
+                            .child(tr::overlay::mobile_device::no_audio()),
                     ),
             )
             .child(

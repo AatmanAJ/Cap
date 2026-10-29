@@ -1488,6 +1488,7 @@ microphone_turn_on = "Mikrofonzugriff in den Einstellungen aktivieren…"
 [overlay.mobile_device]
 connect = "Verbinden Sie ein iPhone oder iPad per Kabel, entsperren Sie es und tippen Sie auf „Vertrauen“. Es kann einige Sekunden dauern, bis es erscheint."
 description = "Den Bildschirm eines per Kabel verbundenen iPhone oder iPad aufnehmen"
+no_audio = "Ton vom Gerät und Systemaudio werden nicht aufgenommen. Mikrofon und Kamera schon."
 
 [overlay.start]
 instant = "Instant-Modus: Link zum Teilen aufnehmen"

@@ -465,14 +465,10 @@ async fn finalize_studio(
         ))
         .unwrap_or_default();
         apply_animated_gradient_to_project_config(&project_path, &capture_target, &library);
-        if let Some(device_id) = capture_target.mobile_device_id() {
-            let kind = cap_camera::list_screen_devices()
-                .into_iter()
-                .find(|device| device.camera.device_id() == device_id)
-                .map_or(cap_camera::ScreenDeviceKind::IPhone, |device| device.kind);
-            if let Err(error) = apply_device_frame(&project_path, kind) {
-                tracing::warn!(%error, "Could not apply the device frame");
-            }
+        if let Some(kind) = capture_target.mobile_device_kind()
+            && let Err(error) = apply_device_frame(&project_path, kind)
+        {
+            tracing::warn!(%error, "Could not apply the device frame");
         }
         if crate::store::studio_sound_by_default()
             && let Err(error) = enable_studio_sound(&project_path)
@@ -1777,8 +1773,6 @@ fn enable_notch_overlay(project_path: &std::path::Path) -> std::io::Result<()> {
     result
 }
 
-/// A device recording opens in the editor already wearing its device frame,
-/// unless the project somehow has a frame of its own.
 fn apply_device_frame(
     project_path: &std::path::Path,
     kind: cap_camera::ScreenDeviceKind,
@@ -2772,9 +2766,9 @@ async fn setup_camera(
     Ok((owner, lock))
 }
 
-/// Opens a USB iPhone/iPad screen like a camera. The device can take a few
-/// seconds to (re)appear after the process opts into screen-capture devices,
-/// e.g. on the first recording after launch, so wait for it before giving up.
+/// A device only appears 1-3 seconds after the process opts into
+/// screen-capture devices (e.g. a shortcut start before the picker was ever
+/// opened), so wait for it before giving up.
 async fn setup_mobile_device(
     device_id: &str,
 ) -> anyhow::Result<(
@@ -2783,9 +2777,12 @@ async fn setup_mobile_device(
 )> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
     let device = loop {
-        let devices = tokio::task::spawn_blocking(crate::devices::list_mobile_devices)
-            .await
-            .unwrap_or_default();
+        let devices = tokio::task::spawn_blocking(|| {
+            cap_camera::enable_screen_devices();
+            crate::devices::list_mobile_devices()
+        })
+        .await
+        .unwrap_or_default();
         if let Some(device) = devices.into_iter().find(|d| d.device_id == device_id) {
             break device;
         }
@@ -2816,7 +2813,7 @@ async fn setup_mobile_device(
     .await
     .map_err(|error| {
         anyhow!(
-            "Could not record {}: {error}. Unlock it, keep it connected and try again.",
+            "Could not record {}: {error}. Unlock it, wake its screen, keep it connected and try again.",
             device.label
         )
     })

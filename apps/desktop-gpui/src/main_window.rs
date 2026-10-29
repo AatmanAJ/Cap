@@ -499,7 +499,6 @@ pub enum TargetType {
     Window,
     Area,
     CameraOnly,
-    /// A USB-connected iPhone or iPad (macOS).
     MobileDevice,
 }
 
@@ -2100,7 +2099,6 @@ impl MainWindow {
             }
             TargetType::Area => None,
             TargetType::CameraOnly => Some(ScreenCaptureTarget::CameraOnly),
-            // Picked on the overlay, like an area.
             TargetType::MobileDevice => None,
         }
     }
@@ -7228,9 +7226,6 @@ fn black_alpha(alpha: f32) -> Hsla {
     color
 }
 
-/// Why a device target cannot start, checked before any feed is opened:
-/// device screens only record in Studio, and the device has to still be
-/// connected.
 fn mobile_device_start_error(
     target: &ScreenCaptureTarget,
     mode: recording::RecordingMode,

@@ -441,6 +441,10 @@ fn dialog_surfaces_match_the_literals_they_replaced() {
             tr::overlay::mobile_device::description(),
             "Record the screen of an iPhone or iPad connected with a cable",
         ),
+        (
+            tr::overlay::mobile_device::no_audio(),
+            "Sound from the device and system audio aren't recorded. Your microphone and camera still are.",
+        ),
         (tr::overlay::device::camera_allow(), "Allow camera access…"),
         (
             tr::overlay::device::camera_turn_on(),

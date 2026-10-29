@@ -1488,6 +1488,7 @@ microphone_turn_on = "Activer l'accès au micro dans Réglages Système…"
 [overlay.mobile_device]
 connect = "Connectez un iPhone ou un iPad avec un câble, déverrouillez-le et touchez « Se fier ». Il peut mettre quelques secondes à apparaître."
 description = "Enregistrer l'écran d'un iPhone ou d'un iPad connecté par câble"
+no_audio = "Le son de l'appareil et l'audio système ne sont pas enregistrés. Le micro et la caméra, si."
 
 [overlay.start]
 instant = "Mode Instant : enregistrer un lien de partage"

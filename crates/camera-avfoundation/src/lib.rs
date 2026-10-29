@@ -48,8 +48,6 @@ pub fn list_video_devices() -> arc::R<ns::Array<av::CaptureDevice>> {
     })
 }
 
-/// `AVCaptureDevice.modelID` of the screen-capture device an iPhone or iPad
-/// exposes over USB once screen-capture devices are allowed.
 pub const IOS_SCREEN_DEVICE_MODEL_ID: &str = "iOS Device";
 
 pub fn is_ios_screen_device_model(model_id: &str) -> bool {
@@ -84,43 +82,50 @@ const CMIO_HARDWARE_PROPERTY_ALLOW_SCREEN_CAPTURE_DEVICES: u32 = u32::from_be_by
 const CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
 const CMIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
 
-static SCREEN_CAPTURE_DEVICES_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+static SCREEN_CAPTURE_DEVICES_ENABLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-/// Opts this process into CoreMediaIO screen-capture devices, which is how a
-/// USB-connected, trusted and unlocked iPhone or iPad shows up as a muxed
-/// `AVCaptureDevice` (the same switch QuickTime flips). The device appears
-/// asynchronously, usually 1-3 seconds after the first call, so callers poll
-/// [`list_screen_capture_devices`]. Returns whether the property was set; only
-/// the first call talks to CoreMediaIO.
+/// The CoreMediaIO switch QuickTime flips so a USB iPhone/iPad appears as a
+/// muxed `AVCaptureDevice`, 1-3 seconds later. It is process-wide and makes
+/// connected devices re-enumerate, so only flip it once the user asks for a
+/// device.
 pub fn enable_screen_capture_devices() -> bool {
-    *SCREEN_CAPTURE_DEVICES_ENABLED.get_or_init(|| {
-        let address = CmioObjectPropertyAddress {
-            selector: CMIO_HARDWARE_PROPERTY_ALLOW_SCREEN_CAPTURE_DEVICES,
-            scope: CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
-            element: CMIO_OBJECT_PROPERTY_ELEMENT_MAIN,
-        };
-        let allow: u32 = 1;
-        let status = unsafe {
-            CMIOObjectSetPropertyData(
-                CMIO_OBJECT_SYSTEM_OBJECT,
-                &address,
-                0,
-                std::ptr::null(),
-                std::mem::size_of::<u32>() as u32,
-                std::ptr::from_ref(&allow).cast(),
-            )
-        };
-        if status != 0 {
-            warn!(status, "Failed to allow CoreMediaIO screen capture devices");
-        }
-        status == 0
-    })
+    use std::sync::atomic::Ordering;
+    if SCREEN_CAPTURE_DEVICES_ENABLED.load(Ordering::Acquire) {
+        return true;
+    }
+    let address = CmioObjectPropertyAddress {
+        selector: CMIO_HARDWARE_PROPERTY_ALLOW_SCREEN_CAPTURE_DEVICES,
+        scope: CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+        element: CMIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+    };
+    let allow: u32 = 1;
+    let status = unsafe {
+        CMIOObjectSetPropertyData(
+            CMIO_OBJECT_SYSTEM_OBJECT,
+            &address,
+            0,
+            std::ptr::null(),
+            std::mem::size_of::<u32>() as u32,
+            std::ptr::from_ref(&allow).cast(),
+        )
+    };
+    if status != 0 {
+        warn!(status, "Failed to allow CoreMediaIO screen capture devices");
+        return false;
+    }
+    SCREEN_CAPTURE_DEVICES_ENABLED.store(true, Ordering::Release);
+    true
 }
 
-/// Connected iPhone/iPad screen-capture devices. Empty until
-/// [`enable_screen_capture_devices`] has run and the devices have had time to
-/// appear.
+pub fn screen_capture_devices_enabled() -> bool {
+    SCREEN_CAPTURE_DEVICES_ENABLED.load(std::sync::atomic::Ordering::Acquire)
+}
+
 pub fn list_screen_capture_devices() -> Vec<arc::R<av::CaptureDevice>> {
+    if !screen_capture_devices_enabled() {
+        return Vec::new();
+    }
     objc::ar_pool(|| {
         let device_type = if api::macos_available("14.0")
             && let Some(typ) = unsafe { av::CaptureDeviceType::external() }

@@ -1051,7 +1051,7 @@ fn target_is_live(target: &ScreenCaptureTarget) -> bool {
             scap_targets::Display::from_id(screen).is_some()
         }
         ScreenCaptureTarget::CameraOnly => true,
-        ScreenCaptureTarget::MobileDevice { id } => cap_camera::list_screen_devices()
+        ScreenCaptureTarget::MobileDevice { id, .. } => cap_camera::list_screen_devices()
             .iter()
             .any(|device| device.camera.device_id() == id),
     }
@@ -1269,6 +1269,8 @@ mod tests {
     fn a_stored_device_target_never_starts_a_shortcut_recording() {
         let device = || ScreenCaptureTarget::MobileDevice {
             id: "00008110-000A1C2E3F40001E".into(),
+            name: "iPhone".into(),
+            kind: cap_camera::ScreenDeviceKind::IPhone,
         };
         let picked = pick_hotkey_target(None, Some(device()), |_| true, || display_id("3"));
         assert!(same(&picked, &display("3")));
