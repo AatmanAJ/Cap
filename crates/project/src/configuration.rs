@@ -2459,10 +2459,19 @@ pub struct CaptionsData {
     pub source_timed: bool,
 }
 
+#[derive(Type, Serialize, Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum KeyboardStyle {
+    #[default]
+    Text,
+    Keycaps,
+}
+
 #[derive(Type, Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", default)]
 pub struct KeyboardSettings {
     pub enabled: bool,
+    pub style: KeyboardStyle,
     pub font: String,
     pub size: u32,
     pub color: String,
@@ -2475,6 +2484,7 @@ pub struct KeyboardSettings {
     pub grouping_threshold_ms: f64,
     pub show_modifiers: bool,
     pub show_special_keys: bool,
+    pub shortcuts_only: bool,
     pub uppercase: bool,
 }
 
@@ -2482,6 +2492,7 @@ impl Default for KeyboardSettings {
     fn default() -> Self {
         Self {
             enabled: false,
+            style: KeyboardStyle::Text,
             font: "System Sans-Serif".to_string(),
             size: 50,
             color: "#FFFFFF".to_string(),
@@ -2494,6 +2505,7 @@ impl Default for KeyboardSettings {
             grouping_threshold_ms: 500.0,
             show_modifiers: true,
             show_special_keys: true,
+            shortcuts_only: false,
             uppercase: false,
         }
     }
@@ -3262,6 +3274,30 @@ mod notch_tests {
 mod tests {
     use super::*;
     use serde_json::Value;
+
+    #[test]
+    fn keyboard_style_and_shortcut_filter_default_off_for_old_projects() {
+        let legacy: KeyboardData = serde_json::from_str(
+            r#"{"settings":{"enabled":true,"size":64,"showModifiers":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.settings.style, KeyboardStyle::Text);
+        assert!(!legacy.settings.shortcuts_only);
+        assert_eq!(legacy.settings.size, 64);
+        assert!(!legacy.settings.show_modifiers);
+
+        let settings = KeyboardSettings {
+            style: KeyboardStyle::Keycaps,
+            shortcuts_only: true,
+            ..Default::default()
+        };
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["style"], "keycaps");
+        assert_eq!(value["shortcutsOnly"], true);
+        let restored: KeyboardSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.style, KeyboardStyle::Keycaps);
+        assert!(restored.shortcuts_only);
+    }
 
     #[test]
     fn studio_sound_defaults_old_projects_to_balanced_and_round_trips_tiers() {

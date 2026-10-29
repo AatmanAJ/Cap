@@ -8,6 +8,9 @@ const KEYBOARD_EVENTS_MAGIC: &[u8; 6] = b"CPKB01";
 
 #[cfg(test)]
 mod projection_tests;
+mod shortcuts;
+
+pub use shortcuts::{KeyLabelPlatform, KeycapLabel, group_shortcut_events, keycap_labels};
 
 #[derive(Serialize, Deserialize, Clone, Type, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -314,7 +317,12 @@ pub fn generate_project_keyboard_segments(
     settings: &crate::KeyboardSettings,
 ) -> Result<Vec<KeyboardTrackSegment>, String> {
     let takes = load_project_keyboard_events(meta)?;
-    Ok(project_keyboard_events(&takes, timeline, settings))
+    Ok(project_keyboard_events_for_platform(
+        &takes,
+        timeline,
+        settings,
+        KeyLabelPlatform::from_recording(meta.platform.as_ref()),
+    ))
 }
 
 fn legacy_keyboard_capture_offset(meta: &crate::RecordingMeta, recording_clip: u32) -> f64 {
@@ -545,8 +553,12 @@ pub fn synchronize_legacy_keyboard(
         timeline.keyboard_segments = project_legacy_keyboard_track(meta, timeline, &settings);
         return;
     }
-    let mut generated =
-        project_keyboard_events(takes.as_deref().unwrap_or_default(), timeline, &settings);
+    let mut generated = project_keyboard_events_for_platform(
+        takes.as_deref().unwrap_or_default(),
+        timeline,
+        &settings,
+        KeyLabelPlatform::from_recording(meta.platform.as_ref()),
+    );
     let clip_offsets = crate::caption_timing::clip_timeline_offsets(timeline);
     let holds = timeline.hold_windows();
     for segment in &mut generated {
@@ -661,10 +673,44 @@ impl<'a> PreparedKeyboardEvents<'a> {
     }
 }
 
+#[cfg(test)]
 fn project_keyboard_events(
     takes: &[(KeyboardEvents, f64)],
     timeline: &crate::TimelineConfiguration,
     settings: &crate::KeyboardSettings,
+) -> Vec<KeyboardTrackSegment> {
+    project_keyboard_events_for_platform(takes, timeline, settings, KeyLabelPlatform::Mac)
+}
+
+fn group_for_settings(
+    events: &KeyboardEvents,
+    settings: &crate::KeyboardSettings,
+    platform: KeyLabelPlatform,
+) -> Vec<KeyboardTrackSegment> {
+    let linger_duration_ms = f64::from(settings.linger_duration) * 1000.0;
+    if settings.shortcuts_only {
+        group_shortcut_events(
+            events,
+            linger_duration_ms,
+            settings.show_special_keys,
+            platform,
+        )
+    } else {
+        group_key_events(
+            events,
+            settings.grouping_threshold_ms,
+            linger_duration_ms,
+            settings.show_modifiers,
+            settings.show_special_keys,
+        )
+    }
+}
+
+fn project_keyboard_events_for_platform(
+    takes: &[(KeyboardEvents, f64)],
+    timeline: &crate::TimelineConfiguration,
+    settings: &crate::KeyboardSettings,
+    platform: KeyLabelPlatform,
 ) -> Vec<KeyboardTrackSegment> {
     let holds = timeline.hold_windows();
     let output_time = |time: f64, end: bool| {
@@ -713,13 +759,7 @@ fn project_keyboard_events(
                 projected.time_ms = output_time(time, false) * 1000.0;
                 presses.push(projected);
             }
-            let mut grouped = group_key_events(
-                &KeyboardEvents { presses },
-                settings.grouping_threshold_ms,
-                f64::from(settings.linger_duration) * 1000.0,
-                settings.show_modifiers,
-                settings.show_special_keys,
-            );
+            let mut grouped = group_for_settings(&KeyboardEvents { presses }, settings, platform);
             for segment in &mut grouped {
                 segment.id = format!("kb-edit-{index}-{}", segment.id);
                 segment.end = segment.end.min(output_time(edited_end, true));
@@ -2030,6 +2070,62 @@ mod timing_tests {
         );
         assert_eq!(result[0].start, 4.0);
         assert_eq!(result[1].start, 5.0);
+    }
+
+    #[test]
+    fn shortcuts_only_regeneration_hides_typing_and_labels_for_the_recording_platform() {
+        let timeline = timeline(serde_json::json!([
+            { "start":2.0,"end":5.0,"timescale":1.0 },
+            { "start":6.0,"end":8.0,"timescale":2.0 }
+        ]));
+        let settings = KeyboardSettings {
+            shortcuts_only: true,
+            ..Default::default()
+        };
+        let takes = [(
+            events(&[
+                ("LControl", 1.0),
+                ("c", 2.5),
+                ("p", 2.6),
+                ("a", 2.7),
+                ("s", 2.8),
+                ("Enter", 3.0),
+                ("Escape", 6.4),
+            ]),
+            0.0,
+        )];
+        let mac = project_keyboard_events_for_platform(
+            &takes,
+            &timeline,
+            &settings,
+            KeyLabelPlatform::Mac,
+        );
+        let windows = project_keyboard_events_for_platform(
+            &takes,
+            &timeline,
+            &settings,
+            KeyLabelPlatform::Windows,
+        );
+        let labels: Vec<_> = mac
+            .iter()
+            .map(|segment| segment.display_text.as_str())
+            .collect();
+        assert_eq!(labels, ["⌃C", "⌃P", "⌃A", "⌃S", "⌃⏎", "⌃⎋"]);
+        for (segment, start) in mac.iter().zip([0.5, 0.6, 0.7, 0.8, 1.0, 3.2]) {
+            assert!((segment.start - start).abs() < 1e-9, "{}", segment.start);
+        }
+        assert_eq!(windows[0].display_text, "Ctrl+C");
+        assert_eq!(windows[5].display_text, "Ctrl+Esc");
+        assert!(mac.iter().all(|segment| segment.id.starts_with("kb-edit-")));
+        assert!(mac[3].end <= 3.0 + 1e-9);
+
+        let typed = project_keyboard_events_for_platform(
+            &[(events(&[("p", 2.5), ("w", 2.6), ("Space", 6.2)]), 0.0)],
+            &timeline,
+            &settings,
+            KeyLabelPlatform::Mac,
+        );
+        assert!(typed.is_empty());
     }
 
     #[test]
