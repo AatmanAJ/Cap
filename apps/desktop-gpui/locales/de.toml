@@ -1003,6 +1003,7 @@ on = "Ein"
 camera_only_needs_camera = "Für reine Kameraaufnahmen muss eine Kamera ausgewählt sein."
 copy = "Fehler kopieren"
 devices_not_ready = "Die Aufnahmegeräte sind nicht bereit. Öffnen Sie den Rekorder und versuchen Sie es erneut."
+mobile_device_needs_studio = "iPhone- und iPad-Aufnahmen verwenden den Studio-Modus. Wechseln Sie zu Studio und starten Sie erneut."
 title = "Etwas ist schiefgelaufen"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "Bildschirm wählen"
 choose_window = "Fenster wählen"
 display = "Bildschirm"
 heading = "Aufnahmequelle wählen"
+mobile_device = "iPhone/iPad"
 no_displays = "Keine Bildschirme gefunden"
 no_matching_displays = "Keine passenden Bildschirme"
 no_matching_windows = "Keine passenden Fenster"
@@ -1482,6 +1484,10 @@ camera_allow = "Kamerazugriff erlauben…"
 camera_turn_on = "Kamerazugriff in den Einstellungen aktivieren…"
 microphone_allow = "Mikrofonzugriff erlauben…"
 microphone_turn_on = "Mikrofonzugriff in den Einstellungen aktivieren…"
+
+[overlay.mobile_device]
+connect = "Verbinden Sie ein iPhone oder iPad per Kabel, entsperren Sie es und tippen Sie auf „Vertrauen“. Es kann einige Sekunden dauern, bis es erscheint."
+description = "Den Bildschirm eines per Kabel verbundenen iPhone oder iPad aufnehmen"
 
 [overlay.start]
 instant = "Instant-Modus: Link zum Teilen aufnehmen"

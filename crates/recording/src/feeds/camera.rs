@@ -777,10 +777,19 @@ pub enum SetInputError {
 
 #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
 fn find_camera(selected_camera: &DeviceOrModelID) -> Option<cap_camera::CameraInfo> {
-    cap_camera::list_cameras().find(|c| match selected_camera {
+    let matches = |c: &cap_camera::CameraInfo| match selected_camera {
         DeviceOrModelID::DeviceID(device_id) => c.device_id() == device_id,
         DeviceOrModelID::ModelID(model_id) => c.model_id() == Some(model_id),
-    })
+    };
+    cap_camera::list_cameras()
+        .find(matches)
+        .or_else(|| match selected_camera {
+            DeviceOrModelID::DeviceID(_) => cap_camera::list_screen_devices()
+                .into_iter()
+                .map(|device| device.camera)
+                .find(matches),
+            DeviceOrModelID::ModelID(_) => None,
+        })
 }
 
 struct SetupCameraResult {

@@ -83,6 +83,7 @@ fn main_surfaces_match_the_literals_they_replaced() {
             "No matching windows",
         ),
         (tr::main::target::heading(), "Choose a capture source"),
+        (tr::main::target::mobile_device(), "iPhone/iPad"),
         (tr::main::device::camera(), "Camera"),
         (tr::main::device::microphone(), "Microphone"),
         (tr::main::device::no_camera(), "No Camera"),
@@ -213,6 +214,10 @@ fn main_surfaces_match_the_literals_they_replaced() {
         (
             tr::main::error::devices_not_ready(),
             "Recording devices are not ready. Open the recorder and try again.",
+        ),
+        (
+            tr::main::error::mobile_device_needs_studio(),
+            "iPhone and iPad recordings use Studio mode. Switch to Studio and start again.",
         ),
         (
             tr::main::sign_in::timed_out(),

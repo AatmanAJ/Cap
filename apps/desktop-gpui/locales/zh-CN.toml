@@ -1003,6 +1003,7 @@ on = "开"
 camera_only_needs_camera = "仅摄像头录制需要先选择摄像头。"
 copy = "复制错误信息"
 devices_not_ready = "录制设备尚未就绪。请打开录制器后重试。"
+mobile_device_needs_studio = "iPhone 和 iPad 录制使用 Studio 模式。请切换到 Studio 后重新开始。"
 title = "出了点问题"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "选择屏幕"
 choose_window = "选择窗口"
 display = "屏幕"
 heading = "选择捕获来源"
+mobile_device = "iPhone/iPad"
 no_displays = "未找到屏幕"
 no_matching_displays = "没有匹配的屏幕"
 no_matching_windows = "没有匹配的窗口"
@@ -1482,6 +1484,10 @@ camera_allow = "允许访问摄像头…"
 camera_turn_on = "在设置中开启摄像头访问…"
 microphone_allow = "允许访问麦克风…"
 microphone_turn_on = "在设置中开启麦克风访问…"
+
+[overlay.mobile_device]
+connect = "用数据线连接 iPhone 或 iPad，解锁后轻点“信任”。可能需要几秒钟才会出现。"
+description = "录制通过数据线连接的 iPhone 或 iPad 的屏幕"
 
 [overlay.start]
 instant = "Instant 模式：录制分享链接"

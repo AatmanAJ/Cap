@@ -97,6 +97,9 @@ pub struct RecordingBaseInputs {
     pub capture_system_audio: bool,
     pub mic_feed: Option<Arc<MicrophoneFeedLock>>,
     pub camera_feed: Option<Arc<CameraFeedLock>>,
+    /// Feed for a [`ScreenCaptureTarget::MobileDevice`] target: the device's
+    /// screen, recorded as the screen track. `camera_feed` stays the webcam.
+    pub mobile_device_feed: Option<Arc<CameraFeedLock>>,
     #[cfg(target_os = "macos")]
     pub shareable_content: Option<SendableShareableContent>,
     #[cfg(target_os = "macos")]

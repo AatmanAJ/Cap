@@ -1003,6 +1003,7 @@ on = "オン"
 camera_only_needs_camera = "カメラのみの録画にはカメラを選択する必要があります。"
 copy = "エラーをコピー"
 devices_not_ready = "録画デバイスの準備ができていません。レコーダーを開いてもう一度お試しください。"
+mobile_device_needs_studio = "iPhoneとiPadの録画はStudioモードを使います。Studioに切り替えてもう一度開始してください。"
 title = "問題が発生しました"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "ディスプレイを選択"
 choose_window = "ウィンドウを選択"
 display = "ディスプレイ"
 heading = "キャプチャするソースを選択"
+mobile_device = "iPhone/iPad"
 no_displays = "ディスプレイが見つかりません"
 no_matching_displays = "一致するディスプレイはありません"
 no_matching_windows = "一致するウィンドウはありません"
@@ -1482,6 +1484,10 @@ camera_allow = "カメラへのアクセスを許可…"
 camera_turn_on = "設定でカメラへのアクセスをオンにする…"
 microphone_allow = "マイクへのアクセスを許可…"
 microphone_turn_on = "設定でマイクへのアクセスをオンにする…"
+
+[overlay.mobile_device]
+connect = "iPhoneまたはiPadをケーブルで接続し、ロックを解除して「信頼」をタップしてください。表示されるまで数秒かかることがあります。"
+description = "ケーブルで接続したiPhoneまたはiPadの画面を録画します"
 
 [overlay.start]
 instant = "Instantモード：共有リンクを録画"

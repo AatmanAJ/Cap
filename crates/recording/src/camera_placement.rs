@@ -66,7 +66,7 @@ pub fn recording_camera_placement(
     target: &ScreenCaptureTarget,
     camera: [f64; 4],
 ) -> Option<RecordingCameraPlacement> {
-    if matches!(target, ScreenCaptureTarget::CameraOnly) || !valid_bounds(camera) {
+    if target.is_feed_backed() || !valid_bounds(camera) {
         return None;
     }
     let reference = capture_bounds(target)
@@ -96,7 +96,7 @@ fn display_bounds(display: scap_targets::Display) -> Option<[f64; 4]> {
 
 fn capture_bounds(target: &ScreenCaptureTarget) -> Option<[f64; 4]> {
     match target {
-        ScreenCaptureTarget::CameraOnly => None,
+        ScreenCaptureTarget::CameraOnly | ScreenCaptureTarget::MobileDevice { .. } => None,
         ScreenCaptureTarget::Display { .. } => display_bounds(target.display()?),
         ScreenCaptureTarget::Window { id } => {
             let window = scap_targets::Window::from_id(id)?;

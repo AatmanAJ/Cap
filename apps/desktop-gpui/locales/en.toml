@@ -1005,6 +1005,7 @@ on = { text = "On", max_px = 130, size = 11 }
 camera_only_needs_camera = "Camera-only recording requires a selected camera."
 copy = "Copy error"
 devices_not_ready = "Recording devices are not ready. Open the recorder and try again."
+mobile_device_needs_studio = "iPhone and iPad recordings use Studio mode. Switch to Studio and start again."
 title = "Something went wrong"
 
 [main.header]
@@ -1111,6 +1112,7 @@ choose_display = "Choose a display"
 choose_window = "Choose a window"
 display = { text = "Display", max_px = 100, size = 12 }
 heading = "Choose a capture source"
+mobile_device = { text = "iPhone/iPad", context = "Capture source: the screen of an iPhone or iPad connected with a cable.", max_px = 90, size = 12 }
 no_displays = "No displays found"
 no_matching_displays = "No matching displays"
 no_matching_windows = "No matching windows"
@@ -1484,6 +1486,10 @@ camera_allow = "Allow camera access…"
 camera_turn_on = "Turn on camera access in Settings…"
 microphone_allow = "Allow microphone access…"
 microphone_turn_on = "Turn on microphone access in Settings…"
+
+[overlay.mobile_device]
+connect = "Connect an iPhone or iPad with a cable, unlock it and tap Trust. It can take a few seconds to appear."
+description = "Record the screen of an iPhone or iPad connected with a cable"
 
 [overlay.start]
 instant = { text = "Instant Mode — Record shareable link", context = "Second line of the start button, 11px, truncates." }

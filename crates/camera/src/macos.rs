@@ -12,6 +12,7 @@ pub(super) fn list_cameras_impl() -> impl Iterator<Item = CameraInfo> {
         let devices = cap_camera_avfoundation::list_video_devices();
         devices
             .iter()
+            .filter(|d| !cap_camera_avfoundation::is_ios_screen_device(d))
             .map(|d| CameraInfo {
                 device_id: d.unique_id().to_string(),
                 model_id: ModelID::from_avfoundation(d),
@@ -93,7 +94,44 @@ fn avfoundation_session_lifecycle_guard() -> std::sync::MutexGuard<'static, ()> 
         .unwrap_or_else(|err| err.into_inner())
 }
 
+pub(super) fn list_screen_devices_impl() -> Vec<ScreenDeviceInfo> {
+    cap_camera_avfoundation::enable_screen_capture_devices();
+    objc::ar_pool(|| {
+        cap_camera_avfoundation::list_screen_capture_devices()
+            .iter()
+            .map(|d| {
+                let name = d.localized_name().to_string();
+                let size = d
+                    .formats()
+                    .iter()
+                    .map(|format| {
+                        let dims = format.format_desc().dims();
+                        (dims.width.max(0) as u32, dims.height.max(0) as u32)
+                    })
+                    .max_by_key(|(w, h)| u64::from(*w) * u64::from(*h));
+                ScreenDeviceInfo {
+                    kind: ScreenDeviceKind::classify(&name, size),
+                    camera: CameraInfo {
+                        device_id: d.unique_id().to_string(),
+                        model_id: None,
+                        display_name: name,
+                    },
+                    screen_size: size,
+                }
+            })
+            .collect::<Vec<_>>()
+    })
+}
+
 fn find_device(info: &CameraInfo) -> Option<arc::R<av::CaptureDevice>> {
+    if info.model_id().is_none()
+        && let Some(device) = cap_camera_avfoundation::list_screen_capture_devices()
+            .into_iter()
+            .find(|d| d.unique_id().to_string() == info.device_id())
+    {
+        return Some(device);
+    }
+
     let devices = list_video_devices();
     devices
         .iter()

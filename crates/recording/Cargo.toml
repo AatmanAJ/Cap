@@ -126,6 +126,10 @@ windows = { workspace = true, features = ["Win32_UI_HiDpi"] }
 name = "synthetic_recording"
 required-features = ["test-utils"]
 
+[[test]]
+name = "mobile_device_recording"
+required-features = ["test-utils"]
+
 [[example]]
 name = "synthetic-test-runner"
 required-features = ["test-utils"]

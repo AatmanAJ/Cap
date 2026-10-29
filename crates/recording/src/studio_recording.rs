@@ -2148,6 +2148,7 @@ pub struct ActorBuilder {
     system_audio: bool,
     mic_feed: Option<Arc<MicrophoneFeedLock>>,
     camera_feed: Option<Arc<CameraFeedLock>>,
+    mobile_device_feed: Option<Arc<CameraFeedLock>>,
     custom_cursor: bool,
     keyboard_capture: bool,
     fragmented: bool,
@@ -2173,6 +2174,7 @@ impl ActorBuilder {
             system_audio: false,
             mic_feed: None,
             camera_feed: None,
+            mobile_device_feed: None,
             custom_cursor: false,
             keyboard_capture: true,
             fragmented: true,
@@ -2211,6 +2213,13 @@ impl ActorBuilder {
 
     pub fn with_camera_feed(mut self, camera_feed: Arc<CameraFeedLock>) -> Self {
         self.camera_feed = Some(camera_feed);
+        self
+    }
+
+    /// The iPhone/iPad screen for a [`screen_capture::ScreenCaptureTarget::MobileDevice`]
+    /// target, opened like a camera.
+    pub fn with_mobile_device_feed(mut self, feed: Arc<CameraFeedLock>) -> Self {
+        self.mobile_device_feed = Some(feed);
         self
     }
 
@@ -2277,6 +2286,7 @@ impl ActorBuilder {
                 capture_system_audio: self.system_audio,
                 mic_feed: self.mic_feed,
                 camera_feed: self.camera_feed,
+                mobile_device_feed: self.mobile_device_feed,
                 start_gate: self.start_gate,
                 #[cfg(target_os = "macos")]
                 shareable_content,
@@ -3296,8 +3306,12 @@ async fn create_segment_pipeline(
     let pipeline_start_gate = start_gate.clone();
 
     let camera_active = base_inputs.camera_feed.is_some();
+    let mobile_device = matches!(
+        base_inputs.capture_target,
+        screen_capture::ScreenCaptureTarget::MobileDevice { .. }
+    );
     #[cfg(target_os = "macos")]
-    let segment_fragmented = fragmented && !camera_active;
+    let segment_fragmented = fragmented && !camera_active && !mobile_device;
     #[cfg(not(target_os = "macos"))]
     let segment_fragmented = fragmented;
 
@@ -3318,7 +3332,35 @@ async fn create_segment_pipeline(
     #[cfg(target_os = "linux")]
     let mut start_time = start_time;
 
-    let (screen, system_audio, cursor_display) = if camera_only {
+    let (screen, system_audio, cursor_display) = if mobile_device {
+        #[cfg(target_os = "macos")]
+        {
+            let device_feed = base_inputs.mobile_device_feed.clone().ok_or_else(|| {
+                anyhow!(
+                    "The iPhone or iPad is not available. Connect it with a cable, unlock it, \
+                    trust this Mac and choose it again."
+                )
+            })?;
+
+            let screen = OutputPipeline::builder(screen_output_path.clone())
+                .with_video::<sources::NativeCamera>(device_feed)
+                .with_timestamps(start_time)
+                .with_start_gate(start_gate.clone())
+                .build::<AVFoundationCameraMuxer>(AVFoundationCameraMuxerConfig::default())
+                .instrument(error_span!("screen-out"))
+                .await
+                .context("device screen pipeline setup")?;
+
+            (screen, None, None)
+        }
+
+        #[cfg(not(target_os = "macos"))]
+        {
+            return Err(anyhow!(
+                "Recording an iPhone or iPad is only supported on macOS"
+            ));
+        }
+    } else if camera_only {
         #[cfg(target_os = "linux")]
         {
             let camera_feed = base_inputs.camera_feed.clone().ok_or_else(|| {
@@ -3636,7 +3678,7 @@ async fn create_segment_pipeline(
         None
     };
 
-    let cursor = if camera_only {
+    let cursor = if camera_only || mobile_device {
         None
     } else {
         (custom_cursor_capture || keyboard_capture)
@@ -4007,6 +4049,7 @@ mod tests {
                         capture_system_audio: false,
                         mic_feed: None,
                         camera_feed: None,
+                        mobile_device_feed: None,
                         start_gate: None,
                         #[cfg(target_os = "macos")]
                         shareable_content: None,
@@ -4118,6 +4161,7 @@ mod tests {
                 capture_system_audio: false,
                 mic_feed: None,
                 camera_feed: None,
+                mobile_device_feed: None,
                 start_gate: None,
                 #[cfg(target_os = "macos")]
                 shareable_content: None,
@@ -4217,6 +4261,7 @@ mod tests {
                 capture_system_audio: false,
                 mic_feed: None,
                 camera_feed: None,
+                mobile_device_feed: None,
                 start_gate: None,
                 shareable_content: None,
                 excluded_windows: Vec::new(),
@@ -4355,6 +4400,7 @@ mod tests {
                     capture_system_audio: false,
                     mic_feed: None,
                     camera_feed: None,
+                    mobile_device_feed: None,
                     start_gate: None,
                     #[cfg(target_os = "macos")]
                     shareable_content: None,
@@ -4600,6 +4646,7 @@ mod tests {
                     capture_system_audio: false,
                     mic_feed: None,
                     camera_feed: None,
+                    mobile_device_feed: None,
                     start_gate: None,
                     #[cfg(target_os = "macos")]
                     shareable_content: None,
@@ -6280,6 +6327,7 @@ mod tests {
                 capture_system_audio: false,
                 mic_feed: None,
                 camera_feed: None,
+                mobile_device_feed: None,
                 start_gate: None,
             },
             false,
@@ -6528,6 +6576,7 @@ mod windows_cancel_tests {
                 capture_system_audio: false,
                 mic_feed: None,
                 camera_feed: None,
+                mobile_device_feed: None,
                 start_gate: None,
             },
             false,

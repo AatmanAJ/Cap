@@ -1003,6 +1003,7 @@ on = "Oui"
 camera_only_needs_camera = "L'enregistrement caméra seule nécessite une caméra sélectionnée."
 copy = "Copier l'erreur"
 devices_not_ready = "Les appareils d'enregistrement ne sont pas prêts. Ouvrez l'enregistreur et réessayez."
+mobile_device_needs_studio = "Les enregistrements d'iPhone et d'iPad utilisent le mode Studio. Passez à Studio et recommencez."
 title = "Un problème est survenu"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "Choisir un écran"
 choose_window = "Choisir une fenêtre"
 display = "Écran"
 heading = "Choisissez une source de capture"
+mobile_device = "iPhone/iPad"
 no_displays = "Aucun écran trouvé"
 no_matching_displays = "Aucun écran correspondant"
 no_matching_windows = "Aucune fenêtre correspondante"
@@ -1482,6 +1484,10 @@ camera_allow = "Autoriser l'accès à la caméra…"
 camera_turn_on = "Activer l'accès à la caméra dans Réglages Système…"
 microphone_allow = "Autoriser l'accès au micro…"
 microphone_turn_on = "Activer l'accès au micro dans Réglages Système…"
+
+[overlay.mobile_device]
+connect = "Connectez un iPhone ou un iPad avec un câble, déverrouillez-le et touchez « Se fier ». Il peut mettre quelques secondes à apparaître."
+description = "Enregistrer l'écran d'un iPhone ou d'un iPad connecté par câble"
 
 [overlay.start]
 instant = "Mode Instant : enregistrer un lien de partage"

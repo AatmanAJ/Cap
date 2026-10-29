@@ -508,7 +508,7 @@ fn capture_title(target: TargetType, screenshot: bool) -> &'static str {
         (TargetType::Display, false) => tr::tray::record_display(),
         (TargetType::Window, false) => tr::tray::record_window(),
         (TargetType::Area, false) => tr::tray::record_area(),
-        (TargetType::CameraOnly, _) => "",
+        (TargetType::CameraOnly | TargetType::MobileDevice, _) => "",
     }
 }
 
@@ -517,7 +517,7 @@ fn capture_icon(target: TargetType) -> &'static str {
         TargetType::Display => "display",
         TargetType::Window => "window",
         TargetType::Area => "area",
-        TargetType::CameraOnly => "display",
+        TargetType::CameraOnly | TargetType::MobileDevice => "display",
     }
 }
 
@@ -560,7 +560,9 @@ fn capture_entry(target: TargetType, mode: Mode) -> Entry {
                 TrayItem::RecordArea
             },
         ),
-        TargetType::CameraOnly => unreachable!("capture slots are display, window and area"),
+        TargetType::CameraOnly | TargetType::MobileDevice => {
+            unreachable!("capture slots are display, window and area")
+        }
     };
     Entry::icon_item(title, item, capture_icon(target))
 }

@@ -1074,7 +1074,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .style,
-            FrameStyle::Browser
+            FRAME_STYLES[FRAME_STYLES.len() - 2].0
         );
         assert_eq!(
             history
@@ -1085,7 +1085,7 @@ mod tests {
                 .as_ref()
                 .unwrap()
                 .style,
-            FrameStyle::Macbook
+            FRAME_STYLES[FRAME_STYLES.len() - 1].0
         );
     }
 }

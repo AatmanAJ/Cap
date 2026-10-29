@@ -48,6 +48,104 @@ pub fn list_video_devices() -> arc::R<ns::Array<av::CaptureDevice>> {
     })
 }
 
+/// `AVCaptureDevice.modelID` of the screen-capture device an iPhone or iPad
+/// exposes over USB once screen-capture devices are allowed.
+pub const IOS_SCREEN_DEVICE_MODEL_ID: &str = "iOS Device";
+
+pub fn is_ios_screen_device_model(model_id: &str) -> bool {
+    model_id == IOS_SCREEN_DEVICE_MODEL_ID
+}
+
+pub fn is_ios_screen_device(device: &av::CaptureDevice) -> bool {
+    is_ios_screen_device_model(&device.model_id().to_string())
+}
+
+#[repr(C)]
+struct CmioObjectPropertyAddress {
+    selector: u32,
+    scope: u32,
+    element: u32,
+}
+
+#[link(name = "CoreMediaIO", kind = "framework")]
+unsafe extern "C" {
+    fn CMIOObjectSetPropertyData(
+        object_id: u32,
+        address: *const CmioObjectPropertyAddress,
+        qualifier_data_size: u32,
+        qualifier_data: *const std::ffi::c_void,
+        data_size: u32,
+        data: *const std::ffi::c_void,
+    ) -> i32;
+}
+
+const CMIO_OBJECT_SYSTEM_OBJECT: u32 = 1;
+const CMIO_HARDWARE_PROPERTY_ALLOW_SCREEN_CAPTURE_DEVICES: u32 = u32::from_be_bytes(*b"yes ");
+const CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL: u32 = u32::from_be_bytes(*b"glob");
+const CMIO_OBJECT_PROPERTY_ELEMENT_MAIN: u32 = 0;
+
+static SCREEN_CAPTURE_DEVICES_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Opts this process into CoreMediaIO screen-capture devices, which is how a
+/// USB-connected, trusted and unlocked iPhone or iPad shows up as a muxed
+/// `AVCaptureDevice` (the same switch QuickTime flips). The device appears
+/// asynchronously, usually 1-3 seconds after the first call, so callers poll
+/// [`list_screen_capture_devices`]. Returns whether the property was set; only
+/// the first call talks to CoreMediaIO.
+pub fn enable_screen_capture_devices() -> bool {
+    *SCREEN_CAPTURE_DEVICES_ENABLED.get_or_init(|| {
+        let address = CmioObjectPropertyAddress {
+            selector: CMIO_HARDWARE_PROPERTY_ALLOW_SCREEN_CAPTURE_DEVICES,
+            scope: CMIO_OBJECT_PROPERTY_SCOPE_GLOBAL,
+            element: CMIO_OBJECT_PROPERTY_ELEMENT_MAIN,
+        };
+        let allow: u32 = 1;
+        let status = unsafe {
+            CMIOObjectSetPropertyData(
+                CMIO_OBJECT_SYSTEM_OBJECT,
+                &address,
+                0,
+                std::ptr::null(),
+                std::mem::size_of::<u32>() as u32,
+                std::ptr::from_ref(&allow).cast(),
+            )
+        };
+        if status != 0 {
+            warn!(status, "Failed to allow CoreMediaIO screen capture devices");
+        }
+        status == 0
+    })
+}
+
+/// Connected iPhone/iPad screen-capture devices. Empty until
+/// [`enable_screen_capture_devices`] has run and the devices have had time to
+/// appear.
+pub fn list_screen_capture_devices() -> Vec<arc::R<av::CaptureDevice>> {
+    objc::ar_pool(|| {
+        let device_type = if api::macos_available("14.0")
+            && let Some(typ) = unsafe { av::CaptureDeviceType::external() }
+        {
+            typ
+        } else {
+            av::CaptureDeviceType::external_unknown()
+        };
+        let device_types = ns::Array::from_slice(&[device_type]);
+
+        let session = av::CaptureDeviceDiscoverySession::with_device_types_media_and_pos(
+            &device_types,
+            Some(av::MediaType::muxed()),
+            av::CaptureDevicePos::Unspecified,
+        );
+
+        session
+            .devices()
+            .iter()
+            .filter(|device| is_ios_screen_device(device))
+            .map(|device| device.retained())
+            .collect()
+    })
+}
+
 #[derive(Clone, Copy)]
 pub enum YCbCrMatrix {
     Rec601,
@@ -271,6 +369,36 @@ impl<'a> BaseAddrLockGuard<'a> {
 impl<'a> Drop for BaseAddrLockGuard<'a> {
     fn drop(&mut self) {
         let _ = unsafe { self.0.unlock_lock_base_addr(self.1) };
+    }
+}
+
+#[cfg(test)]
+mod screen_device_tests {
+    use super::*;
+
+    #[test]
+    fn only_the_ios_screen_model_counts_as_a_screen_device() {
+        assert!(is_ios_screen_device_model("iOS Device"));
+        for model in [
+            "",
+            "ios device",
+            "iOS Device ",
+            "UVC Camera VendorID_1133",
+            "iPhone15,2",
+        ] {
+            assert!(!is_ios_screen_device_model(model), "{model}");
+        }
+    }
+
+    #[test]
+    fn allowing_screen_capture_devices_succeeds_and_is_idempotent() {
+        assert!(enable_screen_capture_devices());
+        assert!(enable_screen_capture_devices());
+        assert!(
+            list_screen_capture_devices()
+                .iter()
+                .all(|device| is_ios_screen_device(device))
+        );
     }
 }
 

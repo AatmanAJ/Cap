@@ -72,6 +72,81 @@ impl MicrophoneOption {
     }
 }
 
+/// An iPhone or iPad connected over USB whose screen can be recorded. The
+/// `device_id` is the `AVCaptureDevice.uniqueID` that
+/// `ScreenCaptureTarget::MobileDevice` carries.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MobileDeviceOption {
+    pub device_id: String,
+    pub label: String,
+    pub kind: cap_camera::ScreenDeviceKind,
+    pub screen_size: Option<(u32, u32)>,
+}
+
+impl MobileDeviceOption {
+    pub fn kind_label(&self) -> &'static str {
+        match self.kind {
+            cap_camera::ScreenDeviceKind::IPhone => "iPhone",
+            cap_camera::ScreenDeviceKind::IPad => "iPad",
+        }
+    }
+
+    pub fn icon(&self) -> &'static str {
+        match self.kind {
+            cap_camera::ScreenDeviceKind::IPhone => "icons/smartphone.svg",
+            cap_camera::ScreenDeviceKind::IPad => "icons/tablet.svg",
+        }
+    }
+
+    /// The format to open it with: its whole screen, up to 60fps.
+    pub fn capture_settings(&self) -> Option<cap_recording::feeds::camera::CameraDeviceSettings> {
+        let camera = cap_camera::list_screen_devices()
+            .into_iter()
+            .find(|device| device.camera.device_id() == self.device_id)?
+            .camera;
+        let formats = camera.formats()?;
+        let format = cap_camera::preferred_screen_format(&formats)?;
+        Some(cap_recording::feeds::camera::CameraDeviceSettings {
+            width: Some(format.width()),
+            height: Some(format.height()),
+            frame_rate: Some(format.frame_rate()),
+        })
+    }
+}
+
+/// Connected iPhones and iPads. Blocking AVFoundation discovery, so run it off
+/// the main thread. The first call opts the process into screen-capture
+/// devices, after which a connected device takes a second or three to appear.
+pub fn list_mobile_devices() -> Vec<MobileDeviceOption> {
+    cap_camera::list_screen_devices()
+        .into_iter()
+        .map(|device| MobileDeviceOption {
+            device_id: device.camera.device_id().to_string(),
+            label: device.camera.display_name().to_string(),
+            kind: device.kind,
+            screen_size: device.screen_size,
+        })
+        .collect()
+}
+
+/// Which device a Start should record: the one picked, while it is still
+/// connected, else the only connected one. Several connected and none picked
+/// means the user has to choose.
+pub fn resolve_mobile_device<'a>(
+    devices: &'a [MobileDeviceOption],
+    picked: Option<&str>,
+) -> Option<&'a MobileDeviceOption> {
+    if let Some(picked) = picked
+        && let Some(device) = devices.iter().find(|device| device.device_id == picked)
+    {
+        return Some(device);
+    }
+    match devices {
+        [only] => Some(only),
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct DisplayOption {
     pub id: DisplayId,
@@ -268,6 +343,63 @@ impl InputSnapshot {
             _ => return false,
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod mobile_device_tests {
+    use super::*;
+
+    fn device(id: &str) -> MobileDeviceOption {
+        MobileDeviceOption {
+            device_id: id.into(),
+            label: format!("Device {id}"),
+            kind: cap_camera::ScreenDeviceKind::IPhone,
+            screen_size: Some((1179, 2556)),
+        }
+    }
+
+    #[test]
+    fn picked_device_wins_while_connected() {
+        let devices = [device("a"), device("b")];
+        assert_eq!(
+            resolve_mobile_device(&devices, Some("b")).map(|d| d.device_id.as_str()),
+            Some("b")
+        );
+    }
+
+    #[test]
+    fn a_single_device_needs_no_pick() {
+        let devices = [device("a")];
+        assert_eq!(
+            resolve_mobile_device(&devices, None).map(|d| d.device_id.as_str()),
+            Some("a")
+        );
+        assert_eq!(
+            resolve_mobile_device(&devices, Some("unplugged")).map(|d| d.device_id.as_str()),
+            Some("a")
+        );
+    }
+
+    #[test]
+    fn nothing_to_record_when_ambiguous_or_unplugged() {
+        assert!(resolve_mobile_device(&[], Some("a")).is_none());
+        assert!(resolve_mobile_device(&[device("a"), device("b")], None).is_none());
+        assert!(resolve_mobile_device(&[device("a"), device("b")], Some("c")).is_none());
+    }
+
+    #[test]
+    fn kind_picks_label_and_icon() {
+        let mut ipad = device("a");
+        ipad.kind = cap_camera::ScreenDeviceKind::IPad;
+        assert_eq!(
+            (ipad.kind_label(), ipad.icon()),
+            ("iPad", "icons/tablet.svg")
+        );
+        assert_eq!(
+            (device("b").kind_label(), device("b").icon()),
+            ("iPhone", "icons/smartphone.svg")
+        );
     }
 }
 

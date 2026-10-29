@@ -1003,6 +1003,7 @@ on = "चालू"
 camera_only_needs_camera = "सिर्फ़ कैमरा रिकॉर्डिंग के लिए कोई कैमरा चुना होना ज़रूरी है।"
 copy = "त्रुटि कॉपी करें"
 devices_not_ready = "रिकॉर्डिंग डिवाइस तैयार नहीं हैं। रिकॉर्डर खोलें और फिर से कोशिश करें।"
+mobile_device_needs_studio = "iPhone और iPad रिकॉर्डिंग Studio मोड में होती है। Studio पर जाएँ और फिर से शुरू करें।"
 title = "कुछ गड़बड़ हो गई"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "डिस्प्ले चुनें"
 choose_window = "विंडो चुनें"
 display = "डिस्प्ले"
 heading = "कैप्चर का स्रोत चुनें"
+mobile_device = "iPhone/iPad"
 no_displays = "कोई डिस्प्ले नहीं मिला"
 no_matching_displays = "कोई मिलता-जुलता डिस्प्ले नहीं"
 no_matching_windows = "कोई मिलती-जुलती विंडो नहीं"
@@ -1482,6 +1484,10 @@ camera_allow = "कैमरा एक्सेस की अनुमति द
 camera_turn_on = "सेटिंग्स में कैमरा एक्सेस चालू करें…"
 microphone_allow = "माइक्रोफ़ोन एक्सेस की अनुमति दें…"
 microphone_turn_on = "सेटिंग्स में माइक्रोफ़ोन एक्सेस चालू करें…"
+
+[overlay.mobile_device]
+connect = "केबल से iPhone या iPad जोड़ें, उसे अनलॉक करें और Trust पर टैप करें। इसे दिखने में कुछ सेकंड लग सकते हैं।"
+description = "केबल से जुड़े iPhone या iPad की स्क्रीन रिकॉर्ड करें"
 
 [overlay.start]
 instant = "Instant मोड: शेयर करने लायक लिंक रिकॉर्ड करें"

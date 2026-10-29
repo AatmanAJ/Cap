@@ -499,6 +499,8 @@ pub enum TargetType {
     Window,
     Area,
     CameraOnly,
+    /// A USB-connected iPhone or iPad (macOS).
+    MobileDevice,
 }
 
 impl TargetType {
@@ -508,6 +510,7 @@ impl TargetType {
             Self::Window => "Window",
             Self::Area => "Area",
             Self::CameraOnly => "Camera Only",
+            Self::MobileDevice => "iPhone/iPad",
         }
     }
 
@@ -519,6 +522,7 @@ impl TargetType {
             Self::Window => tr::main::target::window(),
             Self::Area => tr::main::target::area(),
             Self::CameraOnly => tr::main::target::camera_only(),
+            Self::MobileDevice => tr::main::target::mobile_device(),
         }
     }
 
@@ -528,6 +532,7 @@ impl TargetType {
             Self::Window => "icons/window.svg",
             Self::Area => "icons/area.svg",
             Self::CameraOnly => "icons/camera.svg",
+            Self::MobileDevice => "icons/smartphone.svg",
         }
     }
 }
@@ -1620,8 +1625,8 @@ impl MainWindow {
                     .ok();
                 }))
             }
-            // Area and Camera Only have no cards to fill.
-            TargetType::Area | TargetType::CameraOnly => None,
+            // Area, Camera Only and devices have no cards to fill.
+            TargetType::Area | TargetType::CameraOnly | TargetType::MobileDevice => None,
         }
     }
 
@@ -1639,7 +1644,10 @@ impl MainWindow {
     /// Nothing here runs while no target panel is open: `close_panel` drops the
     /// task, which is the `enabled:` on every one of those queries.
     fn start_target_poll(&mut self, kind: TargetType, window: &mut Window, cx: &mut Context<Self>) {
-        if matches!(kind, TargetType::Area | TargetType::CameraOnly) {
+        if matches!(
+            kind,
+            TargetType::Area | TargetType::CameraOnly | TargetType::MobileDevice
+        ) {
             self.target_poll_task = None;
             return;
         }
@@ -2092,6 +2100,8 @@ impl MainWindow {
             }
             TargetType::Area => None,
             TargetType::CameraOnly => Some(ScreenCaptureTarget::CameraOnly),
+            // Picked on the overlay, like an area.
+            TargetType::MobileDevice => None,
         }
     }
 
@@ -2395,12 +2405,23 @@ impl MainWindow {
                 None => return,
             }
         };
+        if let Some(error) = mobile_device_start_error(&target, mode) {
+            self.session.update(cx, |session, cx| {
+                session.error = Some(error.into());
+                cx.notify();
+            });
+            if editor_flow {
+                cx.defer(app_windows::abort_editor_recording_flow);
+            }
+            return;
+        }
         if mode == recording::RecordingMode::Instant && !crate::store::auth_snapshot().signed_in() {
             let kind = match &target {
                 ScreenCaptureTarget::Display { .. } => TargetType::Display,
                 ScreenCaptureTarget::Window { .. } => TargetType::Window,
                 ScreenCaptureTarget::Area { .. } => TargetType::Area,
                 ScreenCaptureTarget::CameraOnly => TargetType::CameraOnly,
+                ScreenCaptureTarget::MobileDevice { .. } => TargetType::MobileDevice,
             };
             self.show_sign_in_prompt(kind, cx);
             cx.defer(app_windows::show_main_window);
@@ -2613,7 +2634,7 @@ impl MainWindow {
             self.finish_recording_start(&permit);
             return;
         }
-        if matches!(config.target, ScreenCaptureTarget::CameraOnly) {
+        if config.target.is_feed_backed() {
             config.system_audio = false;
         }
         self.checking_storage = true;
@@ -6037,8 +6058,8 @@ impl MainWindow {
                     );
                 }
             }
-            // Area and Camera Only have nothing to pick between.
-            TargetType::Area | TargetType::CameraOnly => {}
+            // Area, Camera Only and devices have nothing to pick between here.
+            TargetType::Area | TargetType::CameraOnly | TargetType::MobileDevice => {}
         }
 
         if cards.is_empty() {
@@ -6801,7 +6822,10 @@ impl MainWindow {
                     .items_stretch()
                     .w_full()
                     .child(self.render_target_tile(TargetType::Area, cx))
-                    .child(self.render_target_tile(TargetType::CameraOnly, cx)),
+                    .child(self.render_target_tile(TargetType::CameraOnly, cx))
+                    .when(cfg!(target_os = "macos"), |row| {
+                        row.child(self.render_target_tile(TargetType::MobileDevice, cx))
+                    }),
             )
     }
 
@@ -7204,7 +7228,18 @@ fn black_alpha(alpha: f32) -> Hsla {
     color
 }
 
-/// `CAP_GPUI_AUTO_OVERLAY=display|window|area|camera`, the harness's stand-in
+/// Why a device target cannot start, checked before any feed is opened:
+/// device screens only record in Studio, and the device has to still be
+/// connected.
+fn mobile_device_start_error(
+    target: &ScreenCaptureTarget,
+    mode: recording::RecordingMode,
+) -> Option<&'static str> {
+    target.mobile_device_id()?;
+    (mode != recording::RecordingMode::Studio).then(tr::main::error::mobile_device_needs_studio)
+}
+
+/// `CAP_GPUI_AUTO_OVERLAY=display|window|area|camera|device`, the harness's stand-in
 /// for clicking a target tile.
 pub fn auto_overlay_kind() -> Option<TargetType> {
     match std::env::var("CAP_GPUI_AUTO_OVERLAY").ok()?.as_str() {
@@ -7212,6 +7247,7 @@ pub fn auto_overlay_kind() -> Option<TargetType> {
         "window" => Some(TargetType::Window),
         "area" => Some(TargetType::Area),
         "camera" => Some(TargetType::CameraOnly),
+        "device" => Some(TargetType::MobileDevice),
         _ => None,
     }
 }

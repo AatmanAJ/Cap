@@ -454,7 +454,14 @@ pub struct TargetSelect {
     /// the one setting it mirrors.
     pub focus_window: bool,
     pub focus_center: bool,
+    /// Connected iPhones and iPads, re-listed while the device picker is up
+    /// so plugging one in (or unlocking it) shows up without reopening it.
+    pub mobile_devices: Vec<crate::devices::MobileDeviceOption>,
+    /// The device clicked in the picker; kept across picker sessions so the
+    /// same phone stays chosen.
+    pub picked_mobile_device: Option<String>,
     _poll: Option<gpui::Task<()>>,
+    _device_poll: Option<gpui::Task<()>>,
 }
 
 /// A window the picker moved, as the picker found it.
@@ -495,7 +502,10 @@ impl TargetSelect {
             arranged: HashMap::new(),
             focus_window: saved_focus(),
             focus_center: crate::store::GeneralSettings::load().focus_center,
+            mobile_devices: Vec::new(),
+            picked_mobile_device: None,
             _poll: None,
+            _device_poll: None,
         });
         cx.set_global(TargetSelectGlobal(select.clone()));
         select
@@ -534,7 +544,53 @@ impl TargetSelect {
             self._poll = None;
             self.cursor_display = None;
         }
+        if mode == Some(TargetType::MobileDevice) {
+            self.start_device_polling(cx);
+        } else {
+            self._device_poll = None;
+        }
         cx.notify();
+    }
+
+    /// The device a Start would record right now, if any.
+    pub fn mobile_device(&self) -> Option<&crate::devices::MobileDeviceOption> {
+        crate::devices::resolve_mobile_device(
+            &self.mobile_devices,
+            self.picked_mobile_device.as_deref(),
+        )
+    }
+
+    pub fn pick_mobile_device(&mut self, device_id: String, cx: &mut Context<Self>) {
+        if self.picked_mobile_device.as_deref() != Some(device_id.as_str()) {
+            self.picked_mobile_device = Some(device_id);
+            cx.notify();
+        }
+    }
+
+    /// Re-lists devices every second while the device picker is up. Enabling
+    /// screen-capture devices happens on the first list, and a device only
+    /// appears a second or three later (and only once it is unlocked and
+    /// trusts this Mac), so a one-shot list would miss it.
+    fn start_device_polling(&mut self, cx: &mut Context<Self>) {
+        self._device_poll = Some(cx.spawn(async move |this, cx| {
+            loop {
+                let devices = cx
+                    .background_executor()
+                    .spawn(async { crate::devices::list_mobile_devices() })
+                    .await;
+                let Ok(()) = this.update(cx, |this, cx| {
+                    if this.mobile_devices != devices {
+                        this.mobile_devices = devices;
+                        cx.notify();
+                    }
+                }) else {
+                    return;
+                };
+                cx.background_executor()
+                    .timer(std::time::Duration::from_secs(1))
+                    .await;
+            }
+        }));
     }
 
     pub fn set_recording_mode(&mut self, mode: Mode, cx: &mut Context<Self>) {
@@ -834,7 +890,7 @@ fn backdrop_suits(mode: Option<TargetType>) -> bool {
     match mode {
         None => false,
         Some(TargetType::Display | TargetType::Window) => !cfg!(windows),
-        Some(TargetType::Area | TargetType::CameraOnly) => true,
+        Some(TargetType::Area | TargetType::CameraOnly | TargetType::MobileDevice) => true,
     }
 }
 
@@ -1476,6 +1532,13 @@ impl OverlayWindow {
                 }
             }),
             TargetType::CameraOnly => Some(ScreenCaptureTarget::CameraOnly),
+            TargetType::MobileDevice => {
+                select
+                    .mobile_device()
+                    .map(|device| ScreenCaptureTarget::MobileDevice {
+                        id: device.device_id.clone(),
+                    })
+            }
         }
     }
 
@@ -1888,6 +1951,7 @@ impl Render for OverlayWindow {
                 Some(TargetType::Window) => root.child(self.render_window_variant(window, cx)),
                 Some(TargetType::Area) => root.child(self.render_area_variant(window, cx)),
                 Some(TargetType::CameraOnly) => root.child(self.render_camera_variant(cx)),
+                Some(TargetType::MobileDevice) => root.child(self.render_mobile_device_variant(cx)),
                 None => root,
             }
         };
@@ -3038,6 +3102,149 @@ impl OverlayWindow {
                     .px(px(24.))
                     .mb(px(16.))
                     .child(preview),
+            )
+            .child(self.render_controls_cluster(self.target(cx), false, cx))
+    }
+
+    /// The device picker: the connected iPhones and iPads to choose from, or
+    /// how to connect one, above the usual start cluster.
+    fn render_mobile_device_variant(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+        let select = self.select.read(cx);
+        let chosen = select
+            .mobile_device()
+            .map(|device| device.device_id.clone());
+        let devices = select.mobile_devices.clone();
+        let title = select
+            .mobile_device()
+            .map(|device| device.label.clone())
+            .unwrap_or_else(|| tr::main::target::mobile_device().to_string());
+
+        let body = if devices.is_empty() {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap(px(10.))
+                .px(px(24.))
+                .py(px(20.))
+                .rounded(px(12.))
+                .border_1()
+                .border_color(theme.gray_6)
+                .bg(gpui::hsla(0., 0., 0., 0.4))
+                .max_w(px(360.))
+                .child(
+                    svg()
+                        .path("icons/smartphone.svg")
+                        .size(px(32.))
+                        .text_color(theme.gray_11),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_center()
+                        .text_color(theme.gray_11)
+                        .child(tr::overlay::mobile_device::connect()),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(6.))
+                .w(px(320.))
+                .children(devices.into_iter().enumerate().map(|(index, device)| {
+                    let selected = chosen.as_deref() == Some(device.device_id.as_str());
+                    let id = device.device_id.clone();
+                    let detail = match device.screen_size {
+                        Some((w, h)) => format!("{} · {w}×{h}", device.kind_label()),
+                        None => device.kind_label().to_string(),
+                    };
+                    div()
+                        .id(("mobile-device", index))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.))
+                        .p(px(10.))
+                        .rounded(px(10.))
+                        .cursor_pointer()
+                        .border_1()
+                        .border_color(if selected {
+                            gpui::Hsla::from(theme.blue_9)
+                        } else {
+                            theme.gray_6.into()
+                        })
+                        .bg(gpui::hsla(0., 0., 0., 0.4))
+                        .hover(|row| row.bg(gpui::hsla(0., 0., 1., 0.08)))
+                        .child(
+                            svg()
+                                .path(device.icon())
+                                .size(px(20.))
+                                .flex_shrink_0()
+                                .text_color(if selected {
+                                    gpui::Hsla::from(theme.blue_10)
+                                } else {
+                                    theme.gray_11.into()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .flex_1()
+                                .min_w_0()
+                                .child(div().text_size(px(13.)).truncate().child(device.label))
+                                .child(
+                                    div()
+                                        .text_size(px(11.))
+                                        .text_color(theme.gray_11)
+                                        .child(detail),
+                                ),
+                        )
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let id = id.clone();
+                            this.select
+                                .update(cx, |select, cx| select.pick_mobile_device(id, cx));
+                        }))
+                }))
+                .into_any_element()
+        };
+
+        div()
+            .size_full()
+            .relative()
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .bg(gpui::hsla(0., 0., 0., 0.7))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .mb(px(16.))
+                    .child(
+                        div()
+                            .mb(px(8.))
+                            .text_size(px(30.))
+                            .font_weight(FontWeight::BOLD)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(theme.gray_11)
+                            .child(tr::overlay::mobile_device::description()),
+                    ),
+            )
+            .child(
+                div()
+                    .flex()
+                    .justify_center()
+                    .w_full()
+                    .mb(px(16.))
+                    .child(body),
             )
             .child(self.render_controls_cluster(self.target(cx), false, cx))
     }

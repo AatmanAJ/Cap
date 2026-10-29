@@ -106,6 +106,7 @@ pub struct ActiveRecording {
     pub mic_mute: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     _mic_feed: Option<Arc<RecordingOwnedFeed<MicrophoneFeed>>>,
     _camera_feed: Option<Arc<RecordingOwnedFeed<CameraFeed>>>,
+    _mobile_device_feed: Option<Arc<RecordingOwnedFeed<CameraFeed>>>,
     // The mic error channel must outlive the stream or error sends panic the
     // sender side into logs; we keep it and drain nothing.
     _mic_errors: Option<flume::Receiver<cpal::StreamError>>,
@@ -464,6 +465,15 @@ async fn finalize_studio(
         ))
         .unwrap_or_default();
         apply_animated_gradient_to_project_config(&project_path, &capture_target, &library);
+        if let Some(device_id) = capture_target.mobile_device_id() {
+            let kind = cap_camera::list_screen_devices()
+                .into_iter()
+                .find(|device| device.camera.device_id() == device_id)
+                .map_or(cap_camera::ScreenDeviceKind::IPhone, |device| device.kind);
+            if let Err(error) = apply_device_frame(&project_path, kind) {
+                tracing::warn!(%error, "Could not apply the device frame");
+            }
+        }
         if crate::store::studio_sound_by_default()
             && let Err(error) = enable_studio_sound(&project_path)
         {
@@ -1767,6 +1777,47 @@ fn enable_notch_overlay(project_path: &std::path::Path) -> std::io::Result<()> {
     result
 }
 
+/// A device recording opens in the editor already wearing its device frame,
+/// unless the project somehow has a frame of its own.
+fn apply_device_frame(
+    project_path: &std::path::Path,
+    kind: cap_camera::ScreenDeviceKind,
+) -> std::io::Result<bool> {
+    let invalid =
+        |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
+    let path = project_path.join("project-config.json");
+    let mut config: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let background = config
+        .as_object_mut()
+        .ok_or_else(|| invalid("Project configuration is not an object"))?
+        .entry("background")
+        .or_insert_with(|| serde_json::json!({}))
+        .as_object_mut()
+        .ok_or_else(|| invalid("Background configuration is not an object"))?;
+    let existing = background
+        .get("frame")
+        .cloned()
+        .and_then(|frame| serde_json::from_value::<cap_project::FrameConfiguration>(frame).ok());
+    if existing.is_some_and(|frame| frame.is_active()) {
+        return Ok(false);
+    }
+    let frame = cap_project::FrameConfiguration {
+        style: match kind {
+            cap_camera::ScreenDeviceKind::IPhone => cap_project::FrameStyle::IPhone,
+            cap_camera::ScreenDeviceKind::IPad => cap_project::FrameStyle::IPad,
+        },
+        ..Default::default()
+    };
+    background.insert("frame".into(), serde_json::to_value(frame)?);
+    let temp = path.with_extension(format!("frame-{}.tmp", crate::store::new_uuid_v4()));
+    let result = std::fs::write(&temp, serde_json::to_vec_pretty(&config)?)
+        .and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result.map(|()| true)
+}
+
 fn apply_animated_gradient_to_project_config(
     project_dir: &std::path::Path,
     capture_target: &ScreenCaptureTarget,
@@ -2238,6 +2289,11 @@ async fn start_internal(
     if matches!(config.target, ScreenCaptureTarget::CameraOnly) && config.camera.is_none() {
         return Err(anyhow!("Camera-only recording requires a selected camera."));
     }
+    if config.target.mobile_device_id().is_some() && config.mode != RecordingMode::Studio {
+        return Err(anyhow!(
+            "iPhone and iPad recordings use Studio mode. Switch to Studio and start again."
+        ));
+    }
     if config.mode == RecordingMode::Instant && !crate::store::auth_snapshot().signed_in() {
         return Err(anyhow!("Please sign in to use instant recording"));
     }
@@ -2447,6 +2503,14 @@ async fn start_attempt_with_upload(
         None
     };
 
+    let (mobile_device_feed, mobile_device_lock) = match config.target.mobile_device_id() {
+        Some(device_id) => {
+            let (feed, lock) = setup_mobile_device(device_id).await?;
+            (Some(feed), Some(Arc::new(lock)))
+        }
+        None => (None, None),
+    };
+
     let mic_mute = mic_lock.as_ref().map(|lock| lock.recording_muted_handle());
 
     // ScreenCaptureKit content, exactly as `read_recording_shareable_content`
@@ -2454,7 +2518,7 @@ async fn start_attempt_with_upload(
     // full query returns no displays.
     #[cfg(target_os = "macos")]
     let shareable_content = match config.target {
-        ScreenCaptureTarget::CameraOnly => None,
+        ScreenCaptureTarget::CameraOnly | ScreenCaptureTarget::MobileDevice { .. } => None,
         _ => Some(read_shareable_content().await?),
     };
 
@@ -2520,6 +2584,9 @@ async fn start_attempt_with_upload(
             }
             if let Some(lock) = camera_lock.clone() {
                 builder = builder.with_camera_feed(lock);
+            }
+            if let Some(lock) = mobile_device_lock.clone() {
+                builder = builder.with_mobile_device_feed(lock);
             }
             if let Some(lock) = mic_lock.clone() {
                 builder = builder.with_mic_feed(lock);
@@ -2635,6 +2702,7 @@ async fn start_attempt_with_upload(
         mic_mute,
         _mic_feed: mic_feed,
         _camera_feed: camera_feed,
+        _mobile_device_feed: mobile_device_feed,
         _mic_errors: mic_errors,
     })
 }
@@ -2702,6 +2770,56 @@ async fn setup_camera(
         .await
         .map_err(|e| anyhow!("camera lock: {e}"))?;
     Ok((owner, lock))
+}
+
+/// Opens a USB iPhone/iPad screen like a camera. The device can take a few
+/// seconds to (re)appear after the process opts into screen-capture devices,
+/// e.g. on the first recording after launch, so wait for it before giving up.
+async fn setup_mobile_device(
+    device_id: &str,
+) -> anyhow::Result<(
+    Arc<RecordingOwnedFeed<CameraFeed>>,
+    cap_recording::feeds::camera::CameraFeedLock,
+)> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let device = loop {
+        let devices = tokio::task::spawn_blocking(crate::devices::list_mobile_devices)
+            .await
+            .unwrap_or_default();
+        if let Some(device) = devices.into_iter().find(|d| d.device_id == device_id) {
+            break device;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(anyhow!(
+                "The iPhone or iPad is not connected. Connect it with a cable, unlock it and choose it again."
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    };
+    let settings = tokio::task::spawn_blocking({
+        let device = device.clone();
+        move || device.capture_settings()
+    })
+    .await
+    .ok()
+    .flatten();
+    tracing::info!(
+        device = %device.label,
+        kind = device.kind_label(),
+        ?settings,
+        "opening device screen"
+    );
+    setup_camera(
+        &DeviceOrModelID::DeviceID(device.device_id.clone()),
+        settings,
+    )
+    .await
+    .map_err(|error| {
+        anyhow!(
+            "Could not record {}: {error}. Unlock it, keep it connected and try again.",
+            device.label
+        )
+    })
 }
 
 async fn setup_microphone(
@@ -3275,6 +3393,34 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("local metadata"));
         assert!(dir.is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn device_recordings_open_in_their_device_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("project-config.json");
+        std::fs::write(&path, r#"{"background":{"padding":12.0}}"#).unwrap();
+        assert!(apply_device_frame(dir.path(), cap_camera::ScreenDeviceKind::IPad).unwrap());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["background"]["frame"]["style"], "iPad");
+        assert_eq!(config["background"]["padding"], 12.0);
+
+        std::fs::write(
+            &path,
+            r#"{"background":{"frame":{"style":"browser","theme":"light","url":"x","title":""}}}"#,
+        )
+        .unwrap();
+        assert!(!apply_device_frame(dir.path(), cap_camera::ScreenDeviceKind::IPhone).unwrap());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["background"]["frame"]["style"], "browser");
+
+        std::fs::write(&path, r#"{"background":{"frame":{"style":"none"}}}"#).unwrap();
+        assert!(apply_device_frame(dir.path(), cap_camera::ScreenDeviceKind::IPhone).unwrap());
+        let config: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(config["background"]["frame"]["style"], "iPhone");
     }
 
     #[test]

@@ -1003,6 +1003,7 @@ on = "Sí"
 camera_only_needs_camera = "Para grabar solo con cámara hay que seleccionar una cámara."
 copy = "Copiar error"
 devices_not_ready = "Los dispositivos de grabación no están listos. Abre la grabadora e inténtalo de nuevo."
+mobile_device_needs_studio = "Las grabaciones de iPhone y iPad usan el modo Studio. Cambia a Studio y vuelve a empezar."
 title = "Algo salió mal"
 
 [main.header]
@@ -1109,6 +1110,7 @@ choose_display = "Elegir una pantalla"
 choose_window = "Elegir una ventana"
 display = "Pantalla"
 heading = "Elige una fuente de captura"
+mobile_device = "iPhone/iPad"
 no_displays = "No se encontraron pantallas"
 no_matching_displays = "No hay pantallas que coincidan"
 no_matching_windows = "No hay ventanas que coincidan"
@@ -1482,6 +1484,10 @@ camera_allow = "Permitir acceso a la cámara…"
 camera_turn_on = "Activar el acceso a la cámara en Ajustes…"
 microphone_allow = "Permitir acceso al micrófono…"
 microphone_turn_on = "Activar el acceso al micrófono en Ajustes…"
+
+[overlay.mobile_device]
+connect = "Conecta un iPhone o iPad con un cable, desbloquéalo y toca «Confiar». Puede tardar unos segundos en aparecer."
+description = "Graba la pantalla de un iPhone o iPad conectado con un cable"
 
 [overlay.start]
 instant = "Modo Instant: graba un enlace para compartir"

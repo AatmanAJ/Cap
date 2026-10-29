@@ -1001,6 +1001,7 @@ impl ActorBuilder {
                 capture_system_audio: self.system_audio,
                 mic_feed: self.mic_feed,
                 camera_feed: self.camera_feed,
+                mobile_device_feed: None,
                 start_gate: self.start_gate,
                 #[cfg(target_os = "macos")]
                 shareable_content,
@@ -1220,6 +1221,13 @@ async fn build_instant_recording_actor(
     {
         return Err(LinuxCameraPresentationError::UnsupportedTarget.into());
     }
+    anyhow::ensure!(
+        !matches!(
+            inputs.capture_target,
+            ScreenCaptureTarget::MobileDevice { .. }
+        ),
+        "iPhone and iPad recordings use Studio mode. Switch to Studio and start again."
+    );
     ensure_dir(&recording_dir)?;
 
     let timestamps = Timestamps::now();

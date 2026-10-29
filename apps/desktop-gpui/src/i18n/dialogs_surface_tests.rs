@@ -433,6 +433,14 @@ fn dialog_surfaces_match_the_literals_they_replaced() {
             tr::overlay::camera_only::select_camera(),
             "Please select a camera",
         ),
+        (
+            tr::overlay::mobile_device::connect(),
+            "Connect an iPhone or iPad with a cable, unlock it and tap Trust. It can take a few seconds to appear.",
+        ),
+        (
+            tr::overlay::mobile_device::description(),
+            "Record the screen of an iPhone or iPad connected with a cable",
+        ),
         (tr::overlay::device::camera_allow(), "Allow camera access…"),
         (
             tr::overlay::device::camera_turn_on(),

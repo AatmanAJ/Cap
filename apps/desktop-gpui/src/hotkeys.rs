@@ -1022,15 +1022,16 @@ fn start_from_hotkey(mode: Mode, cx: &mut App) {
 /// only a candidate that still exists. The stored target can be whatever was
 /// recorded last, possibly by the Tauri app long ago, and a closed window or
 /// unplugged display used to fail the start with "target_display_crop:
-/// Display not found". A stored camera-only target is skipped: without a
-/// camera selected it cannot start, so only an explicit choice records it.
+/// Display not found". A stored camera-only or iPhone/iPad target is skipped:
+/// it needs a camera or a connected device, so only an explicit choice
+/// records it.
 fn pick_hotkey_target(
     armed: Option<ScreenCaptureTarget>,
     stored: Option<ScreenCaptureTarget>,
     is_live: impl Fn(&ScreenCaptureTarget) -> bool,
     fallback_display: impl FnOnce() -> scap_targets::DisplayId,
 ) -> ScreenCaptureTarget {
-    let stored = stored.filter(|target| !matches!(target, ScreenCaptureTarget::CameraOnly));
+    let stored = stored.filter(|target| !target.is_feed_backed());
     [armed, stored]
         .into_iter()
         .flatten()
@@ -1050,6 +1051,9 @@ fn target_is_live(target: &ScreenCaptureTarget) -> bool {
             scap_targets::Display::from_id(screen).is_some()
         }
         ScreenCaptureTarget::CameraOnly => true,
+        ScreenCaptureTarget::MobileDevice { id } => cap_camera::list_screen_devices()
+            .iter()
+            .any(|device| device.camera.device_id() == id),
     }
 }
 
@@ -1259,6 +1263,17 @@ mod tests {
             || display_id("3"),
         );
         assert!(matches!(picked, ScreenCaptureTarget::CameraOnly));
+    }
+
+    #[test]
+    fn a_stored_device_target_never_starts_a_shortcut_recording() {
+        let device = || ScreenCaptureTarget::MobileDevice {
+            id: "00008110-000A1C2E3F40001E".into(),
+        };
+        let picked = pick_hotkey_target(None, Some(device()), |_| true, || display_id("3"));
+        assert!(same(&picked, &display("3")));
+        let picked = pick_hotkey_target(Some(device()), None, |_| true, || display_id("3"));
+        assert!(matches!(picked, ScreenCaptureTarget::MobileDevice { .. }));
     }
 
     /// What the main window writes on every start is what the shortcut reads

@@ -564,7 +564,7 @@ pub fn target_to_display_and_crop(
                 )
             }
         }
-        ScreenCaptureTarget::CameraOnly => {
+        ScreenCaptureTarget::CameraOnly | ScreenCaptureTarget::MobileDevice { .. } => {
             return Err(anyhow!("Camera-only target has no display"));
         }
     };
@@ -593,7 +593,9 @@ pub fn resolve_display_notch(target: &ScreenCaptureTarget) -> Option<cap_project
             let display_size = display.logical_size()?;
             resolve_area_display_notch(notch, display_size, *bounds)
         }
-        ScreenCaptureTarget::Window { .. } | ScreenCaptureTarget::CameraOnly => None,
+        ScreenCaptureTarget::Window { .. }
+        | ScreenCaptureTarget::CameraOnly
+        | ScreenCaptureTarget::MobileDevice { .. } => None,
     }
 }
 

@@ -74,6 +74,12 @@ pub enum ScreenCaptureTarget {
         bounds: LogicalBounds,
     },
     CameraOnly,
+    /// The screen of an iPhone or iPad connected over USB, captured through
+    /// AVFoundation like a camera (macOS only). `id` is the device's
+    /// `AVCaptureDevice.uniqueID`.
+    MobileDevice {
+        id: String,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -90,7 +96,9 @@ impl LinuxCaptureSource {
         match target {
             ScreenCaptureTarget::Window { id } => Self::Window { id: id.clone() },
             ScreenCaptureTarget::Area { .. } => Self::Area,
-            ScreenCaptureTarget::Display { .. } | ScreenCaptureTarget::CameraOnly => Self::Display,
+            ScreenCaptureTarget::Display { .. }
+            | ScreenCaptureTarget::CameraOnly
+            | ScreenCaptureTarget::MobileDevice { .. } => Self::Display,
         }
     }
 }
@@ -101,7 +109,20 @@ impl ScreenCaptureTarget {
             Self::Display { id } => Display::from_id(id),
             Self::Window { id } => Window::from_id(id).and_then(|w| w.display()),
             Self::Area { screen, .. } => Display::from_id(screen),
-            Self::CameraOnly => None,
+            Self::CameraOnly | Self::MobileDevice { .. } => None,
+        }
+    }
+
+    /// Whether the screen track comes from a camera-style feed instead of
+    /// screen capture: no display, no cursor, no system audio tap.
+    pub fn is_feed_backed(&self) -> bool {
+        matches!(self, Self::CameraOnly | Self::MobileDevice { .. })
+    }
+
+    pub fn mobile_device_id(&self) -> Option<&str> {
+        match self {
+            Self::MobileDevice { id } => Some(id),
+            _ => None,
         }
     }
 
@@ -233,7 +254,7 @@ impl ScreenCaptureTarget {
                     return Some(CursorCropBounds::new_linux(bounds));
                 }
             }
-            Self::CameraOnly => None,
+            Self::CameraOnly | Self::MobileDevice { .. } => None,
         }
     }
 
@@ -267,7 +288,7 @@ impl ScreenCaptureTarget {
                     )
                 }
             }
-            Self::CameraOnly => None,
+            Self::CameraOnly | Self::MobileDevice { .. } => None,
         }
     }
 
@@ -277,6 +298,13 @@ impl ScreenCaptureTarget {
             Self::Window { id } => Window::from_id(id).and_then(|w| w.name()),
             Self::Area { screen, .. } => Display::from_id(screen).and_then(|d| d.name()),
             Self::CameraOnly => Some("Camera".to_string()),
+            Self::MobileDevice { id } => Some(
+                cap_camera::list_screen_devices()
+                    .into_iter()
+                    .find(|device| device.camera.device_id() == id)
+                    .map(|device| device.camera.display_name().to_string())
+                    .unwrap_or_else(|| "iPhone".to_string()),
+            ),
         }
     }
 
@@ -286,6 +314,7 @@ impl ScreenCaptureTarget {
             ScreenCaptureTarget::Window { .. } => "Window",
             ScreenCaptureTarget::Area { .. } => "Area",
             ScreenCaptureTarget::CameraOnly => "Camera",
+            ScreenCaptureTarget::MobileDevice { .. } => "Device",
         }
     }
 }

@@ -46,6 +46,78 @@ pub fn list_cameras() -> impl Iterator<Item = CameraInfo> {
     list_cameras_impl()
 }
 
+/// What kind of Apple device a USB screen-capture device is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum ScreenDeviceKind {
+    IPhone,
+    IPad,
+}
+
+impl ScreenDeviceKind {
+    /// AVFoundation reports every iOS screen device with the same model ID, so
+    /// tell them apart by the user's device name, then by screen shape: every
+    /// iPhone screen is at least 16:9, every iPad screen at most about 1.45:1.
+    pub fn classify(name: &str, screen_size: Option<(u32, u32)>) -> Self {
+        let lower = name.to_lowercase();
+        if lower.contains("ipad") {
+            return Self::IPad;
+        }
+        if lower.contains("iphone") {
+            return Self::IPhone;
+        }
+        match screen_size {
+            Some((w, h)) if w > 0 && h > 0 => {
+                let ratio = f64::from(w.max(h)) / f64::from(w.min(h));
+                if ratio < 1.6 {
+                    Self::IPad
+                } else {
+                    Self::IPhone
+                }
+            }
+            _ => Self::IPhone,
+        }
+    }
+}
+
+/// An iPhone or iPad connected over USB whose screen can be captured like a
+/// camera. Only ever non-empty on macOS.
+#[derive(Debug, Clone)]
+pub struct ScreenDeviceInfo {
+    pub camera: CameraInfo,
+    pub kind: ScreenDeviceKind,
+    /// Largest format the device offers, i.e. its screen in pixels.
+    pub screen_size: Option<(u32, u32)>,
+}
+
+/// Connected iPhone/iPad screens. On macOS the first call opts the process
+/// into CoreMediaIO screen-capture devices; devices then take a second or
+/// three to appear, so poll this rather than calling it once.
+pub fn list_screen_devices() -> Vec<ScreenDeviceInfo> {
+    #[cfg(target_os = "macos")]
+    {
+        list_screen_devices_impl()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// The format to capture a device screen with: the full screen at the
+/// highest rate up to 60fps.
+pub fn preferred_screen_format<F: Deref<Target = FormatInfo>>(formats: &[F]) -> Option<&F> {
+    formats.iter().max_by(|a, b| {
+        let area = |f: &F| u64::from(f.width()) * u64::from(f.height());
+        let rate = |f: &F| f.frame_rate().min(60.0);
+        area(a)
+            .cmp(&area(b))
+            .then(rate(a).total_cmp(&rate(b)))
+            .then(b.frame_rate().total_cmp(&a.frame_rate()))
+    })
+}
+
 #[cfg(windows)]
 pub type NativeFormat = cap_camera_windows::VideoFormatInner;
 
@@ -349,5 +421,84 @@ mod model_id_tests {
             let input = StrDeserializer::<serde::de::value::Error>::new(value);
             assert!(ModelID::deserialize(input).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod screen_device_tests {
+    use super::{FormatInfo, ScreenDeviceKind, preferred_screen_format};
+
+    fn format(width: u32, height: u32, frame_rate: f32) -> FormatInfo {
+        FormatInfo {
+            width,
+            height,
+            frame_rate,
+        }
+    }
+
+    #[test]
+    fn screen_format_is_the_full_screen_at_up_to_60fps() {
+        let formats = [
+            format(886, 1920, 60.0),
+            format(1179, 2556, 30.0),
+            format(1179, 2556, 120.0),
+            format(1179, 2556, 60.0),
+            format(590, 1278, 60.0),
+        ];
+        let refs = formats.iter().collect::<Vec<_>>();
+        let best = preferred_screen_format(&refs).unwrap();
+        assert_eq!(
+            (best.width(), best.height(), best.frame_rate()),
+            (1179, 2556, 60.0)
+        );
+        assert!(preferred_screen_format::<&FormatInfo>(&[]).is_none());
+    }
+
+    #[test]
+    fn names_decide_when_they_say_which_device_it_is() {
+        assert_eq!(
+            ScreenDeviceKind::classify("AJ's iPad Pro", Some((1179, 2556))),
+            ScreenDeviceKind::IPad
+        );
+        assert_eq!(
+            ScreenDeviceKind::classify("IPHONE 15", Some((1668, 2420))),
+            ScreenDeviceKind::IPhone
+        );
+    }
+
+    #[test]
+    fn screen_shape_decides_for_renamed_devices() {
+        for size in [(1179, 2556), (2556, 1179), (750, 1334), (1080, 1920)] {
+            assert_eq!(
+                ScreenDeviceKind::classify("Work phone", Some(size)),
+                ScreenDeviceKind::IPhone,
+                "{size:?}"
+            );
+        }
+        for size in [
+            (1668, 2420),
+            (2420, 1668),
+            (1536, 2048),
+            (1640, 2360),
+            (2064, 2752),
+        ] {
+            assert_eq!(
+                ScreenDeviceKind::classify("Kitchen", Some(size)),
+                ScreenDeviceKind::IPad,
+                "{size:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_shape_defaults_to_iphone() {
+        assert_eq!(
+            ScreenDeviceKind::classify("Device", None),
+            ScreenDeviceKind::IPhone
+        );
+        assert_eq!(
+            ScreenDeviceKind::classify("Device", Some((0, 0))),
+            ScreenDeviceKind::IPhone
+        );
     }
 }
