@@ -108,18 +108,27 @@ fn build_cues<'a>(
         if let Some(end) = output_end_ms {
             cue.end_ms = cue.end_ms.min(end);
         }
+        if cue.end_ms <= cue.start_ms {
+            continue;
+        }
         if let Some(previous) = resolved.last_mut()
             && previous.end_ms > cue.start_ms
         {
             if cue.start_ms > previous.start_ms {
                 previous.end_ms = cue.start_ms;
-            } else {
+            } else if cue.end_ms > previous.end_ms {
                 cue.start_ms = previous.end_ms;
+            } else if previous.end_ms - previous.start_ms >= 2 {
+                cue.end_ms = previous.end_ms;
+                cue.start_ms = previous.start_ms + (previous.end_ms - previous.start_ms) / 2;
+                previous.end_ms = cue.start_ms;
+            } else {
+                let text = format!("{} {}", previous.lines.join(" "), cue.lines.join(" "));
+                previous.lines = wrap_lines(&text).unwrap_or_else(|| vec![text]);
+                continue;
             }
         }
-        if cue.end_ms > cue.start_ms {
-            resolved.push(cue);
-        }
+        resolved.push(cue);
     }
     resolved
 }
@@ -667,6 +676,133 @@ mod tests {
             caption_export_cues(&project, &[10.0]),
             vec![cue(3000, 3500, "outgoing"), cue(3500, 4000, "incoming")]
         );
+    }
+
+    fn crossfade_project(captions: Value) -> ProjectConfiguration {
+        let mut project = project(json!([clip(0.0, 4.0), clip(6.0, 10.0)]), captions);
+        project.timeline.as_mut().unwrap().transitions = serde_json::from_value(json!([
+            { "segmentIndex": 1, "type": "cross-fade", "duration": 1.0 }
+        ]))
+        .unwrap();
+        project
+    }
+
+    fn exported_text(cues: &[CaptionCue]) -> String {
+        cues.iter()
+            .flat_map(|cue| cue.lines.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn coincident_cues_with_equal_ends_share_the_interval() {
+        let project = crossfade_project(json!([
+            caption("a", &[("outgoing", 3.0, 3.5)]),
+            caption("b", &[("incoming", 6.0, 6.5)]),
+        ]));
+        let cues = caption_export_cues(&project, &[10.0]);
+        assert_eq!(
+            cues,
+            vec![cue(3000, 3250, "outgoing"), cue(3250, 3500, "incoming")]
+        );
+        assert_valid_srt(&format_caption_cues(&cues, CaptionExportFormat::Srt));
+    }
+
+    #[test]
+    fn coincident_cues_clamped_to_the_same_end_keep_both_texts() {
+        let mut project = project(json!([clip(0.0, 10.0)]), json!([]));
+        project.captions.as_mut().unwrap().source_timed = false;
+        project.timeline.as_mut().unwrap().caption_segments = serde_json::from_value(json!([
+            { "id": "a", "start": 9.0, "end": 11.0, "text": "first" },
+            { "id": "b", "start": 9.0, "end": 12.0, "text": "second" },
+        ]))
+        .unwrap();
+        assert_eq!(
+            caption_export_cues(&project, &[10.0]),
+            vec![cue(9000, 9500, "first"), cue(9500, 10000, "second")]
+        );
+    }
+
+    #[test]
+    fn cue_overlapping_a_serialized_cue_keeps_its_text() {
+        let project = crossfade_project(json!([
+            caption("a", &[("outgoing", 3.0, 3.5)]),
+            caption("b", &[("incoming", 6.0, 7.0)]),
+            caption("c", &[("late", 3.2, 3.4)]),
+        ]));
+        let cues = caption_export_cues(&project, &[10.0]);
+        assert_eq!(
+            cues,
+            vec![
+                cue(3000, 3500, "outgoing"),
+                cue(3500, 3750, "incoming"),
+                cue(3750, 4000, "late"),
+            ]
+        );
+        assert_valid_srt(&format_caption_cues(&cues, CaptionExportFormat::Srt));
+    }
+
+    #[test]
+    fn coincident_cues_too_short_to_divide_are_merged() {
+        let project = crossfade_project(json!([
+            caption("a", &[("outgoing", 3.0, 3.001)]),
+            caption("b", &[("incoming", 6.0, 6.001)]),
+        ]));
+        assert_eq!(
+            caption_export_cues(&project, &[10.0]),
+            vec![cue(3000, 3001, "outgoing incoming")]
+        );
+    }
+
+    #[test]
+    fn overlapping_cues_never_lose_text() {
+        let words = ["one", "two", "three", "four", "five", "six"];
+        let offsets = [0.0_f32, 0.001, 0.2, 0.4];
+        let lengths = [0.001_f32, 0.3, 0.5, 1.0];
+        let mut cases = 0;
+        for outgoing_offset in offsets {
+            for outgoing_length in lengths {
+                for incoming_offset in offsets {
+                    for incoming_length in lengths {
+                        let captions: Vec<Value> = words
+                            .chunks(2)
+                            .enumerate()
+                            .flat_map(|(index, pair)| {
+                                let outgoing = 3.0 + outgoing_offset * index as f32;
+                                let incoming = 6.0 + incoming_offset * index as f32;
+                                [
+                                    caption(
+                                        &format!("out{index}"),
+                                        &[(pair[0], outgoing, outgoing + outgoing_length)],
+                                    ),
+                                    caption(
+                                        &format!("in{index}"),
+                                        &[(pair[1], incoming, incoming + incoming_length)],
+                                    ),
+                                ]
+                            })
+                            .collect();
+                        let project = crossfade_project(Value::Array(captions));
+                        let cues = caption_export_cues(&project, &[10.0]);
+                        let mut exported: Vec<String> = exported_text(&cues)
+                            .split(' ')
+                            .map(str::to_string)
+                            .collect();
+                        exported.sort();
+                        let mut expected: Vec<String> =
+                            words.iter().map(|word| word.to_string()).collect();
+                        expected.sort();
+                        assert_eq!(
+                            exported, expected,
+                            "{outgoing_offset} {outgoing_length} {incoming_offset} {incoming_length}"
+                        );
+                        assert_valid_srt(&format_caption_cues(&cues, CaptionExportFormat::Srt));
+                        cases += 1;
+                    }
+                }
+            }
+        }
+        assert_eq!(cases, 256);
     }
 
     #[test]
