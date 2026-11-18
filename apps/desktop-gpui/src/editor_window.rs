@@ -2976,7 +2976,7 @@ impl EditorWindow {
     /// (`editor_instance.rs:476-482`), and the frontend's equivalent of this
     /// is `setEditorState("playbackTime", payload.playhead_position / FPS)`
     /// (`Editor.tsx:482-486`).
-    pub fn playhead_changed(&mut self, frame: u32, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn playhead_changed(&mut self, frame: u32, _window: &mut Window, cx: &mut Context<Self>) {
         let next = frame as f64 / EDITOR_PREVIEW_FPS as f64;
         if (next - self.playhead).abs() < f64::EPSILON {
             return;
@@ -3012,7 +3012,7 @@ impl EditorWindow {
         }
 
         self.last_playhead_redraw = Instant::now();
-        self.invalidate_playback_chrome(window, cx);
+        self.invalidate_playhead(cx);
     }
 
     /// The pause half of `handlePlayPauseClick`, also used by the end-of-media
@@ -3243,7 +3243,7 @@ impl EditorWindow {
         self.playhead = time;
         self.view.playhead = time;
         self.view.playing = self.playing;
-        cx.notify();
+        self.invalidate_playhead(cx);
     }
 
     /// The prev button (`Player.tsx:370-381`): stop, playhead to 0, and the
@@ -3289,6 +3289,22 @@ impl EditorWindow {
             + timeline::content_width(viewport_width) * fraction.clamp(0.0, 1.0) as f32;
         let time = self.time_at(x, viewport_width);
         self.seek_to_time(time, cx);
+    }
+
+    pub(crate) fn hover_fraction(
+        &mut self,
+        fraction: f64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let viewport_width: f32 = window.viewport_size().width.into();
+        let x = timeline::content_left()
+            + timeline::content_width(viewport_width) * fraction.min(1.0) as f32;
+        self.timeline_hover(x, window, cx);
+    }
+
+    pub(crate) fn benchmark_ready(&self) -> bool {
+        self.visual_ready() && self.transport.is_some()
     }
 
     /// Harness only (`CAP_GPUI_AUTO_PLAYBACK`): stop and emit the run's
@@ -3741,19 +3757,26 @@ impl EditorWindow {
         cx.notify();
     }
 
-    fn invalidate_playback_chrome(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+    // Notifying the editor entity itself would rebuild every cached section,
+    // because each one observes it. Notifying the timeline alone still
+    // re-renders the editor's own root (gpui marks a dirty view's ancestors
+    // dirty), which is where the canvas overlay and clip popovers read the
+    // playhead and preview time. Only the 3D panel's pose strip reads the
+    // playhead from inside a cached section.
+    fn invalidate_playback_chrome(&mut self, cx: &mut Context<Self>) {
         self.timeline_view.update(cx, |_, cx| cx.notify());
         self.transport_controls.update(cx, |_, cx| cx.notify());
-        // While playing, nothing else the parent renders reads the playhead:
-        // the canvas overlay is hidden (`canvas_overlay_visible`) and the
-        // scene-mode pane gates on it too. Notifying the parent here would
-        // rebuild every cached section -- header, toolbar, sidebar included --
-        // at the 60Hz playhead rate, which is the same class of rebuild that
-        // measured 40ms/frame on the text-panel sidebar. Paused paths (hover,
-        // seeks) keep the full invalidation: the overlay's element boxes
-        // appear and disappear as the playhead crosses segments.
-        if !self.playing {
-            cx.notify();
+    }
+
+    fn invalidate_playhead(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_playback_chrome(cx);
+        if !self.playing
+            && self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| selection.track == TrackKind::ThreeD)
+        {
+            self.sidebar_view.update(cx, |_, cx| cx.notify());
         }
     }
 
@@ -3788,17 +3811,17 @@ impl EditorWindow {
         if next != self.view.preview_time {
             self.view.preview_time = next;
             self.emit_preview_frame();
-            self.invalidate_playback_chrome(window, cx);
+            self.invalidate_playback_chrome(cx);
         }
     }
 
-    fn timeline_hover_leave(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn timeline_hover_leave(&mut self, cx: &mut Context<Self>) {
         if self.playing || self.view.preview_time.is_none() {
             return;
         }
         self.view.preview_time = None;
         self.emit_preview_frame();
-        self.invalidate_playback_chrome(window, cx);
+        self.invalidate_playback_chrome(cx);
     }
 
     fn set_hovered_track(
@@ -3812,7 +3835,7 @@ impl EditorWindow {
             if track != Some(TrackKind::Scene) {
                 self.scene_preview_time = None;
             }
-            cx.notify();
+            self.timeline_view.update(cx, |_, cx| cx.notify());
         }
     }
 
@@ -5885,7 +5908,7 @@ impl EditorWindow {
             changed = true;
         }
         if changed {
-            cx.notify();
+            self.timeline_view.update(cx, |_, cx| cx.notify());
         }
     }
 
@@ -10284,9 +10307,9 @@ impl EditorWindow {
                     .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, window, cx| {
                         this.timeline_hover(f32::from(event.position.x), window, cx);
                     }))
-                    .on_hover(cx.listener(|this, hovered: &bool, window, cx| {
+                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
                         if !*hovered {
-                            this.timeline_hover_leave(window, cx);
+                            this.timeline_hover_leave(cx);
                         }
                     }))
                     // `onWheel` (`:1189-1207`) and the pinch the webview
@@ -10317,9 +10340,9 @@ impl EditorWindow {
                         |bar| {
                             bar.cursor_pointer()
                                 .capture_any_mouse_down(cx.listener(Self::minimap_mouse_down))
-                                .on_mouse_move(cx.listener(|this, _, window, cx| {
+                                .on_mouse_move(cx.listener(|this, _, _window, cx| {
                                     if this.minimap_drag.is_none() {
-                                        this.timeline_hover_leave(window, cx);
+                                        this.timeline_hover_leave(cx);
                                         cx.stop_propagation();
                                     }
                                 }))

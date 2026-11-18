@@ -20,6 +20,7 @@ mod dev_restore;
 mod devices;
 mod diagnostics;
 mod editor_audio;
+mod editor_benchmark;
 mod editor_canvas;
 mod editor_clips;
 mod editor_color;
