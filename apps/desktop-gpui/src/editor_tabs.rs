@@ -23,9 +23,9 @@ use std::{
 use cap_project::CaptionsData;
 use cap_project::{
     BackgroundBlurConfig, BackgroundBlurMode, CameraShape, CameraXPosition, CameraYPosition,
-    CaptionSegment, CaptionSettings, CornerStyle, CursorAnimationStyle, CursorRippleConfig,
-    KeyboardData, KeyboardSettings, ProjectConfiguration, RecordingMeta, ShadowConfiguration,
-    StereoMode,
+    CaptionExportFormat, CaptionSegment, CaptionSettings, CornerStyle, CursorAnimationStyle,
+    CursorRippleConfig, KeyboardData, KeyboardSettings, ProjectConfiguration, RecordingMeta,
+    ShadowConfiguration, StereoMode, caption_export_file_name,
 };
 use gpui::{
     AnyElement, Bounds, Context, EntityId, FontWeight, Hsla, InteractiveElement, IntoElement,
@@ -38,7 +38,7 @@ use crate::{
     editor_color::GradeTarget,
     editor_sidebar::{SliderKey, collapsible, dashed_divider},
     editor_window::EditorWindow,
-    store,
+    platform, store,
     theme::Theme,
     transcription, ui,
 };
@@ -2706,7 +2706,65 @@ impl EditorWindow {
                     ),
                 )),
             )
-            .child(div().pt(px(8.)).child(action));
+            .child(div().pt(px(8.)).child(action))
+            .children(has_captions.then(|| {
+                let export_button = |format: CaptionExportFormat| {
+                    ui::Button::plain(
+                        &theme,
+                        match format {
+                            CaptionExportFormat::Srt => "caption-export-srt",
+                            CaptionExportFormat::Vtt => "caption-export-vtt",
+                        },
+                        ui::ButtonVariant::Gray,
+                        ui::ButtonSize::Sm,
+                    )
+                    .icon("icons/download.svg")
+                    .label(format!("Export {}", format.label()))
+                    .disabled(generating)
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.export_captions_clicked(format, window, cx);
+                    }))
+                };
+                let status = snapshot.caption_export.clone().map(|result| match result {
+                    Ok(outcome) => div()
+                        .text_size(px(12.))
+                        .text_color(Hsla::from(theme.gray_10))
+                        .truncate()
+                        .child(format!(
+                            "Saved {} cues to {}",
+                            outcome.cues,
+                            outcome.path.file_name().map_or_else(
+                                || outcome.path.display().to_string(),
+                                |name| name.to_string_lossy().into_owned()
+                            )
+                        )),
+                    Err(error) => div()
+                        .text_size(px(12.))
+                        .text_color(error_color)
+                        .child(error),
+                });
+                ui::Subfield::plain(&theme, "Export Transcript").child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap(px(8.))
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(Hsla::from(theme.gray_10))
+                                .child("Subtitle files follow your cuts and speed changes."),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap(px(8.))
+                                .child(export_button(CaptionExportFormat::Srt))
+                                .child(export_button(CaptionExportFormat::Vtt)),
+                        )
+                        .children(status),
+                )
+            }));
 
         let style = div()
             .flex()
@@ -3224,6 +3282,64 @@ impl EditorWindow {
                     let _ = this.update(cx, |_, cx| cx.notify());
                 }
             }
+        })
+        .detach();
+    }
+
+    fn export_captions_clicked(
+        &mut self,
+        format: CaptionExportFormat,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(summary) = self.summary() else {
+            return;
+        };
+        let recording_durations = summary.clip_display_durations.clone();
+        let default_name = caption_export_file_name(&summary.pretty_name, format);
+        let project = self.project.clone();
+        let project_path = self.project_path.clone();
+
+        cx.spawn_in(window, async move |this, cx| {
+            let extension = format.extension();
+            let chosen: Result<Option<std::path::PathBuf>, String> =
+                match std::env::var_os("CAP_GPUI_AUTO_CAPTION_EXPORT_DIR") {
+                    Some(dir) => Ok(Some(std::path::PathBuf::from(dir).join(&default_name))),
+                    None => {
+                        #[cfg(target_os = "macos")]
+                        {
+                            platform::try_save_file_panel(&default_name, &[extension])
+                        }
+                        #[cfg(not(target_os = "macos"))]
+                        {
+                            Ok(
+                                platform::save_file_panel_async(&default_name, &[extension], cx)
+                                    .await,
+                            )
+                        }
+                    }
+                };
+            let result = match chosen {
+                Ok(None) => return,
+                Ok(Some(path)) => {
+                    cx.background_executor()
+                        .spawn(async move {
+                            transcription::export_caption_file(
+                                &project,
+                                &recording_durations,
+                                format,
+                                &path,
+                            )
+                        })
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            if let Err(error) = &result {
+                tracing::error!("caption export failed: {error}");
+            }
+            transcription::finish_caption_export(&project_path, result);
+            let _ = this.update(cx, |_, cx| cx.notify());
         })
         .detach();
     }

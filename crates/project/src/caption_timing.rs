@@ -46,7 +46,7 @@ fn caption_char_attaches_to_previous(value: char) -> bool {
     )
 }
 
-fn caption_token_attaches_to_previous(text: &str) -> bool {
+pub(crate) fn caption_token_attaches_to_previous(text: &str) -> bool {
     text.trim()
         .chars()
         .next()
@@ -87,7 +87,7 @@ fn mapped_caption_segment_id(base_id: &str, index: usize, total: usize) -> Strin
     }
 }
 
-fn clamp_caption_segment_words(segment: &CaptionSegment) -> CaptionSegment {
+pub(crate) fn clamp_caption_segment_words(segment: &CaptionSegment) -> CaptionSegment {
     if segment.words.is_empty() {
         return segment.clone();
     }

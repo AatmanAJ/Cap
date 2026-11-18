@@ -36,9 +36,9 @@ use std::{
 
 use cap_editor::{TranscriptionAudioSource, TranscriptionAudioTake, append_transcription_audio};
 use cap_project::{
-    CaptionSegment, CaptionSettings, CaptionTrackSegment, CaptionWord, CaptionsData,
-    ProjectConfiguration, RecordingMeta, StudioRecordingMeta, TimelineConfiguration,
-    TimelineSegment,
+    CaptionExportFormat, CaptionSegment, CaptionSettings, CaptionTrackSegment, CaptionWord,
+    CaptionsData, ProjectConfiguration, RecordingMeta, StudioRecordingMeta, TimelineConfiguration,
+    TimelineSegment, caption_export_cues, format_caption_cues,
 };
 use cap_rendering::Video;
 use ffmpeg::{
@@ -155,6 +155,7 @@ struct Hub {
     deleting: Option<String>,
     generating: HashSet<PathBuf>,
     generation_errors: HashMap<PathBuf, String>,
+    caption_exports: HashMap<PathBuf, Result<CaptionExportOutcome, String>>,
 }
 
 impl Hub {
@@ -180,6 +181,7 @@ pub struct CaptionsUiSnapshot {
     pub deleting: Option<String>,
     pub generating: bool,
     pub generation_error: Option<String>,
+    pub caption_export: Option<Result<CaptionExportOutcome, String>>,
 }
 
 pub fn ui_snapshot(project_path: &Path) -> CaptionsUiSnapshot {
@@ -190,6 +192,7 @@ pub fn ui_snapshot(project_path: &Path) -> CaptionsUiSnapshot {
         deleting: hub.deleting.clone(),
         generating: hub.generating.contains(project_path),
         generation_error: hub.generation_errors.get(project_path).cloned(),
+        caption_export: hub.caption_exports.get(project_path).cloned(),
     }
 }
 
@@ -344,6 +347,36 @@ pub fn finish_generation(project_path: &Path, error: Option<String>) {
             hub.generation_errors.remove(project_path);
         }
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct CaptionExportOutcome {
+    pub path: PathBuf,
+    pub cues: usize,
+}
+
+pub fn export_caption_file(
+    project: &ProjectConfiguration,
+    recording_durations: &[f64],
+    format: CaptionExportFormat,
+    path: &Path,
+) -> Result<CaptionExportOutcome, String> {
+    let cues = caption_export_cues(project, recording_durations);
+    if cues.is_empty() {
+        return Err("There are no captions left in the edited video to export.".to_string());
+    }
+    std::fs::write(path, format_caption_cues(&cues, format))
+        .map_err(|error| format!("Failed to save {}: {error}", path.display()))?;
+    Ok(CaptionExportOutcome {
+        path: path.to_path_buf(),
+        cues: cues.len(),
+    })
+}
+
+pub fn finish_caption_export(project_path: &Path, result: Result<CaptionExportOutcome, String>) {
+    hub()
+        .caption_exports
+        .insert(project_path.to_path_buf(), result);
 }
 
 // ---------------------------------------------------------------------------
@@ -2400,6 +2433,48 @@ mod tests {
     }
 
     // -- applyCaptionResultToProject ------------------------------------------
+
+    #[test]
+    fn caption_export_writes_the_edited_timeline_and_refuses_empty_files() {
+        let mut project: ProjectConfiguration = serde_json::from_value(serde_json::json!({
+            "timeline": {
+                "segments": [
+                    { "recordingSegment": 0, "timescale": 1.0, "start": 0.0, "end": 2.0 },
+                    { "recordingSegment": 0, "timescale": 1.0, "start": 4.0, "end": 6.0 }
+                ],
+                "zoomSegments": []
+            }
+        }))
+        .unwrap();
+        apply_caption_result(
+            &mut project,
+            vec![
+                caption("kept", 1.0, 1.5, &[("kept", 1.0, 1.5)]),
+                caption("cut", 2.5, 3.0, &[("cut", 2.5, 3.0)]),
+                caption("moved", 4.5, 5.0, &[("moved", 4.5, 5.0)]),
+            ],
+            &[6.0],
+            6.0,
+        );
+
+        let directory =
+            std::env::temp_dir().join(format!("cap-caption-export-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("captions.srt");
+        let outcome =
+            export_caption_file(&project, &[6.0], CaptionExportFormat::Srt, &path).unwrap();
+        assert_eq!(outcome.cues, 2);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "1\n00:00:01,000 --> 00:00:01,500\nkept\n\n2\n00:00:02,500 --> 00:00:03,000\nmoved\n"
+        );
+
+        project.captions.as_mut().unwrap().segments.clear();
+        let empty = directory.join("empty.vtt");
+        assert!(export_caption_file(&project, &[6.0], CaptionExportFormat::Vtt, &empty).is_err());
+        assert!(!empty.exists());
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 
     #[test]
     fn apply_caption_result_enables_captions_and_derives_the_track() {

@@ -1,4 +1,5 @@
 mod animated_gradient;
+mod caption_export;
 mod caption_timing;
 mod configuration;
 pub mod cursor;
@@ -6,6 +7,10 @@ pub mod keyboard;
 mod meta;
 
 pub use animated_gradient::*;
+pub use caption_export::{
+    CaptionCue, CaptionExportFormat, caption_export_cues, caption_export_file_name,
+    format_caption_cues,
+};
 pub use caption_timing::{derive_caption_track_segments, source_caption_id, synchronize_captions};
 pub use configuration::*;
 pub use cursor::*;
