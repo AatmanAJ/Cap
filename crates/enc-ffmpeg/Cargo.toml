@@ -3,6 +3,10 @@ name = "cap-enc-ffmpeg"
 version = "0.1.0"
 edition = "2024"
 
+[[example]]
+name = "rgb-encode-benchmark"
+test = true
+
 [dependencies]
 cap-media-info = { path = "../media-info" }
 
