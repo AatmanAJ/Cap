@@ -170,6 +170,13 @@ fn swscale_converter(width: u32, height: u32) -> scaling::Context {
     context
 }
 
+fn shared(frame: &frame::Video) -> frame::Video {
+    let mut reference = frame::Video::empty();
+    let result = unsafe { ffmpeg::ffi::av_frame_ref(reference.as_mut_ptr(), frame.as_ptr()) };
+    assert!(result >= 0, "frame reference failed");
+    reference
+}
+
 struct Stats {
     mean: f64,
     p50: f64,
@@ -280,7 +287,7 @@ impl Encoder {
         let frame = match &mut self.swscale {
             Some((context, converted)) => {
                 context.run(&frame, converted).expect("swscale run");
-                converted.clone()
+                shared(converted)
             }
             None => frame,
         };
@@ -439,7 +446,7 @@ fn consume(
                 let frame = match &mut swscale {
                     Some((context, converted)) => {
                         context.run(&frame, converted).expect("swscale run");
-                        converted.clone()
+                        shared(converted)
                     }
                     None => frame,
                 };
@@ -538,4 +545,77 @@ fn simd_label() -> bool {
 #[cfg(not(target_arch = "x86_64"))]
 fn simd_label() -> bool {
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn swscale_baseline_submits_the_reused_frame_without_copying() {
+        ffmpeg::init().expect("ffmpeg init");
+        let (width, height) = (64, 36);
+        let source = screen_frames(width, height).remove(0);
+        let mut converted = frame::Video::new(Pixel::YUV420P, width, height);
+        swscale_converter(width, height)
+            .run(&source, &mut converted)
+            .expect("swscale run");
+        let planes: Vec<Vec<u8>> = (0..3).map(|plane| converted.data(plane).to_vec()).collect();
+
+        let mut submitted = shared(&converted);
+        assert_eq!(submitted.format(), Pixel::YUV420P);
+        assert_eq!((submitted.width(), submitted.height()), (width, height));
+        for plane in 0..3 {
+            assert_eq!(
+                submitted.data(plane).as_ptr(),
+                converted.data(plane).as_ptr()
+            );
+        }
+        submitted.set_pts(Some(7));
+        drop(submitted);
+
+        assert_eq!(converted.pts(), None);
+        for (plane, expected) in planes.iter().enumerate() {
+            assert_eq!(converted.data(plane), expected.as_slice());
+        }
+    }
+
+    #[test]
+    fn both_paths_keep_encoding_across_reused_frames() {
+        ffmpeg::init().expect("ffmpeg init");
+        let (width, height) = (320, 180);
+        let frames = screen_frames(width, height);
+        for path in [Path::Swscale, Path::Simd] {
+            let mut encoder = Encoder::new(path, width, height, 30);
+            for index in 0..SOURCE_FRAMES * 3 {
+                encoder.queue(
+                    frames[index % SOURCE_FRAMES].clone(),
+                    Duration::from_millis(index as u64 * 33),
+                );
+            }
+            encoder.finish();
+        }
+    }
+
+    #[test]
+    fn realtime_baseline_encodes_every_delivered_frame() {
+        ffmpeg::init().expect("ffmpeg init");
+        let (width, height, fps) = (320, 180, 30);
+        let frames = screen_frames(width, height);
+        for path in [Path::Swscale, Path::Simd] {
+            let (tx, rx) = sync_channel::<Queued>(CHANNEL_CAPACITY);
+            let started = Instant::now();
+            let consumer = thread::spawn(move || consume(rx, path, width, height, fps, started));
+            for index in 0..SOURCE_FRAMES * 3 {
+                tx.send(Some((
+                    frames[index % SOURCE_FRAMES].clone(),
+                    Duration::from_millis(index as u64 * 33),
+                )))
+                .expect("send frame");
+            }
+            tx.send(None).expect("send end");
+            let (encoded, _, _) = consumer.join().expect("consumer");
+            assert_eq!(encoded, (SOURCE_FRAMES * 3) as u64);
+        }
+    }
 }
