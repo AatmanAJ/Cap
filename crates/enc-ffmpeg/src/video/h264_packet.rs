@@ -7,11 +7,11 @@ use ffmpeg::{
     frame,
 };
 
-use crate::video::h264::OpenedVideoEncoder;
+use crate::video::{convert::VideoConverter, h264::OpenedVideoEncoder};
 
 pub struct H264PacketEncoder {
     encoder: encoder::Video,
-    converter: Option<ffmpeg::software::scaling::Context>,
+    converter: Option<VideoConverter>,
     converted_frame_pool: Option<frame::Video>,
     output_format: format::Pixel,
     output_width: u32,

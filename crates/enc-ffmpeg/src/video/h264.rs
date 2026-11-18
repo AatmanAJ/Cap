@@ -12,6 +12,7 @@ use ffmpeg::{
 use tracing::{debug, error, info, trace, warn};
 
 use crate::base::EncoderBase;
+use crate::video::convert::{RgbToYuv420, VideoConverter};
 use crate::video::h264_packet::H264PacketEncoder;
 #[cfg(target_os = "macos")]
 use crate::video::videotoolbox_hw::VideoToolboxHwFrames;
@@ -559,7 +560,7 @@ impl H264EncoderBuilder {
 
 pub(crate) struct OpenedVideoEncoder {
     pub encoder: encoder::Video,
-    pub converter: Option<ffmpeg::software::scaling::Context>,
+    pub converter: Option<VideoConverter>,
     pub converted_frame_pool: Option<frame::Video>,
     pub output_format: format::Pixel,
     pub output_width: u32,
@@ -714,6 +715,18 @@ fn open_video_encoder_inner(
         );
     }
 
+    let rgb_converter = (needs_pixel_conversion && !needs_scaling)
+        .then(|| {
+            RgbToYuv420::new(
+                input_config.pixel_format,
+                output_format,
+                output_width,
+                output_height,
+            )
+        })
+        .flatten()
+        .filter(RgbToYuv420::is_accelerated);
+
     let converter = if external_conversion {
         debug!(
             output_format = ?output_format,
@@ -722,6 +735,14 @@ fn open_video_encoder_inner(
             "External conversion enabled, skipping internal converter"
         );
         None
+    } else if let Some(converter) = rgb_converter {
+        debug!(
+            encoder = %codec.name(),
+            src_format = ?input_config.pixel_format,
+            dst_format = ?output_format,
+            "Using SIMD RGB to YUV 4:2:0 converter"
+        );
+        Some(VideoConverter::Rgb(converter))
     } else if needs_pixel_conversion || needs_scaling {
         let flags = if needs_scaling {
             ffmpeg::software::scaling::flag::Flags::BICUBIC
@@ -749,7 +770,7 @@ fn open_video_encoder_inner(
                     needs_scaling = needs_scaling,
                     "Created SOFTWARE scaler for pixel format conversion (CPU-intensive)"
                 );
-                Some(context)
+                Some(VideoConverter::Swscale(context))
             }
             Err(e) => {
                 if needs_pixel_conversion {
@@ -841,7 +862,7 @@ fn open_video_encoder_inner(
 pub struct H264Encoder {
     base: EncoderBase,
     encoder: encoder::Video,
-    converter: Option<ffmpeg::software::scaling::Context>,
+    converter: Option<VideoConverter>,
     output_format: format::Pixel,
     output_width: u32,
     output_height: u32,
