@@ -462,9 +462,14 @@ impl<'a> Iterator for FramesIter<'a> {
                 Err(e) => return Some(Err(e)),
             }
 
-            let (stream_index, packet) = match self.packets.next()? {
-                Ok(packet) => packet,
-                Err(error) => return Some(Err(error)),
+            let (stream_index, packet) = match self.packets.next() {
+                Some(Ok(packet)) => packet,
+                Some(Err(error)) => return Some(Err(error)),
+                None => match self.decoder.send_eof() {
+                    Ok(()) => continue,
+                    Err(ffmpeg::Error::Eof) => return None,
+                    Err(error) => return Some(Err(error)),
+                },
             };
 
             if stream_index != self.stream_index {
@@ -488,6 +493,11 @@ mod tests {
     use std::{fs::File, time::Duration};
 
     fn encode_segments(directory: &std::path::Path) {
+        let encoder = encode_frames(directory, 120);
+        assert!(encoder.completed_segments().len() >= 2);
+    }
+
+    fn encode_frames(directory: &std::path::Path, count: u64) -> SegmentedVideoEncoder {
         ffmpeg::init().unwrap();
         let mut encoder = SegmentedVideoEncoder::init(
             directory.to_path_buf(),
@@ -501,7 +511,7 @@ mod tests {
             SegmentedVideoEncoderConfig::default(),
         )
         .unwrap();
-        for index in 0..120 {
+        for index in 0..count {
             let mut frame = avframe::Video::new(avformat::Pixel::NV12, 160, 120);
             frame.data_mut(0).fill(32 + (index % 192) as u8);
             frame.data_mut(1).fill(128);
@@ -510,7 +520,41 @@ mod tests {
                 .unwrap();
         }
         encoder.finish().unwrap();
-        assert!(encoder.completed_segments().len() >= 2);
+        encoder
+    }
+
+    fn video_packet_count(path: &std::path::Path) -> usize {
+        let mut input = ffmpeg::format::input(path).unwrap();
+        let stream_index = input
+            .streams()
+            .best(avutil::media::Type::Video)
+            .unwrap()
+            .index();
+        input
+            .packets()
+            .filter(|(stream, _)| stream.index() == stream_index)
+            .count()
+    }
+
+    fn timestamps_take(decoder: &mut FFmpegDecoder, count: usize) -> Vec<Option<i64>> {
+        decoder
+            .frames()
+            .take(count)
+            .map(|frame| {
+                let frame = frame.unwrap();
+                frame.timestamp().or_else(|| frame.pts())
+            })
+            .collect()
+    }
+
+    fn timestamps(decoder: &mut FFmpegDecoder) -> Vec<Option<i64>> {
+        decoder
+            .frames()
+            .map(|frame| {
+                let frame = frame.unwrap();
+                frame.timestamp().or_else(|| frame.pts())
+            })
+            .collect()
     }
 
     fn frame_data(frame: avframe::Video) -> (Option<i64>, Vec<u8>) {
@@ -545,6 +589,45 @@ mod tests {
         assert!(context.thread_count >= 2);
         assert_ne!(context.active_thread_type, 0);
         assert!(decoder.frames().count() > 0);
+    }
+
+    #[test]
+    fn software_decoder_returns_every_frame_including_the_buffered_tail() {
+        ffmpeg::init().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/h264-decoder-lifecycle.mp4");
+        let packet_count = video_packet_count(&fixture);
+        assert!(packet_count > 0);
+        let mut decoder = FFmpegDecoder::new(&fixture, None).unwrap();
+        let full = timestamps(&mut decoder);
+        assert_eq!(full.len(), packet_count);
+        assert!(full.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(decoder.frames().next().is_none());
+
+        decoder.reset(0.0).unwrap();
+        assert_eq!(timestamps(&mut decoder), full);
+
+        decoder.reset(0.0).unwrap();
+        let mut resumed = timestamps_take(&mut decoder, full.len() - 1);
+        resumed.extend(timestamps(&mut decoder));
+        assert_eq!(resumed, full);
+    }
+
+    #[test]
+    fn software_decoder_returns_every_frame_of_a_clip_shorter_than_its_thread_delay() {
+        for count in [1_u64, 3] {
+            let directory = tempfile::tempdir().unwrap();
+            let source = directory.path().join("segments");
+            encode_frames(&source, count);
+            let mut decoder = FFmpegDecoder::new(&source, None).unwrap();
+            let context = unsafe { &*decoder.decoder().as_ptr() };
+            assert!(context.thread_count as u64 >= 2);
+            assert_ne!(context.active_thread_type, 0);
+            let full = timestamps(&mut decoder);
+            assert_eq!(full.len() as u64, count);
+            decoder.reset(0.0).unwrap();
+            assert_eq!(timestamps(&mut decoder), full);
+        }
     }
 
     #[test]
