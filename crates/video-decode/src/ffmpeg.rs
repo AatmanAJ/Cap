@@ -148,7 +148,9 @@ pub fn get_hw_decoder_capabilities() -> &'static HwDecoderCapabilities {
     HW_CAPABILITIES.get_or_init(query_d3d11_video_decoder_capabilities)
 }
 
-fn configure_software_threading(decoder: &mut avcodec::decoder::Video, width: u32, height: u32) {
+fn configure_software_threading(context: &mut avcodec::Context) {
+    let codec_ctx = unsafe { context.as_mut_ptr() };
+    let (width, height) = unsafe { ((*codec_ctx).width.max(0), (*codec_ctx).height.max(0)) };
     let pixel_count = (width as u64) * (height as u64);
     let cpu_count = num_cpus::get();
 
@@ -163,11 +165,8 @@ fn configure_software_threading(decoder: &mut avcodec::decoder::Video, width: u3
     let thread_type = ffmpeg::sys::FF_THREAD_FRAME | ffmpeg::sys::FF_THREAD_SLICE;
 
     unsafe {
-        let codec_ctx = decoder.as_mut_ptr();
-        if !codec_ctx.is_null() {
-            (*codec_ctx).thread_count = thread_count;
-            (*codec_ctx).thread_type = thread_type;
-        }
+        (*codec_ctx).thread_count = thread_count;
+        (*codec_ctx).thread_type = thread_type;
     }
 
     info!(
@@ -179,6 +178,25 @@ fn configure_software_threading(decoder: &mut avcodec::decoder::Video, width: u3
         },
         cpu_count
     );
+}
+
+fn open_video_decoder(
+    stream: &ffmpeg::format::stream::Stream,
+    software_threading: bool,
+) -> Result<avcodec::decoder::Video, String> {
+    let mut context = avcodec::Context::from_parameters(stream.parameters())
+        .map_err(|e| format!("decoder context / {e}"))?;
+
+    if software_threading {
+        configure_software_threading(&mut context);
+    }
+
+    let mut decoder = context
+        .decoder()
+        .video()
+        .map_err(|e| format!("video decoder / {e}"))?;
+    decoder.set_time_base(stream.time_base());
+    Ok(decoder)
 }
 
 pub struct FFmpegDecoder {
@@ -326,50 +344,44 @@ impl FFmpegDecoder {
 
         let stream_index = input_stream.index();
 
-        let mut decoder = avcodec::Context::from_parameters(input_stream.parameters())
-            .map_err(|e| format!("decoder context / {e}"))?
-            .decoder()
-            .video()
-            .map_err(|e| format!("video decoder / {e}"))?;
-
-        decoder.set_time_base(input_stream.time_base());
-
-        let width = decoder.width();
-        let height = decoder.height();
+        let parameters = input_stream.parameters();
+        let (width, height) = unsafe {
+            let raw = parameters.as_ptr();
+            ((*raw).width.max(0) as u32, (*raw).height.max(0) as u32)
+        };
 
         let hw_caps = get_hw_decoder_capabilities();
         let exceeds_hw_limits =
             width > hw_caps.max_width || height > hw_caps.max_height || !hw_caps.supports_hw_decode;
 
-        let hw_device = hw_device_type.and_then(|hw_device_type| {
-            if exceeds_hw_limits {
+        let (decoder, hw_device) = match hw_device_type {
+            Some(_) if exceeds_hw_limits => {
                 warn!(
                     "Video dimensions {width}x{height} exceed hardware decoder limits ({}x{}), using software decode",
                     hw_caps.max_width, hw_caps.max_height
                 );
-                configure_software_threading(&mut decoder, width, height);
-                None
-            } else {
+                (open_video_decoder(&input_stream, true)?, None)
+            }
+            Some(hw_device_type) => {
+                let mut decoder = open_video_decoder(&input_stream, false)?;
                 match decoder.try_use_hw_device(hw_device_type) {
                     Ok(device) => {
                         info!(
                             "Using hardware acceleration for {width}x{height} video (device: {:?})",
                             hw_device_type
                         );
-                        Some(device)
+                        (decoder, Some(device))
                     }
                     Err(error) => {
-                        warn!("Failed to enable hardware decoder: {error:?}, falling back to optimized software decode");
-                        configure_software_threading(&mut decoder, width, height);
-                        None
+                        warn!(
+                            "Failed to enable hardware decoder: {error:?}, falling back to optimized software decode"
+                        );
+                        (open_video_decoder(&input_stream, true)?, None)
                     }
                 }
             }
-        });
-
-        if hw_device.is_none() && hw_device_type.is_none() {
-            configure_software_threading(&mut decoder, width, height);
-        }
+            None => (open_video_decoder(&input_stream, true)?, None),
+        };
 
         Ok(FFmpegDecoder {
             input,
@@ -521,6 +533,18 @@ mod tests {
             .frames()
             .map(|frame| frame_data(frame.unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn software_decoder_opens_with_frame_threading_active() {
+        ffmpeg::init().unwrap();
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/h264-decoder-lifecycle.mp4");
+        let mut decoder = FFmpegDecoder::new(fixture, None).unwrap();
+        let context = unsafe { &*decoder.decoder().as_ptr() };
+        assert!(context.thread_count >= 2);
+        assert_ne!(context.active_thread_type, 0);
+        assert!(decoder.frames().count() > 0);
     }
 
     #[test]
