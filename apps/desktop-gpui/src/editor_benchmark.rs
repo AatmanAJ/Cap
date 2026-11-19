@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use gpui::{AsyncApp, FrameTimingCollector, WindowHandle};
+use gpui::{AsyncApp, FrameTiming, FrameTimingCollector, WindowHandle};
 use serde::Serialize;
 
 use crate::editor_window::EditorWindow;
@@ -19,8 +19,9 @@ struct Scenario {
     draw_ms_p50: f64,
     draw_ms_p95: f64,
     draw_ms_max: f64,
-    input_to_frame_ms_p50: f64,
-    input_to_frame_ms_p95: f64,
+    input_to_draw_end_samples: usize,
+    input_to_draw_end_ms_p50: f64,
+    input_to_draw_end_ms_p95: f64,
     draw_ms_trace: Vec<f64>,
 }
 
@@ -109,11 +110,11 @@ async fn measure(
 ) -> Option<Scenario> {
     let window_id = handle.window_id();
     let mut collector = FrameTimingCollector::new();
-    let mut latencies = Vec::new();
+    let mut inputs = Vec::new();
     for step in 0..STEPS {
         let fraction = 0.05 + 0.9 * f64::from(step) / f64::from(STEPS - 1);
         let (sender, receiver) = flume::bounded(1);
-        let sent = Instant::now();
+        inputs.push(Instant::now());
         handle
             .update(cx, |view, window, cx| {
                 match input {
@@ -121,16 +122,12 @@ async fn measure(
                     Input::Scrub => view.seek_fraction(fraction, window, cx),
                 }
                 cx.on_next_frame(window, move |_, _, _| {
-                    let _ = sender.send(Instant::now());
+                    let _ = sender.send(());
                 });
             })
             .ok()?;
         let timeout = cx.background_executor().timer(STEP_TIMEOUT);
-        if let futures_util::future::Either::Left((Ok(drawn), _)) =
-            futures_util::future::select(Box::pin(receiver.recv_async()), timeout).await
-        {
-            latencies.push(drawn.duration_since(sent).as_secs_f64() * 1000.0);
-        }
+        futures_util::future::select(Box::pin(receiver.recv_async()), timeout).await;
         cx.background_executor()
             .timer(Duration::from_millis(16))
             .await;
@@ -144,10 +141,14 @@ async fn measure(
         .timer(Duration::from_millis(100))
         .await;
 
-    let trace: Vec<f64> = collector
+    let frames: Vec<FrameTiming> = collector
         .collect_unseen()
         .into_iter()
         .filter(|frame| frame.window_id == window_id)
+        .collect();
+    let mut latencies = input_to_draw_end_ms(&inputs, &frames);
+    let trace: Vec<f64> = frames
+        .iter()
         .map(|frame| frame.draw_duration().as_secs_f64() * 1000.0)
         .collect();
     let mut draws = trace.clone();
@@ -168,10 +169,29 @@ async fn measure(
         draw_ms_p50: percentile(&draws, 0.5),
         draw_ms_p95: percentile(&draws, 0.95),
         draw_ms_max: draws.last().copied().unwrap_or(0.0),
-        input_to_frame_ms_p50: percentile(&latencies, 0.5),
-        input_to_frame_ms_p95: percentile(&latencies, 0.95),
+        input_to_draw_end_samples: latencies.len(),
+        input_to_draw_end_ms_p50: percentile(&latencies, 0.5),
+        input_to_draw_end_ms_p95: percentile(&latencies, 0.95),
         draw_ms_trace: trace,
     })
+}
+
+fn input_to_draw_end_ms(inputs: &[Instant], frames: &[FrameTiming]) -> Vec<f64> {
+    inputs
+        .iter()
+        .enumerate()
+        .filter_map(|(index, &sent)| {
+            frames
+                .iter()
+                .find(|frame| frame.draw_start >= sent)
+                .filter(|frame| {
+                    inputs
+                        .get(index + 1)
+                        .is_none_or(|&next| frame.draw_start < next)
+                })
+                .map(|frame| frame.draw_end.duration_since(sent).as_secs_f64() * 1000.0)
+        })
+        .collect()
 }
 
 fn percentile(sorted: &[f64], quantile: f64) -> f64 {
@@ -180,4 +200,60 @@ fn percentile(sorted: &[f64], quantile: f64) -> f64 {
     }
     let index = ((sorted.len() - 1) as f64 * quantile).round() as usize;
     sorted[index.min(sorted.len() - 1)]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(origin: Instant, draw_start_ms: u64, draw_end_ms: u64) -> FrameTiming {
+        FrameTiming {
+            window_id: 1.into(),
+            dirty_at: None,
+            invalidations: 1,
+            draw_start: origin + Duration::from_millis(draw_start_ms),
+            draw_end: origin + Duration::from_millis(draw_end_ms),
+        }
+    }
+
+    #[test]
+    fn latency_runs_to_the_end_of_the_draw_that_follows_the_input() {
+        let origin = Instant::now();
+        let inputs = [origin, origin + Duration::from_millis(40)];
+        let frames = [frame(origin, 8, 30), frame(origin, 48, 51)];
+
+        assert_eq!(input_to_draw_end_ms(&inputs, &frames), vec![30.0, 11.0]);
+    }
+
+    #[test]
+    fn slower_draw_raises_latency_when_the_frame_starts_at_the_same_time() {
+        let origin = Instant::now();
+        let fast = input_to_draw_end_ms(&[origin], &[frame(origin, 8, 10)]);
+        let slow = input_to_draw_end_ms(&[origin], &[frame(origin, 8, 33)]);
+
+        assert_eq!(fast, vec![10.0]);
+        assert_eq!(slow, vec![33.0]);
+    }
+
+    #[test]
+    fn frame_already_drawing_when_the_input_arrives_is_not_counted() {
+        let origin = Instant::now();
+        let inputs = [origin + Duration::from_millis(10)];
+        let frames = [frame(origin, 5, 12), frame(origin, 20, 26)];
+
+        assert_eq!(input_to_draw_end_ms(&inputs, &frames), vec![16.0]);
+    }
+
+    #[test]
+    fn input_without_its_own_frame_yields_no_sample() {
+        let origin = Instant::now();
+        let inputs = [
+            origin,
+            origin + Duration::from_millis(20),
+            origin + Duration::from_millis(40),
+        ];
+        let frames = [frame(origin, 25, 31)];
+
+        assert_eq!(input_to_draw_end_ms(&inputs, &frames), vec![11.0]);
+    }
 }
