@@ -13,7 +13,9 @@ pub use video::*;
 mod mux;
 pub use mux::*;
 
+pub mod decode_limit;
 pub mod fragment_order;
+pub mod mp4_boxes;
 mod relocatable_source;
 pub mod remux;
 pub use relocatable_source::{RelocatableReader, RelocatableSource};
